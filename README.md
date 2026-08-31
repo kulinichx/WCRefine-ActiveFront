@@ -1,13 +1,15 @@
-# WCRefine Group v1.2 (TrollStore)
+# WCRefine Group v1.3 (TrollStore)
 
 
-## v1.2 device fix
+## v1.3 device fix
 
-- Fixed the missing **分组 / 保持 / 回组** swipe action caused by hard-coding WCRefine group scopes to only `1` and `2`.
-- WCRefine 2.1-2 uses additional scope values/bitmasks; v1.2 now asks WCRefine for the actual scope and only offers **分组** when a matching custom group exists.
+- Fixed the real cause of the missing **分组 / 保持 / 回组** swipe action: WCRefine swizzles the native `tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:` selector with its `wcrGrouping_...` alias. v1.1/v1.2 hooked the alias, which becomes the saved pre-WCRefine implementation after the exchange.
+- v1.3 hooks the **active native selector** after WCRefine has installed its swizzle, so the ActiveFront action is merged into the menu that UITableView actually requests.
+- Session lookup now uses the active `logicGetSessionAtIndexPath:` selector rather than the saved `wcrGrouping_logicGetSessionAtIndexPath:` alias.
+- Home-return refresh now hooks the active `viewDidAppear:` chain for the same reason.
+- The v1.2 scope fix remains: group scope values are not hard-coded, and **分组** is only offered when a matching custom WCRefine group exists.
 - WCRefine-created group rows keep their existing long-press menu untouched.
-- The injected library is now named **`WCRefineGroup.dylib`**.
-- Added concise swipe diagnostics with username/scope/group count for the next device test.
+- The injected library remains **`WCRefineGroup.dylib`**.
 
 ## v1.1 compile fix
 
@@ -90,7 +92,7 @@ The workflow is intentionally compile-only. It does not modify a WeChat IPA/TIPA
 
 ## v1.1 runtime diagnostics
 
-The dylib now emits concise `NSLog` lines prefixed with `WCRefineActiveFront 1.2` for:
+The dylib now emits concise `NSLog` lines prefixed with `WCRefineActiveFront 1.3` for:
 
 - dylib constructor/load;
 - successful resolution of `MSHookMessageEx`;

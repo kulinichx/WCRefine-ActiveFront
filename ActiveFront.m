@@ -4,7 +4,7 @@
 #import <objc/runtime.h>
 #import <stdarg.h>
 
-static NSString * const kWCRAFVersion = @"1.2";
+static NSString * const kWCRAFVersion = @"1.3";
 
 static void WCRAFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void WCRAFLog(NSString *format, ...) {
@@ -13,7 +13,7 @@ static void WCRAFLog(NSString *format, ...) {
     va_start(args, format);
     NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
-    NSLog(@"[WCRefineActiveFront %@] %@", kWCRAFVersion, message);
+    NSLog(@"[WCRefineGroup %@] %@", kWCRAFVersion, message);
 }
 
 #define WCRAF_LOG(...) WCRAFLog(__VA_ARGS__)
@@ -58,9 +58,13 @@ static void WCRAFLog(NSString *format, ...) {
 @end
 
 @interface NewMainFrameViewController : UIViewController
+- (id)logicGetSessionAtIndexPath:(NSIndexPath *)indexPath;
 - (id)wcrGrouping_logicGetSessionAtIndexPath:(NSIndexPath *)indexPath;
 - (void)wcrGrouping_scheduleRefreshForTrigger:(id)trigger;
+- (void)viewDidAppear:(BOOL)animated;
 - (void)wcrGrouping_viewDidAppear:(BOOL)animated;
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
+      trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath;
 - (UISwipeActionsConfiguration *)wcrGrouping_tableView:(UITableView *)tableView
       trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath;
 @end
@@ -569,9 +573,9 @@ static void hook_noteRead(id self, SEL _cmd, NSString *username) {
     if (wasSurfaced) WCRRefreshHomeGlobal(@"active_front_read");
 }
 
-static void (*orig_groupingViewDidAppear)(id, SEL, BOOL) = NULL;
-static void hook_groupingViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    if (orig_groupingViewDidAppear) orig_groupingViewDidAppear(self, _cmd, animated);
+static void (*orig_activeViewDidAppear)(id, SEL, BOOL) = NULL;
+static void hook_activeViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (orig_activeViewDidAppear) orig_activeViewDidAppear(self, _cmd, animated);
     WCRPruneStaleActiveFrontState();
     WCRRefreshHomeDeferred(self, @"active_front_home_appear");
 }
@@ -579,8 +583,10 @@ static void hook_groupingViewDidAppear(id self, SEL _cmd, BOOL animated) {
 
 static UISwipeActionsConfiguration *(*orig_trailingActions)(id, SEL, UITableView *, NSIndexPath *) = NULL;
 static UISwipeActionsConfiguration *hook_trailingActions(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) API_AVAILABLE(ios(11.0)) {
+    // orig_trailingActions is WCRefine's active grouping implementation because
+    // we install this hook only after WCRefine's selector exchange is visible.
     UISwipeActionsConfiguration *original = orig_trailingActions ? orig_trailingActions(self, _cmd, tableView, indexPath) : nil;
-    id session = [self respondsToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)] ? [self wcrGrouping_logicGetSessionAtIndexPath:indexPath] : nil;
+    id session = [self respondsToSelector:@selector(logicGetSessionAtIndexPath:)] ? [self logicGetSessionAtIndexPath:indexPath] : nil;
     UIContextualAction *ours = WCRActionForSession(self, tableView, indexPath, session);
     if (!ours) return original;
     NSMutableArray *actions = [NSMutableArray arrayWithObject:ours];
@@ -603,9 +609,12 @@ static BOOL WCRRuntimeReadyForHooks(void) {
     return [provider instancesRespondToSelector:@selector(shouldExcludeNativeSessionFromGroupingForUnreadPolicy:)] &&
            [quickRuntime instancesRespondToSelector:@selector(noteIncomingMessageForUsername:)] &&
            [quickRuntime instancesRespondToSelector:@selector(noteReadForUsername:)] &&
+           [mainFrame instancesRespondToSelector:@selector(viewDidAppear:)] &&
            [mainFrame instancesRespondToSelector:@selector(wcrGrouping_viewDidAppear:)] &&
            [mainFrame instancesRespondToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)] &&
+           [mainFrame instancesRespondToSelector:@selector(logicGetSessionAtIndexPath:)] &&
            [mainFrame instancesRespondToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)] &&
+           [mainFrame instancesRespondToSelector:@selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)] &&
            [mainFrame instancesRespondToSelector:@selector(wcrGrouping_tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)];
 }
 
@@ -626,8 +635,12 @@ static void WCRInstallHooks(void) {
     WCRInstallHook(provider, @selector(shouldExcludeNativeSessionFromGroupingForUnreadPolicy:), (IMP)hook_shouldExclude, (IMP *)&orig_shouldExclude);
     WCRInstallHook(quickRuntime, @selector(noteIncomingMessageForUsername:), (IMP)hook_noteIncoming, (IMP *)&orig_noteIncoming);
     WCRInstallHook(quickRuntime, @selector(noteReadForUsername:), (IMP)hook_noteRead, (IMP *)&orig_noteRead);
-    WCRInstallHook(mainFrame, @selector(wcrGrouping_viewDidAppear:), (IMP)hook_groupingViewDidAppear, (IMP *)&orig_groupingViewDidAppear);
-    WCRInstallHook(mainFrame, @selector(wcrGrouping_tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:), (IMP)hook_trailingActions, (IMP *)&orig_trailingActions);
+    // WCRefine swizzles the native selectors with its wcrGrouping_ aliases.
+    // After that exchange, the native selector is the ACTIVE grouping implementation,
+    // while the wcrGrouping_ selector points back to the pre-WCRefine/original method.
+    // Hook the active selectors, not the aliases.
+    WCRInstallHook(mainFrame, @selector(viewDidAppear:), (IMP)hook_activeViewDidAppear, (IMP *)&orig_activeViewDidAppear);
+    WCRInstallHook(mainFrame, @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:), (IMP)hook_trailingActions, (IMP *)&orig_trailingActions);
 }
 
 static void WCRTryInstallHooks(NSUInteger attemptsRemaining) {
