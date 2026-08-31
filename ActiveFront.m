@@ -4,7 +4,7 @@
 #import <objc/runtime.h>
 #import <stdarg.h>
 
-static NSString * const kWCRAFVersion = @"1.1";
+static NSString * const kWCRAFVersion = @"1.2";
 
 static void WCRAFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void WCRAFLog(NSString *format, ...) {
@@ -419,10 +419,10 @@ static BOOL WCRResolveSessionState(id session,
     NSString *username = [provider usernameForNativeObject:session];
     if (![username isKindOfClass:[NSString class]] || username.length == 0) return NO;
 
-    NSUInteger scope = [provider groupScopeForNativeSession:session];
-    // Recovered from WCRefine 2.1-2: 1 = friend, 2 = chat room.
-    if (scope != 1 && scope != 2) return NO;
-
+    // Do not hard-code WCRefine scope values. 2.1-2 uses several scope
+    // values/bitmasks (not only 1/2), and filtering here caused valid friend
+    // and chat-room rows to lose the ActiveFront swipe action. WCRefine's own
+    // group list is the authority for whether a scope is groupable.
     BOOL grouped = WCRIsInCustomGroup(username);
     BOOL held = grouped && WCRIsHeld(username);
     BOOL surfaced = grouped && WCRIsSurfaced(username);
@@ -445,6 +445,12 @@ static UIContextualAction *WCRActionForSession(NewMainFrameViewController *host,
     if (!WCRResolveSessionState(session, &username, &grouped, &held, &surfaced)) return nil;
 
     if (!grouped) {
+        NSUInteger scope = [WCRDataProvider() groupScopeForNativeSession:session];
+        NSArray<WCRefineGroup *> *available = WCRAvailableGroupsForScope(scope);
+        WCRAF_LOG(@"swipe ungrouped %@ scope=%lu availableGroups=%lu",
+                  username, (unsigned long)scope, (unsigned long)available.count);
+        if (available.count == 0) return nil;
+
         return [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
                                                        title:@"分组"
                                                      handler:^(__unused UIContextualAction *action,
@@ -456,6 +462,8 @@ static UIContextualAction *WCRActionForSession(NewMainFrameViewController *host,
             });
         }];
     }
+
+    WCRAF_LOG(@"swipe grouped %@ held=%d surfaced=%d", username, held, surfaced);
 
     if (held) {
         return [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal

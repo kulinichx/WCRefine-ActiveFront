@@ -1,4 +1,4 @@
-name: Build ActiveFront dylib
+name: Build WCRefineGroup dylib
 
 on:
   workflow_dispatch:
@@ -43,18 +43,18 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p artifacts
-          DYLIB="$(find .theos -type f -name 'WCRefineActiveFront.dylib' | head -n 1)"
+          DYLIB="$(find .theos -type f -name 'WCRefineGroup.dylib' | head -n 1)"
           test -n "$DYLIB"
-          cp "$DYLIB" artifacts/WCRefineActiveFront.dylib
-          file artifacts/WCRefineActiveFront.dylib | tee artifacts/file.txt
-          otool -hv artifacts/WCRefineActiveFront.dylib | tee artifacts/mach-header.txt
-          otool -L artifacts/WCRefineActiveFront.dylib | tee artifacts/dependencies.txt
-          nm -u artifacts/WCRefineActiveFront.dylib | tee artifacts/undefined-symbols.txt || true
-          shasum -a 256 artifacts/WCRefineActiveFront.dylib > artifacts/WCRefineActiveFront.dylib.sha256
+          cp "$DYLIB" artifacts/WCRefineGroup.dylib
+          file artifacts/WCRefineGroup.dylib | tee artifacts/file.txt
+          otool -hv artifacts/WCRefineGroup.dylib | tee artifacts/mach-header.txt
+          otool -L artifacts/WCRefineGroup.dylib | tee artifacts/dependencies.txt
+          nm -u artifacts/WCRefineGroup.dylib | tee artifacts/undefined-symbols.txt || true
+          shasum -a 256 artifacts/WCRefineGroup.dylib > artifacts/WCRefineGroup.dylib.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WCRefineActiveFront-v1.1-arm64
+          name: WCRefineGroup-v1.2-arm64
           path: artifacts/
           if-no-files-found: error

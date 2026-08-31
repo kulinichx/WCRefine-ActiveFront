@@ -1,4 +1,13 @@
-# WCRefine ActiveFront v1.1 (TrollStore)
+# WCRefine Group v1.2 (TrollStore)
+
+
+## v1.2 device fix
+
+- Fixed the missing **分组 / 保持 / 回组** swipe action caused by hard-coding WCRefine group scopes to only `1` and `2`.
+- WCRefine 2.1-2 uses additional scope values/bitmasks; v1.2 now asks WCRefine for the actual scope and only offers **分组** when a matching custom group exists.
+- WCRefine-created group rows keep their existing long-press menu untouched.
+- The injected library is now named **`WCRefineGroup.dylib`**.
+- Added concise swipe diagnostics with username/scope/group count for the next device test.
 
 ## v1.1 compile fix
 
@@ -73,7 +82,7 @@ It:
 1. checks out Theos on a macOS 14 runner;
 2. uses the Xcode-provided iPhoneOS SDK rather than a separate Linux cross-toolchain;
 3. builds the project as arm64;
-4. finds `WCRefineActiveFront.dylib`;
+4. finds `WCRefineGroup.dylib`;
 5. records Mach-O header, linked dependencies, undefined symbols and SHA-256;
 6. uploads all of those files as one Actions artifact.
 
@@ -81,7 +90,7 @@ The workflow is intentionally compile-only. It does not modify a WeChat IPA/TIPA
 
 ## v1.1 runtime diagnostics
 
-The dylib now emits concise `NSLog` lines prefixed with `WCRefineActiveFront 1.0` for:
+The dylib now emits concise `NSLog` lines prefixed with `WCRefineActiveFront 1.2` for:
 
 - dylib constructor/load;
 - successful resolution of `MSHookMessageEx`;
@@ -103,7 +112,7 @@ Payload/WeChat.app/
   Frameworks/
     CydiaSubstrate.framework/...
     WCRefine.dylib
-    WCRefineActiveFront.dylib
+    WCRefineGroup.dylib
 ```
 
 The final TIPA workflow should preserve the load-command/layout conventions used by the already-working WCRefine-injected WeChat package.
@@ -112,7 +121,7 @@ The final TIPA workflow should preserve the load-command/layout conventions used
 
 1. Confirm the current TrollStore WeChat + WCRefine build works unchanged.
 2. Turn off WCRefine's unread-message group for the initial ActiveFront test.
-3. Add only `WCRefineActiveFront.dylib` and its load command.
+3. Add only `WCRefineGroup.dylib` and its load command.
 4. Test ungrouped friend -> swipe **分组**.
 5. Test ungrouped group chat -> swipe **分组**.
 6. Grouped friend receives a real message -> native row surfaces.
