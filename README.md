@@ -1,4 +1,12 @@
-# WCRefine Active Front v1.0 — TrollStore injection edition
+# WCRefine ActiveFront v1.1 (TrollStore)
+
+## v1.1 compile fix
+
+- Removed the deprecated `UITableViewRowAction` / `editActionsForRowAtIndexPath:` compatibility path.
+- ActiveFront now adds its dynamic **分组 / 保持 / 回组** action only through WCRefine's modern `UISwipeActionsConfiguration` hook.
+- WCRefine's existing trailing swipe actions are preserved and appended after the ActiveFront action.
+- Full-swipe execution is disabled for the merged configuration to avoid accidental **分组 / 保持 / 回组** activation.
+- `-Werror` remains enabled; the build is fixed at the source level rather than suppressing deprecation diagnostics.
 
 Target: a TrollStore-installed/injected WeChat build where **WCRefine 2.1-2 is already embedded and working**.
 
@@ -24,7 +32,7 @@ ActiveFront only adds the home-list projection behavior:
 
 ## WCRefine unread-message feature
 
-v1.0 deliberately **does not enable, disable, delete, or rewrite** WCRefine's own unread-message group/settings.
+v1.1 deliberately **does not enable, disable, delete, or rewrite** WCRefine's own unread-message group/settings.
 
 For the clean ActiveFront experience we currently recommend testing with WCRefine's unread-message group turned off. If the user turns WCRefine's unread feature back on, its original unread policy is allowed to continue running; ActiveFront does not silently change that preference.
 
@@ -71,7 +79,7 @@ It:
 
 The workflow is intentionally compile-only. It does not modify a WeChat IPA/TIPA yet. The first CI run is meant to validate compilation and linkage before app injection is automated.
 
-## v1.0 runtime diagnostics
+## v1.1 runtime diagnostics
 
 The dylib now emits concise `NSLog` lines prefixed with `WCRefineActiveFront 1.0` for:
 

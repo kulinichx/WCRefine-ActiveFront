@@ -4,7 +4,7 @@
 #import <objc/runtime.h>
 #import <stdarg.h>
 
-static NSString * const kWCRAFVersion = @"1.0";
+static NSString * const kWCRAFVersion = @"1.1";
 
 static void WCRAFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void WCRAFLog(NSString *format, ...) {
@@ -61,8 +61,6 @@ static void WCRAFLog(NSString *format, ...) {
 - (id)wcrGrouping_logicGetSessionAtIndexPath:(NSIndexPath *)indexPath;
 - (void)wcrGrouping_scheduleRefreshForTrigger:(id)trigger;
 - (void)wcrGrouping_viewDidAppear:(BOOL)animated;
-- (NSArray *)wcrGrouping_tableView:(UITableView *)tableView
-      editActionsForRowAtIndexPath:(NSIndexPath *)indexPath;
 - (UISwipeActionsConfiguration *)wcrGrouping_tableView:(UITableView *)tableView
       trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath;
 @end
@@ -485,45 +483,6 @@ static UIContextualAction *WCRActionForSession(NewMainFrameViewController *host,
     }];
 }
 
-static UITableViewRowAction *WCROldStyleActionForSession(NewMainFrameViewController *host,
-                                                         UITableView *tableView,
-                                                         NSIndexPath *indexPath,
-                                                         id session) {
-    NSString *username = nil;
-    BOOL grouped = NO;
-    BOOL held = NO;
-    BOOL surfaced = NO;
-    if (!WCRResolveSessionState(session, &username, &grouped, &held, &surfaced)) return nil;
-
-    if (!grouped) {
-        return [UITableViewRowAction rowActionWithStyle:UITableViewRowActionStyleNormal
-                                                   title:@"分组"
-                                                 handler:^(__unused UITableViewRowAction *action,
-                                                           __unused NSIndexPath *path) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                WCRPresentGroupPicker(host, username, session, tableView, indexPath);
-            });
-        }];
-    }
-
-    if (held) {
-        return [UITableViewRowAction rowActionWithStyle:UITableViewRowActionStyleNormal
-                                                   title:@"回组"
-                                                 handler:^(__unused UITableViewRowAction *action,
-                                                           __unused NSIndexPath *path) {
-            WCRSetHeld(username, NO, host);
-        }];
-    }
-
-    if (!surfaced) return nil;
-
-    return [UITableViewRowAction rowActionWithStyle:UITableViewRowActionStyleNormal
-                                               title:@"保持"
-                                             handler:^(__unused UITableViewRowAction *action,
-                                                       __unused NSIndexPath *path) {
-        WCRSetHeld(username, YES, host);
-    }];
-}
 
 #pragma mark - Manual Substrate hooks for TrollStore injection
 
@@ -609,16 +568,6 @@ static void hook_groupingViewDidAppear(id self, SEL _cmd, BOOL animated) {
     WCRRefreshHomeDeferred(self, @"active_front_home_appear");
 }
 
-static NSArray *(*orig_editActions)(id, SEL, UITableView *, NSIndexPath *) = NULL;
-static NSArray *hook_editActions(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
-    NSArray *original = orig_editActions ? orig_editActions(self, _cmd, tableView, indexPath) : nil;
-    id session = [self respondsToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)] ? [self wcrGrouping_logicGetSessionAtIndexPath:indexPath] : nil;
-    UITableViewRowAction *ours = WCROldStyleActionForSession(self, tableView, indexPath, session);
-    if (!ours) return original;
-    NSMutableArray *actions = [NSMutableArray arrayWithObject:ours];
-    if ([original isKindOfClass:[NSArray class]]) [actions addObjectsFromArray:original];
-    return actions;
-}
 
 static UISwipeActionsConfiguration *(*orig_trailingActions)(id, SEL, UITableView *, NSIndexPath *) = NULL;
 static UISwipeActionsConfiguration *hook_trailingActions(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) API_AVAILABLE(ios(11.0)) {
@@ -649,7 +598,6 @@ static BOOL WCRRuntimeReadyForHooks(void) {
            [mainFrame instancesRespondToSelector:@selector(wcrGrouping_viewDidAppear:)] &&
            [mainFrame instancesRespondToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)] &&
            [mainFrame instancesRespondToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)] &&
-           [mainFrame instancesRespondToSelector:@selector(wcrGrouping_tableView:editActionsForRowAtIndexPath:)] &&
            [mainFrame instancesRespondToSelector:@selector(wcrGrouping_tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)];
 }
 
@@ -671,7 +619,6 @@ static void WCRInstallHooks(void) {
     WCRInstallHook(quickRuntime, @selector(noteIncomingMessageForUsername:), (IMP)hook_noteIncoming, (IMP *)&orig_noteIncoming);
     WCRInstallHook(quickRuntime, @selector(noteReadForUsername:), (IMP)hook_noteRead, (IMP *)&orig_noteRead);
     WCRInstallHook(mainFrame, @selector(wcrGrouping_viewDidAppear:), (IMP)hook_groupingViewDidAppear, (IMP *)&orig_groupingViewDidAppear);
-    WCRInstallHook(mainFrame, @selector(wcrGrouping_tableView:editActionsForRowAtIndexPath:), (IMP)hook_editActions, (IMP *)&orig_editActions);
     WCRInstallHook(mainFrame, @selector(wcrGrouping_tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:), (IMP)hook_trailingActions, (IMP *)&orig_trailingActions);
 }
 
