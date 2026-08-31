@@ -1,15 +1,14 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 
-// WCRefine 2.1-2 runtime interfaces discovered from Objective-C metadata.
-// This patch intentionally reuses WCRefine's existing grouping/exclusion machinery.
+// WCRefine 2.1-2 runtime interfaces recovered from Objective-C metadata.
+// This tweak adds an "active front" projection without replacing WCRefine's
+// group database or WeChat's native session ordering.
 
 @interface WCRefineConfig : NSObject
 + (instancetype)shared;
 @property(nonatomic, assign) BOOL homeGroupingExcludeUnreadEnabled;
 @property(nonatomic, assign) BOOL homeGroupingUnreadBelowGroupsEnabled;
-@property(nonatomic, assign) BOOL homeGroupingExcludeSessionsEnabled;
-@property(nonatomic, copy) NSArray<NSString *> *homeGroupingExcludeSessions;
 @end
 
 @interface WCRefineGroup : NSObject
@@ -33,6 +32,7 @@
 + (instancetype)shared;
 - (NSString *)usernameForNativeObject:(id)obj;
 - (NSUInteger)groupScopeForNativeSession:(id)session;
+- (BOOL)shouldExcludeNativeSessionFromGroupingForUnreadPolicy:(id)session;
 @end
 
 @interface NewMainFrameViewController : UIViewController
@@ -46,6 +46,7 @@
 
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRUnreadQuickGroupId = @"wcrefine_quick_unread";
+static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 
 #pragma mark - Runtime helpers
 
@@ -74,33 +75,59 @@ static void WCRRefreshHome(id host, NSString *reason) {
     }
 }
 
-static NSArray<NSString *> *WCRHeldUsernames(void) {
-    NSArray *items = WCRConfig().homeGroupingExcludeSessions;
-    return [items isKindOfClass:[NSArray class]] ? items : @[];
+#pragma mark - Independent Keep state
+
+// Do NOT reuse WCRefine's homeGroupingExcludeSessions here. Users may already
+// use that setting for a different purpose. Keeping our own set prevents a
+// "回组" operation from deleting the user's existing WCRefine exclusions.
+
+static NSSet<NSString *> *WCRHeldUsernameSet(void) {
+    id stored = [[NSUserDefaults standardUserDefaults] objectForKey:kWCRAFHeldUsernamesDefaultsKey];
+    if (![stored isKindOfClass:[NSArray class]]) return [NSSet set];
+
+    NSMutableSet<NSString *> *result = [NSMutableSet set];
+    for (id obj in (NSArray *)stored) {
+        if ([obj isKindOfClass:[NSString class]] && [(NSString *)obj length] > 0) {
+            [result addObject:obj];
+        }
+    }
+    return [result copy];
 }
 
 static BOOL WCRIsHeld(NSString *username) {
     if (username.length == 0) return NO;
-    return [WCRHeldUsernames() containsObject:username];
+    return [WCRHeldUsernameSet() containsObject:username];
 }
 
-static void WCRSetHeld(NSString *username, BOOL held, id host) {
-    if (username.length == 0) return;
+static BOOL WCRPersistHeld(NSString *username, BOOL held) {
+    if (username.length == 0) return NO;
 
-    WCRefineConfig *cfg = WCRConfig();
-    if (!cfg) return;
-
-    NSMutableOrderedSet<NSString *> *set = [NSMutableOrderedSet orderedSetWithArray:WCRHeldUsernames()];
+    NSMutableSet<NSString *> *set = [WCRHeldUsernameSet() mutableCopy];
+    BOOL wasHeld = [set containsObject:username];
     if (held) {
         [set addObject:username];
     } else {
         [set removeObject:username];
     }
 
-    cfg.homeGroupingExcludeSessionsEnabled = YES;
-    cfg.homeGroupingExcludeSessions = set.array;
-    WCRRefreshHome(host, held ? @"active_front_keep" : @"active_front_return");
+    if (wasHeld == held) return NO;
+
+    NSArray<NSString *> *stable = [[set allObjects] sortedArrayUsingSelector:@selector(compare:)];
+    [[NSUserDefaults standardUserDefaults] setObject:stable forKey:kWCRAFHeldUsernamesDefaultsKey];
+    return YES;
 }
+
+static void WCRSetHeld(NSString *username, BOOL held, id host) {
+    if (WCRPersistHeld(username, held)) {
+        WCRRefreshHome(host, held ? @"active_front_keep" : @"active_front_return");
+    } else {
+        // Still request a projection refresh: WCRefine/WeChat state may have
+        // changed even when the persistent flag was already in this state.
+        WCRRefreshHome(host, held ? @"active_front_keep_refresh" : @"active_front_return_refresh");
+    }
+}
+
+#pragma mark - Group membership helpers
 
 static NSSet<NSString *> *WCRCustomGroupIdSet(void) {
     WCRefineGroupManager *mgr = WCRGroupManager();
@@ -113,7 +140,10 @@ static NSSet<NSString *> *WCRCustomGroupIdSet(void) {
 
 static BOOL WCRIsInCustomGroup(NSString *username) {
     if (username.length == 0) return NO;
+
     WCRefineGroupManager *mgr = WCRGroupManager();
+    if (!mgr) return NO;
+
     NSArray<NSString *> *memberGroupIds = [mgr groupIdsContainingMember:username] ?: @[];
     if (memberGroupIds.count == 0) return NO;
 
@@ -143,16 +173,14 @@ static void WCREnsureActiveFrontDefaults(void) {
     WCRefineGroupManager *mgr = WCRGroupManager();
     if (!cfg || !mgr) return;
 
-    // 1) Grouped sessions with unread messages remain native rows on WeChat home.
+    // Grouped sessions with unread messages must remain native rows on home.
     cfg.homeGroupingExcludeUnreadEnabled = YES;
 
-    // Keep those native rows in the normal/front part of the list, not below groups.
+    // Native unread/held rows stay in WeChat's normal/front session area,
+    // rather than being projected below WCRefine group rows.
     cfg.homeGroupingUnreadBelowGroupsEnabled = NO;
 
-    // 2) Reuse WCRefine's existing explicit exclusion list as persistent "保持" state.
-    cfg.homeGroupingExcludeSessionsEnabled = YES;
-
-    // 3) The old unread-message group is redundant in this interaction model.
+    // The old unread-message group is redundant in this interaction model.
     WCRefineGroup *unreadGroup = [mgr groupForId:kWCRUnreadQuickGroupId];
     if (unreadGroup && !unreadGroup.disabled) {
         unreadGroup.disabled = YES;
@@ -203,32 +231,35 @@ static void WCRPresentGroupPicker(NewMainFrameViewController *host,
     for (WCRefineGroup *group in groups) {
         NSString *title = group.name.length ? group.name : @"未命名分组";
         NSString *groupId = [group.groupId copy];
+
         [sheet addAction:[UIAlertAction actionWithTitle:title
                                                  style:UIAlertActionStyleDefault
                                                handler:^(__unused UIAlertAction *action) {
-            // Treat "分组" as an exclusive move for home-session grouping:
-            // remove the member from any existing custom groups first, then add to the chosen group.
-            // This prevents one conversation from appearing in multiple custom groups.
+            // "分组" means MOVE for this feature: remove the conversation from
+            // other custom groups first, then add it to the selected group.
             NSArray<NSString *> *existing = [mgr groupIdsContainingMember:username] ?: @[];
             NSSet<NSString *> *customIds = WCRCustomGroupIdSet();
             for (NSString *existingGroupId in existing) {
-                if ([customIds containsObject:existingGroupId] && ![existingGroupId isEqualToString:groupId]) {
+                if ([customIds containsObject:existingGroupId] &&
+                    ![existingGroupId isEqualToString:groupId]) {
                     [mgr removeMember:username fromGroup:existingGroupId];
                 }
             }
 
             BOOL ok = [mgr addMember:username toGroup:groupId];
             if (ok) {
-                // Group assignment cancels an old explicit Keep state. If this conversation
-                // is unread it still stays on home through WCRefine's unread-exclusion rule;
-                // once read it will naturally return to the newly selected group.
-                WCRSetHeld(username, NO, host);
+                // A newly assigned group starts in normal grouped state.
+                // If it still has unread messages, WCRefine's unread rule keeps
+                // it temporarily visible until those messages are read.
+                WCRPersistHeld(username, NO);
                 WCRRefreshHome(host, @"active_front_assign_group");
             }
         }]];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消"
+                                             style:UIAlertActionStyleCancel
+                                           handler:nil]];
 
     UIPopoverPresentationController *popover = sheet.popoverPresentationController;
     if (popover) {
@@ -240,24 +271,39 @@ static void WCRPresentGroupPicker(NewMainFrameViewController *host,
     [WCRTopPresenter(host) presentViewController:sheet animated:YES completion:nil];
 }
 
-#pragma mark - Dynamic swipe action
+#pragma mark - Dynamic swipe actions
+
+static BOOL WCRResolveSessionState(id session,
+                                   NSString **usernameOut,
+                                   BOOL *groupedOut,
+                                   BOOL *heldOut) {
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    if (!provider || !session) return NO;
+
+    NSString *username = [provider usernameForNativeObject:session];
+    if (![username isKindOfClass:[NSString class]] || username.length == 0) return NO;
+
+    NSUInteger scope = [provider groupScopeForNativeSession:session];
+    // Recovered from WCRefine 2.1-2: 1 = friend, 2 = chat room.
+    if (scope != 1 && scope != 2) return NO;
+
+    BOOL grouped = WCRIsInCustomGroup(username);
+    BOOL held = grouped && WCRIsHeld(username);
+
+    if (usernameOut) *usernameOut = username;
+    if (groupedOut) *groupedOut = grouped;
+    if (heldOut) *heldOut = held;
+    return YES;
+}
 
 static UIContextualAction *WCRActionForSession(NewMainFrameViewController *host,
                                                UITableView *tableView,
                                                NSIndexPath *indexPath,
                                                id session) {
-    WCRefineGroupDataProvider *provider = WCRDataProvider();
-    if (!provider || !session) return nil;
-
-    NSString *username = [provider usernameForNativeObject:session];
-    if (![username isKindOfClass:[NSString class]] || username.length == 0) return nil;
-
-    NSUInteger scope = [provider groupScopeForNativeSession:session];
-    // WCRefine metadata/disassembly identifies 1=friend and 2=chat room.
-    if (scope != 1 && scope != 2) return nil;
-
-    BOOL grouped = WCRIsInCustomGroup(username);
-    BOOL held = grouped && WCRIsHeld(username);
+    NSString *username = nil;
+    BOOL grouped = NO;
+    BOOL held = NO;
+    if (!WCRResolveSessionState(session, &username, &grouped, &held)) return nil;
 
     if (!grouped) {
         return [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
@@ -293,22 +339,14 @@ static UIContextualAction *WCRActionForSession(NewMainFrameViewController *host,
     }];
 }
 
-
 static UITableViewRowAction *WCROldStyleActionForSession(NewMainFrameViewController *host,
                                                          UITableView *tableView,
                                                          NSIndexPath *indexPath,
                                                          id session) {
-    WCRefineGroupDataProvider *provider = WCRDataProvider();
-    if (!provider || !session) return nil;
-
-    NSString *username = [provider usernameForNativeObject:session];
-    if (![username isKindOfClass:[NSString class]] || username.length == 0) return nil;
-
-    NSUInteger scope = [provider groupScopeForNativeSession:session];
-    if (scope != 1 && scope != 2) return nil;
-
-    BOOL grouped = WCRIsInCustomGroup(username);
-    BOOL held = grouped && WCRIsHeld(username);
+    NSString *username = nil;
+    BOOL grouped = NO;
+    BOOL held = NO;
+    if (!WCRResolveSessionState(session, &username, &grouped, &held)) return nil;
 
     if (!grouped) {
         return [UITableViewRowAction rowActionWithStyle:UITableViewRowActionStyleNormal
@@ -338,11 +376,37 @@ static UITableViewRowAction *WCROldStyleActionForSession(NewMainFrameViewControl
     }];
 }
 
+#pragma mark - Hooks
+
+%group WCRActiveFrontHooks
+
+// This is the key projection hook. WCRefine already calls this while building
+// its home snapshot whenever unread-exclusion is enabled. Returning YES means
+// "do not collect this native session into a group right now".
+%hook WCRefineGroupDataProvider
+
+- (BOOL)shouldExcludeNativeSessionFromGroupingForUnreadPolicy:(id)session {
+    BOOL originalDecision = %orig;
+    if (originalDecision) return YES; // native unread behavior from WCRefine
+
+    NSString *username = [self usernameForNativeObject:session];
+    if (username.length == 0) return NO;
+
+    // A Keep flag only has meaning while the conversation still belongs to a
+    // WCRefine custom group. Stale flags therefore cannot pin ungrouped rows.
+    return WCRIsHeld(username) && WCRIsInCustomGroup(username);
+}
+
+%end
+
 %hook NewMainFrameViewController
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     WCREnsureActiveFrontDefaults();
+    // Rebuild after returning from a chat. If the chat was not kept and its
+    // unread count is now zero, WCRefine naturally collects it back to group.
+    WCRRefreshHome(self, @"active_front_home_appear");
 }
 
 - (NSArray *)wcrGrouping_tableView:(UITableView *)tableView
@@ -389,3 +453,22 @@ static UITableViewRowAction *WCROldStyleActionForSession(NewMainFrameViewControl
 }
 
 %end
+
+%end // WCRActiveFrontHooks
+
+%ctor {
+    @autoreleasepool {
+        // Schedule initialization onto the main queue so other injected tweaks
+        // (notably WCRefine itself) finish registering their classes/methods
+        // before we attach to WCRefine's runtime-added hook methods.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (NSClassFromString(@"WCRefineConfig") &&
+                NSClassFromString(@"WCRefineGroupManager") &&
+                NSClassFromString(@"WCRefineGroupDataProvider") &&
+                NSClassFromString(@"NewMainFrameViewController")) {
+                %init(WCRActiveFrontHooks);
+                WCREnsureActiveFrontDefaults();
+            }
+        });
+    }
+}

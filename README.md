@@ -1,63 +1,68 @@
-# WCRefine Active Front patch (prototype v0.3)
+# WCRefine Active Front v0.4
 
 Target: WCRefine 2.1-2, rootless.
 
-## Behavior
+## Intended behavior
 
-- Grouped friend/chat room + unread message: temporarily remains as a native WeChat home session.
-- Open/read without choosing Keep: after unread clears and home refreshes, WCRefine collects it back into its original group.
-- Before opening, swipe left and choose **保持**: session is added to WCRefine's existing `homeGroupingExcludeSessions`, so it stays native on home after being read.
-- Held session: swipe left and choose **回组** to remove it from that exclusion list.
-- Ungrouped friend/chat room: retains native WeChat behavior; swipe left shows **分组**, then choose an existing WCRefine custom group.
-- Old `wcrefine_quick_unread` group is disabled because unread sessions are surfaced directly.
-- Native WeChat ordering is not replaced by this patch.
+1. A friend/chat room that is not assigned to a WCRefine custom group remains a normal native WeChat home session.
+2. An ungrouped friend/chat room gets an extra swipe action: **分组**.
+3. A grouped friend/chat room with unread messages temporarily stays as a native WeChat home session.
+4. If the user opens that surfaced session without choosing **保持**, unread clears; when returning home, WCRefine rebuilds the snapshot and collects the session back into its original group.
+5. Before opening, swipe the surfaced grouped session and choose **保持**. It stays on the native WeChat home list even after being read.
+6. A held grouped session gets **回组**. Choosing it clears only this tweak's Keep flag and lets WCRefine collect it back into its original group.
+7. Surfaced/held rows keep WeChat's native ordering, pinning, preview, unread badge, draft behavior, etc.
+8. WCRefine's old unread-message quick group is disabled.
 
-## Important design choice
+## v0.4 compatibility change
 
-This patch does not create a second grouping database. It reuses three existing WCRefine mechanisms discovered in the 2.1-2 binary:
+v0.3 reused WCRefine's `homeGroupingExcludeSessions` as the Keep list. v0.4 no longer does that.
 
-- `homeGroupingExcludeUnreadEnabled` -> temporary unread surfacing.
-- `homeGroupingExcludeSessions` -> persistent Keep state.
-- `WCRefineGroupManager addMember:toGroup:` -> group assignment.
+The Keep list is now stored independently under:
+
+`com.local.wcrefine.activefront.heldUsernames.v1`
+
+The patch hooks WCRefine's existing:
+
+`-[WCRefineGroupDataProvider shouldExcludeNativeSessionFromGroupingForUnreadPolicy:]`
+
+The original result is preserved. When WCRefine itself says a session should stay native because it is unread, v0.4 returns YES unchanged. If not unread, v0.4 additionally returns YES only when the username has our Keep flag and still belongs to a custom group.
+
+This prevents **回组** from modifying the user's own WCRefine "exclude sessions" configuration.
+
+## Group assignment
+
+The extra **分组** action is shown only for friend/chat-room native rows that are currently not in a WCRefine custom group.
+
+Choosing a group is treated as an exclusive move among custom groups:
+
+- remove from other custom groups;
+- add to selected custom group;
+- clear stale Active Front Keep state;
+- refresh WCRefine home projection.
 
 ## Build
 
-Requires a rootless Theos toolchain with an iOS SDK:
+Requires rootless Theos + iOS SDK:
 
 ```sh
-make package
+make clean package
 ```
 
-The current analysis environment does not contain a usable iOS SDK/Theos installation, so this folder is source-complete but not compiled here.
+## First-device test order
 
-## Test order
+Test these in order so a failure can be isolated quickly:
 
-1. Launch WeChat and confirm the old unread group is hidden.
-2. Send a message to a grouped friend: the friend should appear as a native home row.
-3. Open it without Keep, return home: it should be back inside its original group.
-4. Repeat, but swipe **保持** before opening: after reading it should remain on home.
-5. Swipe the held row and choose **回组**: it should return to its original group.
-6. For an ungrouped friend/chat room, swipe and choose **分组**: choose a matching group and confirm membership.
-7. Verify multiple surfaced/held rows are ordered by WeChat itself.
+1. Launch WeChat and verify WCRefine itself still loads normally.
+2. Verify the old unread quick group is disabled.
+3. Use an **ungrouped** friend: swipe left -> **分组** should appear and the group picker should list groups of matching scope.
+4. Assign that friend to a group and confirm the normal home row disappears after refresh if it has no unread message.
+5. Send a new message to that grouped friend. It should surface as a normal native WeChat row.
+6. Open it directly without **保持**, read it, return home. It should return to its original group.
+7. Send another message. Before opening, swipe -> **保持**. Open/read/return. It should remain on home.
+8. Swipe the held row -> **回组**. With no unread messages it should disappear from native home and return to its original group.
+9. Repeat steps 5-8 with a chat room.
+10. Surface multiple conversations and verify their order is controlled by WeChat, not by this patch.
 
-The existing "group row cannot be tapped" WCRefine bug is intentionally not addressed in this patch yet.
+## Deliberately not addressed yet
 
-
-## v0.2 static compatibility update
-
-- Hooks both WCRefine swipe paths: modern `UISwipeActionsConfiguration` and legacy `UITableViewRowAction`.
-- Keeps the original WCRefine swipe actions and appends one dynamic action: `分组` / `保持` / `回组`.
-- No changes to the known group-row tap/highlight issue.
-
-## Reverse-engineering checks for WCRefine 2.1-2
-
-- `homeGroupingExcludeUnreadEnabled` is read while WCRefine builds the home grouping snapshot. When `shouldExcludeNativeSessionFromGroupingForUnreadPolicy:` returns true, that native session skips the group-collection path and remains in the WeChat home list.
-- `groupScopeForNativeSession:` returns scope `2` for usernames ending in `@chatroom` / `@im.chatroom`, and scope `1` for normal single-chat sessions; these are the two scopes patched here.
-- `homeGroupingExcludeSessions` is converted into a set during snapshot construction and is suitable for the explicit Keep/Return state.
-
-
-## v0.3 behavior refinement
-
-- The **分组** action now behaves as an exclusive move among WCRefine custom groups: it removes the conversation from other custom groups before adding it to the selected one.
-- Assigning a conversation to a group also clears any stale **保持** state, while unread surfacing still keeps a newly active conversation visible until it is read.
-- The known group-row tap/highlight visual issue remains intentionally untouched.
+The existing WCRefine group-row tap/highlight visual-feedback issue is not changed in this branch. It remains the final task after Active Front behavior is stable.

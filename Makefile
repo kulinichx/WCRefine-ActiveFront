@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = ZZWCRefineActiveFront
 ZZWCRefineActiveFront_FILES = Tweak.xm
-ZZWCRefineActiveFront_CFLAGS = -fobjc-arc
+ZZWCRefineActiveFront_CFLAGS = -fobjc-arc -fblocks
 ZZWCRefineActiveFront_FRAMEWORKS = UIKit Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk

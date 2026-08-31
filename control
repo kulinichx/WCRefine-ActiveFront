@@ -1,8 +1,8 @@
 Package: com.local.wcrefine.activefront
 Name: WCRefine Active Front
-Version: 0.2.0
+Version: 0.4.0
 Architecture: iphoneos-arm64
-Description: Adds native-home surfacing, Keep/Return, and quick grouping to WCRefine 2.1-2.
+Description: Active-front sessions, Keep/Return, and quick grouping for WCRefine 2.1-2.
 Maintainer: local
 Author: local
 Section: Tweaks
