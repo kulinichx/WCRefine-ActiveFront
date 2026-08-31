@@ -1,4 +1,16 @@
-# WCRefine Group v1.4 (TrollStore)
+# WCRefine Group v1.5 (TrollStore)
+
+## v1.5 runtime-hook fix
+
+- Removed the global all-or-nothing runtime readiness gate.
+- Removed the dependency on `dlsym(RTLD_DEFAULT, "MSHookMessageEx")`.
+- Each WCRefine hook is installed independently with Objective-C runtime APIs.
+- Swipe actions can work even if an unrelated message/projection selector is absent.
+- ActiveFront action is appended after WCRefine/WeChat actions, preserving their original order and full-swipe target.
+- Session lookup accepts either the active selector or the WCRefine alias.
+- Group assignment now adds the destination first, then removes old custom-group membership.
+- Startup waits 4 seconds for WCRefine to settle, then verifies hooks independently.
+
 
 
 ## v1.4 device fix

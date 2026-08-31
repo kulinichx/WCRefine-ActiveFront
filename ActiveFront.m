@@ -1,10 +1,9 @@
 #import <UIKit/UIKit.h>
-#import <dlfcn.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <stdarg.h>
 
-static NSString * const kWCRAFVersion = @"1.4";
+static NSString * const kWCRAFVersion = @"1.5";
 
 static void WCRAFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void WCRAFLog(NSString *format, ...) {
@@ -315,8 +314,17 @@ static NSArray<WCRefineGroup *> *WCRAvailableGroupsForScope(NSUInteger scope) {
     NSMutableArray<WCRefineGroup *> *groups = [NSMutableArray array];
     for (WCRefineGroup *group in mgr.customGroups ?: @[]) {
         if (group.disabled) continue;
-        if (group.scope != scope) continue;
         if (group.groupId.length == 0) continue;
+
+        // WCRefine 2.1-2 uses more than one scope value and some builds expose
+        // scope-like bitmasks. Exact equality remains authoritative; overlap is
+        // only a fallback so a valid friend/chat-room group is not hidden.
+        BOOL scopeMatches = (group.scope == scope);
+        if (!scopeMatches && group.scope != 0 && scope != 0) {
+            scopeMatches = ((group.scope & scope) != 0);
+        }
+        if (!scopeMatches) continue;
+
         [groups addObject:group];
     }
     return groups;
@@ -496,28 +504,16 @@ static UIContextualAction *WCRActionForSession(NewMainFrameViewController *host,
 }
 
 
-#pragma mark - Manual Substrate hooks for TrollStore injection
+#pragma mark - Objective-C runtime hooks for TrollStore injection
 
-typedef void (*WCRMSHookMessageExFn)(Class cls, SEL sel, IMP replacement, IMP *result);
-static WCRMSHookMessageExFn gMSHookMessageEx = NULL;
-
-static BOOL WCRResolveSubstrateHookAPI(void) {
-    if (gMSHookMessageEx) return YES;
-    gMSHookMessageEx = (WCRMSHookMessageExFn)dlsym(RTLD_DEFAULT, "MSHookMessageEx");
-    if (gMSHookMessageEx) {
-        WCRAF_LOG(@"resolved MSHookMessageEx");
-    }
-    return gMSHookMessageEx != NULL;
-}
+// v1.5 deliberately does not depend on MSHookMessageEx. Each WCRefine hook is
+// installed independently using the Objective-C runtime. A missing optional
+// class/selector therefore cannot disable unrelated features such as swipe
+// actions.
 
 static BOOL (*orig_configExcludeUnread)(id, SEL) = NULL;
 static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
     BOOL original = orig_configExcludeUnread ? orig_configExcludeUnread(self, _cmd) : NO;
-
-    // WCRefine guards its per-session unread-policy predicate behind this
-    // getter. Temporarily ensure that predicate runs only while ActiveFront
-    // actually needs projection work (or during the short startup recovery
-    // window). Outside those cases the user's WCRefine setting is untouched.
     return original || gWCRBootstrapUnreadFallbackOpen || WCRHasAnyActiveFrontProjection();
 }
 
@@ -526,14 +522,18 @@ static BOOL hook_shouldExclude(id self, SEL _cmd, id session) {
     BOOL originalDecision = orig_shouldExclude ? orig_shouldExclude(self, _cmd, session) : NO;
     NSString *username = [self usernameForNativeObject:session];
     if (username.length == 0) return originalDecision;
+
     if (WCRIsHeld(username) && WCRIsInCustomGroup(username)) return YES;
+
     if (WCRIsSurfaced(username) && WCRIsInCustomGroup(username)) {
         BOOL unreadKnown = NO;
         BOOL hasUnread = WCRSessionUnreadState(session, &unreadKnown);
         if (!unreadKnown || hasUnread) return YES;
+
         WCRPersistSurfaced(username, NO);
         return NO;
     }
+
     if (gWCRBootstrapUnreadFallbackOpen && WCRIsInCustomGroup(username)) {
         BOOL unreadKnown = NO;
         BOOL hasUnread = WCRSessionUnreadState(session, &unreadKnown);
@@ -543,9 +543,6 @@ static BOOL hook_shouldExclude(id self, SEL _cmd, id session) {
         }
     }
 
-    // Do not replace WCRefine's own unread behavior. Its unread-message
-    // feature remains entirely user-controlled; ActiveFront adds only the
-    // Held/Surfaced cases above and otherwise preserves WCRefine's decision.
     return originalDecision;
 }
 
@@ -553,10 +550,12 @@ static void (*orig_noteIncoming)(id, SEL, NSString *) = NULL;
 static void hook_noteIncoming(id self, SEL _cmd, NSString *username) {
     BOOL valid = [username isKindOfClass:[NSString class]] && username.length > 0;
     BOOL grouped = valid && WCRIsInCustomGroup(username);
+
     if (grouped) {
         WCRPersistSurfaced(username, YES);
         WCRAF_LOG(@"incoming surfaced: %@", username);
     }
+
     if (orig_noteIncoming) orig_noteIncoming(self, _cmd, username);
     if (grouped) WCRRefreshHomeGlobal(@"active_front_incoming");
 }
@@ -565,129 +564,240 @@ static void (*orig_noteRead)(id, SEL, NSString *) = NULL;
 static void hook_noteRead(id self, SEL _cmd, NSString *username) {
     BOOL valid = [username isKindOfClass:[NSString class]] && username.length > 0;
     BOOL wasSurfaced = valid && WCRIsSurfaced(username);
+
     if (wasSurfaced) {
         WCRPersistSurfaced(username, NO);
         WCRAF_LOG(@"read consumed surfaced: %@", username);
     }
+
     if (orig_noteRead) orig_noteRead(self, _cmd, username);
     if (wasSurfaced) WCRRefreshHomeGlobal(@"active_front_read");
 }
 
-static void (*orig_activeViewDidAppear)(id, SEL, BOOL) = NULL;
-static void hook_activeViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    if (orig_activeViewDidAppear) orig_activeViewDidAppear(self, _cmd, animated);
-    WCRPruneStaleActiveFrontState();
-    WCRRefreshHomeDeferred(self, @"active_front_home_appear");
+static id WCRSessionAtIndexPath(id host, NSIndexPath *indexPath) {
+    if (!host || !indexPath) return nil;
+
+    if ([host respondsToSelector:@selector(logicGetSessionAtIndexPath:)]) {
+        return [host logicGetSessionAtIndexPath:indexPath];
+    }
+
+    if ([host respondsToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
+        return [host wcrGrouping_logicGetSessionAtIndexPath:indexPath];
+    }
+
+    return nil;
 }
 
-
 static UISwipeActionsConfiguration *(*orig_trailingActions)(id, SEL, UITableView *, NSIndexPath *) = NULL;
-static UISwipeActionsConfiguration *hook_trailingActions(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) API_AVAILABLE(ios(11.0)) {
-    // orig_trailingActions is WCRefine's active grouping implementation because
-    // we install this hook only after WCRefine's selector exchange is visible.
-    UISwipeActionsConfiguration *original = orig_trailingActions ? orig_trailingActions(self, _cmd, tableView, indexPath) : nil;
-    id session = [self respondsToSelector:@selector(logicGetSessionAtIndexPath:)] ? [self logicGetSessionAtIndexPath:indexPath] : nil;
+static UISwipeActionsConfiguration *hook_trailingActions(id self,
+                                                          SEL _cmd,
+                                                          UITableView *tableView,
+                                                          NSIndexPath *indexPath) API_AVAILABLE(ios(11.0)) {
+    UISwipeActionsConfiguration *original =
+        orig_trailingActions ? orig_trailingActions(self, _cmd, tableView, indexPath) : nil;
+
+    id session = WCRSessionAtIndexPath(self, indexPath);
     UIContextualAction *ours = WCRActionForSession(self, tableView, indexPath, session);
     if (!ours) return original;
-    NSMutableArray *actions = [NSMutableArray arrayWithObject:ours];
-    if ([original.actions isKindOfClass:[NSArray class]]) [actions addObjectsFromArray:original.actions];
-    UISwipeActionsConfiguration *result = [UISwipeActionsConfiguration configurationWithActions:actions];
-    result.performsFirstActionWithFullSwipe = NO;
+
+    // Keep WCRefine/WeChat's original three actions in their original order.
+    // Our state action is appended so it appears nearest the conversation cell,
+    // while the original first action remains the full-swipe target.
+    NSMutableArray<UIContextualAction *> *actions = [NSMutableArray array];
+    if ([original.actions isKindOfClass:[NSArray class]]) {
+        [actions addObjectsFromArray:original.actions];
+    }
+    [actions addObject:ours];
+
+    UISwipeActionsConfiguration *result =
+        [UISwipeActionsConfiguration configurationWithActions:actions];
+
+    result.performsFirstActionWithFullSwipe =
+        original ? original.performsFirstActionWithFullSwipe : NO;
+
+    WCRAF_LOG(@"swipe merged original=%lu total=%lu",
+              (unsigned long)original.actions.count,
+              (unsigned long)actions.count);
     return result;
 }
 
-static BOOL gWCRAFHooksInstalled = NO;
+// class_replaceMethod safely creates an override on cls for an inherited method,
+// instead of modifying the superclass implementation. Hooks are installed once:
+// after the 4-second WCRefine settle delay we retry only selectors that are still
+// missing, avoiding any possibility of wrapping a later method-exchange twice.
+static BOOL WCRInstallRuntimeHookOnce(Class cls,
+                                      SEL sel,
+                                      IMP replacement,
+                                      IMP *original,
+                                      BOOL *installedFlag,
+                                      NSString *name) {
+    if (installedFlag && *installedFlag) return YES;
+    if (!cls || !sel || !replacement) return NO;
 
-static void WCRLogRuntimeReadiness(void) {
-    Class config = NSClassFromString(@"WCRefineConfig");
-    Class manager = NSClassFromString(@"WCRefineGroupManager");
-    Class provider = NSClassFromString(@"WCRefineGroupDataProvider");
-    Class quickRuntime = NSClassFromString(@"WCRQuickChatRuntime");
-    Class mainFrame = NSClassFromString(@"NewMainFrameViewController");
-    WCRAF_LOG(@"runtime readiness substrate=%d config=%d manager=%d provider=%d quick=%d main=%d trailing=%d trailingAlias=%d logic=%d logicAlias=%d",
-              gMSHookMessageEx != NULL,
-              config != Nil, manager != Nil, provider != Nil, quickRuntime != Nil, mainFrame != Nil,
-              mainFrame && [mainFrame instancesRespondToSelector:@selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)],
-              mainFrame && [mainFrame instancesRespondToSelector:@selector(wcrGrouping_tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)],
-              mainFrame && [mainFrame instancesRespondToSelector:@selector(logicGetSessionAtIndexPath:)],
-              mainFrame && [mainFrame instancesRespondToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)]);
-}
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!method) return NO;
 
-static BOOL WCRRuntimeReadyForHooks(void) {
-    if (!WCRResolveSubstrateHookAPI()) return NO;
-    Class config = NSClassFromString(@"WCRefineConfig");
-    Class manager = NSClassFromString(@"WCRefineGroupManager");
-    Class provider = NSClassFromString(@"WCRefineGroupDataProvider");
-    Class quickRuntime = NSClassFromString(@"WCRQuickChatRuntime");
-    Class mainFrame = NSClassFromString(@"NewMainFrameViewController");
-    if (!config || !manager || !provider || !quickRuntime || !mainFrame) return NO;
-    return [provider instancesRespondToSelector:@selector(shouldExcludeNativeSessionFromGroupingForUnreadPolicy:)] &&
-           [quickRuntime instancesRespondToSelector:@selector(noteIncomingMessageForUsername:)] &&
-           [quickRuntime instancesRespondToSelector:@selector(noteReadForUsername:)] &&
-           [mainFrame instancesRespondToSelector:@selector(viewDidAppear:)] &&
-           [mainFrame instancesRespondToSelector:@selector(wcrGrouping_viewDidAppear:)] &&
-           [mainFrame instancesRespondToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)] &&
-           [mainFrame instancesRespondToSelector:@selector(logicGetSessionAtIndexPath:)] &&
-           [mainFrame instancesRespondToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)] &&
-           // trailingSwipeActions... is installed by WCRefine through
-           // installOptionalTableDelegateOnClass:. If WeChat did not originally
-           // implement the modern delegate method, WCRefine adds ONLY the native
-           // selector and does not create the wcrGrouping_ alias on the target
-           // class. Requiring that alias here prevented every ActiveFront hook
-           // from ever being installed on those WeChat builds.
-           [mainFrame instancesRespondToSelector:@selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)];
-}
+    IMP current = method_getImplementation(method);
+    const char *types = method_getTypeEncoding(method);
+    if (!current || !types) return NO;
 
-static void WCRInstallHook(Class cls, SEL sel, IMP replacement, IMP *original) {
-    if (cls && [cls instancesRespondToSelector:sel] && gMSHookMessageEx) {
-        gMSHookMessageEx(cls, sel, replacement, original);
+    if (current == replacement) {
+        if (installedFlag) *installedFlag = YES;
+        return YES;
     }
+
+    if (original) *original = current;
+    class_replaceMethod(cls, sel, replacement, types);
+
+    Method installed = class_getInstanceMethod(cls, sel);
+    BOOL ok = installed && method_getImplementation(installed) == replacement;
+    if (ok) {
+        if (installedFlag) *installedFlag = YES;
+        WCRAF_LOG(@"runtime hook installed: %@", name ?: NSStringFromSelector(sel));
+    }
+    return ok;
 }
 
-static void WCRInstallHooks(void) {
-    WCRAF_LOG(@"installing runtime hooks");
+typedef struct {
+    BOOL config;
+    BOOL projection;
+    BOOL incoming;
+    BOOL read;
+    BOOL swipe;
+} WCRHookStatus;
+
+static BOOL gHookConfigInstalled = NO;
+static BOOL gHookProjectionInstalled = NO;
+static BOOL gHookIncomingInstalled = NO;
+static BOOL gHookReadInstalled = NO;
+static BOOL gHookSwipeInstalled = NO;
+
+static WCRHookStatus WCREnsureIndependentHooks(void) {
     Class config = NSClassFromString(@"WCRefineConfig");
     Class provider = NSClassFromString(@"WCRefineGroupDataProvider");
     Class quickRuntime = NSClassFromString(@"WCRQuickChatRuntime");
     Class mainFrame = NSClassFromString(@"NewMainFrameViewController");
+    Class manager = NSClassFromString(@"WCRefineGroupManager");
 
-    WCRInstallHook(config, @selector(homeGroupingExcludeUnreadEnabled), (IMP)hook_configExcludeUnread, (IMP *)&orig_configExcludeUnread);
-    WCRInstallHook(provider, @selector(shouldExcludeNativeSessionFromGroupingForUnreadPolicy:), (IMP)hook_shouldExclude, (IMP *)&orig_shouldExclude);
-    WCRInstallHook(quickRuntime, @selector(noteIncomingMessageForUsername:), (IMP)hook_noteIncoming, (IMP *)&orig_noteIncoming);
-    WCRInstallHook(quickRuntime, @selector(noteReadForUsername:), (IMP)hook_noteRead, (IMP *)&orig_noteRead);
-    // WCRefine swizzles the native selectors with its wcrGrouping_ aliases.
-    // After that exchange, the native selector is the ACTIVE grouping implementation,
-    // while the wcrGrouping_ selector points back to the pre-WCRefine/original method.
-    // Hook the active selectors, not the aliases.
-    WCRInstallHook(mainFrame, @selector(viewDidAppear:), (IMP)hook_activeViewDidAppear, (IMP *)&orig_activeViewDidAppear);
-    WCRInstallHook(mainFrame, @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:), (IMP)hook_trailingActions, (IMP *)&orig_trailingActions);
+    WCRHookStatus status = {0};
+
+    status.config = WCRInstallRuntimeHookOnce(config,
+                                             @selector(homeGroupingExcludeUnreadEnabled),
+                                             (IMP)hook_configExcludeUnread,
+                                             (IMP *)&orig_configExcludeUnread,
+                                             &gHookConfigInstalled,
+                                             @"config.excludeUnread");
+
+    status.projection = WCRInstallRuntimeHookOnce(
+        provider,
+        @selector(shouldExcludeNativeSessionFromGroupingForUnreadPolicy:),
+        (IMP)hook_shouldExclude,
+        (IMP *)&orig_shouldExclude,
+        &gHookProjectionInstalled,
+        @"provider.shouldExclude");
+
+    status.incoming = WCRInstallRuntimeHookOnce(
+        quickRuntime,
+        @selector(noteIncomingMessageForUsername:),
+        (IMP)hook_noteIncoming,
+        (IMP *)&orig_noteIncoming,
+        &gHookIncomingInstalled,
+        @"quick.noteIncoming");
+
+    status.read = WCRInstallRuntimeHookOnce(
+        quickRuntime,
+        @selector(noteReadForUsername:),
+        (IMP)hook_noteRead,
+        (IMP *)&orig_noteRead,
+        &gHookReadInstalled,
+        @"quick.noteRead");
+
+    BOOL hasSessionLookup =
+        mainFrame &&
+        ([mainFrame instancesRespondToSelector:@selector(logicGetSessionAtIndexPath:)] ||
+         [mainFrame instancesRespondToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)]);
+
+    BOOL swipePrerequisites =
+        mainFrame && manager && provider && hasSessionLookup &&
+        [mainFrame instancesRespondToSelector:
+            @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)];
+
+    if (swipePrerequisites) {
+        status.swipe = WCRInstallRuntimeHookOnce(
+            mainFrame,
+            @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:),
+            (IMP)hook_trailingActions,
+            (IMP *)&orig_trailingActions,
+            &gHookSwipeInstalled,
+            @"main.trailingSwipe");
+    } else {
+        status.swipe = gHookSwipeInstalled;
+    }
+
+    return status;
 }
+
+static BOOL WCRAllDesiredHooksReady(WCRHookStatus s) {
+    return s.config && s.projection && s.incoming && s.read && s.swipe;
+}
+
+static void WCRLogHookStatus(WCRHookStatus s) {
+    Class mainFrame = NSClassFromString(@"NewMainFrameViewController");
+    WCRAF_LOG(@"hook status config=%d projection=%d incoming=%d read=%d swipe=%d main=%d logic=%d logicAlias=%d trailing=%d",
+              s.config, s.projection, s.incoming, s.read, s.swipe,
+              mainFrame != Nil,
+              mainFrame && [mainFrame instancesRespondToSelector:@selector(logicGetSessionAtIndexPath:)],
+              mainFrame && [mainFrame instancesRespondToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)],
+              mainFrame && [mainFrame instancesRespondToSelector:
+                  @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)]);
+}
+
+static BOOL gWCRBootstrapCloseScheduled = NO;
+static BOOL gWCRInitialStatePruned = NO;
 
 static void WCRTryInstallHooks(NSUInteger attemptsRemaining) {
-    if (gWCRAFHooksInstalled) return;
-    if (WCRRuntimeReadyForHooks()) {
-        WCRInstallHooks();
-        gWCRAFHooksInstalled = YES;
-        WCRAF_LOG(@"hooks installed successfully");
+    WCRHookStatus status = WCREnsureIndependentHooks();
+
+    if (!gWCRInitialStatePruned && NSClassFromString(@"WCRefineGroupManager")) {
+        gWCRInitialStatePruned = YES;
         WCRPruneStaleActiveFrontState();
+    }
+
+    if (!gWCRBootstrapCloseScheduled &&
+        (status.projection || status.incoming || status.swipe)) {
+        gWCRBootstrapCloseScheduled = YES;
         WCRScheduleBootstrapUnreadFallbackClose();
+    }
+
+    if (WCRAllDesiredHooksReady(status)) {
+        WCRLogHookStatus(status);
+        WCRAF_LOG(@"all independent hooks installed");
         return;
     }
+
     if (attemptsRemaining == 0) {
-        WCRLogRuntimeReadiness();
-        WCRAF_LOG(@"hook installation timed out; WCRefine/Substrate runtime not ready");
+        WCRLogHookStatus(status);
+        WCRAF_LOG(@"hook retry window ended; successfully installed hooks remain active");
         return;
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
         WCRTryInstallHooks(attemptsRemaining - 1);
     });
 }
 
 __attribute__((constructor)) static void WCRActiveFrontEntry(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; waiting for WCRefine runtime");
-        dispatch_async(dispatch_get_main_queue(), ^{
-            WCRTryInstallHooks(40); // allow up to ~10s for injected WCRefine/Substrate startup
+        WCRAF_LOG(@"dylib loaded; v1.5 runtime-hook backend");
+
+        // Let WCRefine finish its own startup/swizzling before we wrap its final
+        // runtime methods. Then verify independently for up to ~20 seconds.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(4.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            WCRTryInstallHooks(80);
         });
     }
 }
