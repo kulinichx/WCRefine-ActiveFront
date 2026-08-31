@@ -1,68 +1,120 @@
-# WCRefine Active Front v0.4
+# WCRefine Active Front v1.0 — TrollStore injection edition
 
-Target: WCRefine 2.1-2, rootless.
+Target: a TrollStore-installed/injected WeChat build where **WCRefine 2.1-2 is already embedded and working**.
 
-## Intended behavior
+## Responsibility split
 
-1. A friend/chat room that is not assigned to a WCRefine custom group remains a normal native WeChat home session.
-2. An ungrouped friend/chat room gets an extra swipe action: **分组**.
-3. A grouped friend/chat room with unread messages temporarily stays as a native WeChat home session.
-4. If the user opens that surfaced session without choosing **保持**, unread clears; when returning home, WCRefine rebuilds the snapshot and collects the session back into its original group.
-5. Before opening, swipe the surfaced grouped session and choose **保持**. It stays on the native WeChat home list even after being read.
-6. A held grouped session gets **回组**. Choosing it clears only this tweak's Keep flag and lets WCRefine collect it back into its original group.
-7. Surfaced/held rows keep WeChat's native ordering, pinning, preview, unread badge, draft behavior, etc.
-8. WCRefine's old unread-message quick group is disabled.
+WCRefine remains the grouping engine. ActiveFront does not replace or rewrite its group database.
 
-## v0.4 compatibility change
+WCRefine continues to own:
 
-v0.3 reused WCRefine's `homeGroupingExcludeSessions` as the Keep list. v0.4 no longer does that.
+- custom friend/chat-room groups;
+- group creation, deletion, renaming and membership;
+- its original unread-message feature and its on/off state;
+- the rest of WCRefine's grouping UI/settings.
 
-The Keep list is now stored independently under:
+ActiveFront only adds the home-list projection behavior:
 
-`com.local.wcrefine.activefront.heldUsernames.v1`
+1. A real new message for an already-grouped friend/chat room marks that session **Surfaced**.
+2. Surfaced sessions remain native WeChat rows, so WeChat keeps its own ordering, pinning, message preview, unread badge/red dot and drafts.
+3. Open/read a Surfaced session without choosing **保持** -> Surfaced clears and the next WCRefine projection returns it to its original group.
+4. Swipe **保持** before opening -> persistent **Held** keeps it on the native home list after read.
+5. Swipe a Held row -> **回组** clears Held plus the current Surfaced state; group membership itself never changes.
+6. An ungrouped friend/chat room remains a normal WeChat row and gets a swipe action **分组**.
 
-The patch hooks WCRefine's existing:
+## WCRefine unread-message feature
 
-`-[WCRefineGroupDataProvider shouldExcludeNativeSessionFromGroupingForUnreadPolicy:]`
+v1.0 deliberately **does not enable, disable, delete, or rewrite** WCRefine's own unread-message group/settings.
 
-The original result is preserved. When WCRefine itself says a session should stay native because it is unread, v0.4 returns YES unchanged. If not unread, v0.4 additionally returns YES only when the username has our Keep flag and still belongs to a custom group.
+For the clean ActiveFront experience we currently recommend testing with WCRefine's unread-message group turned off. If the user turns WCRefine's unread feature back on, its original unread policy is allowed to continue running; ActiveFront does not silently change that preference.
 
-This prevents **回组** from modifying the user's own WCRefine "exclude sessions" configuration.
+Internally, ActiveFront only makes WCRefine's per-session projection predicate available while ActiveFront has Surfaced/Held state (plus a short startup recovery window). Outside those cases the original WCRefine getter result is returned unchanged.
 
-## Group assignment
+## Packaging model
 
-The extra **分组** action is shown only for friend/chat-room native rows that are currently not in a WCRefine custom group.
+This is an **app-injection dylib**, not a RootHide/rootless jailbreak package.
 
-Choosing a group is treated as an exclusive move among custom groups:
+- arm64;
+- no `/var/jb` dependency;
+- no RootHide `.jbroot` dependency;
+- no `control` or MobileSubstrate filter plist;
+- no static Substrate link;
+- resolves `MSHookMessageEx` dynamically from the CydiaSubstrate compatibility framework already loaded by the WCRefine-injected WeChat build.
 
-- remove from other custom groups;
-- add to selected custom group;
-- clear stale Active Front Keep state;
-- refresh WCRefine home projection.
+If WCRefine or `MSHookMessageEx` is unavailable, ActiveFront does not install its hooks.
 
-## Build
+## Local repository workflow (Windows + Git Bash)
 
-Requires rootless Theos + iOS SDK:
+Windows only needs Git for normal source management:
 
 ```sh
-make clean package
+git checkout feature/active-front
+git status
+git add .
+git commit -m "feat: preserve WCRefine unread settings"
 ```
 
-## First-device test order
+Compilation is intended to run in GitHub Actions.
 
-Test these in order so a failure can be isolated quickly:
+## GitHub Actions
 
-1. Launch WeChat and verify WCRefine itself still loads normally.
-2. Verify the old unread quick group is disabled.
-3. Use an **ungrouped** friend: swipe left -> **分组** should appear and the group picker should list groups of matching scope.
-4. Assign that friend to a group and confirm the normal home row disappears after refresh if it has no unread message.
-5. Send a new message to that grouped friend. It should surface as a normal native WeChat row.
-6. Open it directly without **保持**, read it, return home. It should return to its original group.
-7. Send another message. Before opening, swipe -> **保持**. Open/read/return. It should remain on home.
-8. Swipe the held row -> **回组**. With no unread messages it should disappear from native home and return to its original group.
-9. Repeat steps 5-8 with a chat room.
-10. Surface multiple conversations and verify their order is controlled by WeChat, not by this patch.
+The included `.github/workflows/build-dylib.yml` uses a macOS 14 GitHub runner and runs on pushes to `feature/active-front` or manually with `workflow_dispatch`.
 
-## Deliberately not addressed yet
+It:
 
-The existing WCRefine group-row tap/highlight visual-feedback issue is not changed in this branch. It remains the final task after Active Front behavior is stable.
+1. checks out Theos on a macOS 14 runner;
+2. uses the Xcode-provided iPhoneOS SDK rather than a separate Linux cross-toolchain;
+3. builds the project as arm64;
+4. finds `WCRefineActiveFront.dylib`;
+5. records Mach-O header, linked dependencies, undefined symbols and SHA-256;
+6. uploads all of those files as one Actions artifact.
+
+The workflow is intentionally compile-only. It does not modify a WeChat IPA/TIPA yet. The first CI run is meant to validate compilation and linkage before app injection is automated.
+
+## v1.0 runtime diagnostics
+
+The dylib now emits concise `NSLog` lines prefixed with `WCRefineActiveFront 1.0` for:
+
+- dylib constructor/load;
+- successful resolution of `MSHookMessageEx`;
+- hook installation success or timeout;
+- grouped incoming message -> Surfaced;
+- read -> Surfaced cleared;
+- swipe Keep / Return-to-group;
+- assigning an ungrouped session to a WCRefine group.
+
+These logs are for the first device validation. They do not change WCRefine's group data model or native WeChat ordering.
+
+## Intended app layout
+
+Conceptually:
+
+```text
+Payload/WeChat.app/
+  WeChat
+  Frameworks/
+    CydiaSubstrate.framework/...
+    WCRefine.dylib
+    WCRefineActiveFront.dylib
+```
+
+The final TIPA workflow should preserve the load-command/layout conventions used by the already-working WCRefine-injected WeChat package.
+
+## First device test order
+
+1. Confirm the current TrollStore WeChat + WCRefine build works unchanged.
+2. Turn off WCRefine's unread-message group for the initial ActiveFront test.
+3. Add only `WCRefineActiveFront.dylib` and its load command.
+4. Test ungrouped friend -> swipe **分组**.
+5. Test ungrouped group chat -> swipe **分组**.
+6. Grouped friend receives a real message -> native row surfaces.
+7. Open directly -> read -> return -> row goes back to its original group.
+8. Receive again -> swipe **保持** before opening -> read -> return -> row remains native.
+9. Swipe held row -> **回组** -> row returns to group.
+10. Repeat with group chats and muted/red-dot chats.
+11. Verify native WeChat ordering is unchanged.
+12. Optionally re-enable WCRefine's unread feature and observe coexistence behavior; ActiveFront must not alter its saved setting.
+
+## Deferred
+
+The pre-existing WCRefine group-row tap/highlight visual-feedback issue remains intentionally untouched until ActiveFront is stable.

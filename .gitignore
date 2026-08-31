@@ -1,0 +1,9 @@
+.theos-toolchain/
+.theos/
+obj/
+packages/
+*.dylib
+*.deb
+*.tipa
+*.ipa
+.DS_Store

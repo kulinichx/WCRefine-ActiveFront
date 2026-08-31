@@ -1,0 +1,60 @@
+name: Build ActiveFront dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/active-front
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos prerequisites
+        run: |
+          brew update
+          brew install ldid xz
+
+      - name: Install Theos
+        env:
+          THEOS: ${{ github.workspace }}/.theos-toolchain
+        run: |
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          "$THEOS/bin/nic.pl" --version || true
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Build arm64 dylib
+        run: |
+          set -euxo pipefail
+          make clean
+          make -j2 FINALPACKAGE=1 messages=yes
+
+      - name: Collect and inspect dylib
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+          DYLIB="$(find .theos -type f -name 'WCRefineActiveFront.dylib' | head -n 1)"
+          test -n "$DYLIB"
+          cp "$DYLIB" artifacts/WCRefineActiveFront.dylib
+          file artifacts/WCRefineActiveFront.dylib | tee artifacts/file.txt
+          otool -hv artifacts/WCRefineActiveFront.dylib | tee artifacts/mach-header.txt
+          otool -L artifacts/WCRefineActiveFront.dylib | tee artifacts/dependencies.txt
+          nm -u artifacts/WCRefineActiveFront.dylib | tee artifacts/undefined-symbols.txt || true
+          shasum -a 256 artifacts/WCRefineActiveFront.dylib > artifacts/WCRefineActiveFront.dylib.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WCRefineActiveFront-v1.0-arm64
+          path: artifacts/
+          if-no-files-found: error

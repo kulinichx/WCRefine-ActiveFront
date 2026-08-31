@@ -1,12 +1,12 @@
-ARCHS = arm64 arm64e
+ARCHS = arm64
 TARGET = iphone:clang:latest:14.0
-THEOS_PACKAGE_SCHEME = rootless
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = ZZWCRefineActiveFront
-ZZWCRefineActiveFront_FILES = Tweak.xm
-ZZWCRefineActiveFront_CFLAGS = -fobjc-arc -fblocks
-ZZWCRefineActiveFront_FRAMEWORKS = UIKit Foundation
+LIBRARY_NAME = WCRefineActiveFront
+WCRefineActiveFront_FILES = ActiveFront.m
+WCRefineActiveFront_CFLAGS = -fobjc-arc -fblocks -Wall -Wextra
+WCRefineActiveFront_FRAMEWORKS = UIKit Foundation
+WCRefineActiveFront_LDFLAGS = -Wl,-install_name,@rpath/WCRefineActiveFront.dylib
 
-include $(THEOS_MAKE_PATH)/tweak.mk
+include $(THEOS_MAKE_PATH)/library.mk
