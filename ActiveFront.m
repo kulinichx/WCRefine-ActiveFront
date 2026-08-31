@@ -4,7 +4,7 @@
 #import <objc/runtime.h>
 #import <stdarg.h>
 
-static NSString * const kWCRAFVersion = @"1.3";
+static NSString * const kWCRAFVersion = @"1.4";
 
 static void WCRAFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void WCRAFLog(NSString *format, ...) {
@@ -598,6 +598,21 @@ static UISwipeActionsConfiguration *hook_trailingActions(id self, SEL _cmd, UITa
 
 static BOOL gWCRAFHooksInstalled = NO;
 
+static void WCRLogRuntimeReadiness(void) {
+    Class config = NSClassFromString(@"WCRefineConfig");
+    Class manager = NSClassFromString(@"WCRefineGroupManager");
+    Class provider = NSClassFromString(@"WCRefineGroupDataProvider");
+    Class quickRuntime = NSClassFromString(@"WCRQuickChatRuntime");
+    Class mainFrame = NSClassFromString(@"NewMainFrameViewController");
+    WCRAF_LOG(@"runtime readiness substrate=%d config=%d manager=%d provider=%d quick=%d main=%d trailing=%d trailingAlias=%d logic=%d logicAlias=%d",
+              gMSHookMessageEx != NULL,
+              config != Nil, manager != Nil, provider != Nil, quickRuntime != Nil, mainFrame != Nil,
+              mainFrame && [mainFrame instancesRespondToSelector:@selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)],
+              mainFrame && [mainFrame instancesRespondToSelector:@selector(wcrGrouping_tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)],
+              mainFrame && [mainFrame instancesRespondToSelector:@selector(logicGetSessionAtIndexPath:)],
+              mainFrame && [mainFrame instancesRespondToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)]);
+}
+
 static BOOL WCRRuntimeReadyForHooks(void) {
     if (!WCRResolveSubstrateHookAPI()) return NO;
     Class config = NSClassFromString(@"WCRefineConfig");
@@ -614,8 +629,13 @@ static BOOL WCRRuntimeReadyForHooks(void) {
            [mainFrame instancesRespondToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)] &&
            [mainFrame instancesRespondToSelector:@selector(logicGetSessionAtIndexPath:)] &&
            [mainFrame instancesRespondToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)] &&
-           [mainFrame instancesRespondToSelector:@selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)] &&
-           [mainFrame instancesRespondToSelector:@selector(wcrGrouping_tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)];
+           // trailingSwipeActions... is installed by WCRefine through
+           // installOptionalTableDelegateOnClass:. If WeChat did not originally
+           // implement the modern delegate method, WCRefine adds ONLY the native
+           // selector and does not create the wcrGrouping_ alias on the target
+           // class. Requiring that alias here prevented every ActiveFront hook
+           // from ever being installed on those WeChat builds.
+           [mainFrame instancesRespondToSelector:@selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)];
 }
 
 static void WCRInstallHook(Class cls, SEL sel, IMP replacement, IMP *original) {
@@ -654,6 +674,7 @@ static void WCRTryInstallHooks(NSUInteger attemptsRemaining) {
         return;
     }
     if (attemptsRemaining == 0) {
+        WCRLogRuntimeReadiness();
         WCRAF_LOG(@"hook installation timed out; WCRefine/Substrate runtime not ready");
         return;
     }
