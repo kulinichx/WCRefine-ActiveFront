@@ -1,36 +1,38 @@
-// ActiveFront.MIN_GROUP_UI_V1.m
-// WCRefineGroup - Minimal native "分组" button proof
+// ActiveFront.RIGHT_GROUP_UI_V1.m
+// WCRefineGroup - Minimal RIGHT swipe "分组" proof
 //
-// Based on DIAG6:
-// - NewMainFrameCell inherits MMMultiMenuTableViewCell / MMBaseMultiMenuTableViewCell.
-// - Real menu model = MMMultiMenuItem.
-// - _arrMenuItems and _currentMenuItems contain 3 native items.
-// - Visible buttons all call NewMainFrameCell.onButtonClicked:.
+// Design goal:
+// - Keep WeChat's LEFT swipe completely untouched:
+//     标为已读 / 不显示 / 删除
+// - Use the otherwise-unused RIGHT swipe for WCRefineGroup.
+// - This first proof shows ONE green "分组" button on the left side.
 //
-// Goal of this build:
-// - Keep the three native actions unchanged.
-// - Append ONE native MMMultiMenuItem titled "分组" before "删除".
-// - Intercept only taps on "分组" and show a diagnostic alert.
-// - Do NOT perform real grouping yet.
+// This build DOES NOT perform real grouping yet.
+// Tapping "分组" only shows a confirmation alert.
 //
-// Important:
-// This is still a minimal UI proof. It intentionally does not yet filter
-// grouped vs. ungrouped sessions and does not modify WCRefine group data.
+// Implementation strategy:
+// - Reuse each NewMainFrameCell's existing UIPanGestureRecognizer.
+// - Add an observer target; do not replace NewMainFrameCell.handlePan:.
+// - Only react when translation.x > 0 and horizontal movement dominates.
+// - Reveal a button underneath the cell's contentView.
+// - Left swipe remains handled by WeChat's original code.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 
-static IMP gOrigSetArrMenuItems = NULL;
-static IMP gOrigSetMenuItemsNoDelete = NULL;
-static IMP gOrigSetMenuItemsDefaultDelete = NULL;
-static IMP gOrigOnButtonClicked = NULL;
+static const void *kWCRRightButtonKey = &kWCRRightButtonKey;
+static const void *kWCRRightOpenKey   = &kWCRRightOpenKey;
 
-static BOOL gHookSetArr = NO;
-static BOOL gHookNoDelete = NO;
-static BOOL gHookDefaultDelete = NO;
-static BOOL gHookButton = NO;
+static NSHashTable *gObservedRecognizers;
+static id gObserver;
+static __weak UITableViewCell *gOpenCell = nil;
+static BOOL gReadyShown = NO;
+
+static const CGFloat kWCRButtonWidth = 88.0;
+static const CGFloat kWCROpenThreshold = 42.0;
+
+#pragma mark - Helpers
 
 static NSString *WCRClassName(id obj) {
     return obj ? NSStringFromClass([obj class]) : @"<nil>";
@@ -66,18 +68,20 @@ static UIViewController *WCRTopVC(void) {
         }
 
         if ([vc isKindOfClass:[UINavigationController class]]) {
-            UIViewController *n = [(UINavigationController *)vc visibleViewController];
-            if (n && n != vc) {
-                vc = n;
+            UIViewController *next =
+                [(UINavigationController *)vc visibleViewController];
+            if (next && next != vc) {
+                vc = next;
                 moved = YES;
                 continue;
             }
         }
 
         if ([vc isKindOfClass:[UITabBarController class]]) {
-            UIViewController *n = [(UITabBarController *)vc selectedViewController];
-            if (n && n != vc) {
-                vc = n;
+            UIViewController *next =
+                [(UITabBarController *)vc selectedViewController];
+            if (next && next != vc) {
+                vc = next;
                 moved = YES;
                 continue;
             }
@@ -94,7 +98,7 @@ static void WCRShow(NSString *title, NSString *message) {
 
         if ([vc isKindOfClass:[UIAlertController class]] ||
             [vc.presentedViewController isKindOfClass:[UIAlertController class]]) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 WCRShow(title, message);
             });
@@ -114,265 +118,336 @@ static void WCRShow(NSString *title, NSString *message) {
     });
 }
 
-static NSString *WCRMenuItemTitle(id item) {
-    if (!item) return nil;
+static void WCRCollectTableViews(UIView *view, NSMutableArray *out) {
+    if (!view || view.hidden || view.alpha <= 0.01) return;
 
-    SEL getter = NSSelectorFromString(@"nsTitle");
-    if ([item respondsToSelector:getter]) {
-        NSString *(*fn)(id, SEL) = (NSString *(*)(id, SEL))objc_msgSend;
-        id value = fn(item, getter);
-        if ([value isKindOfClass:[NSString class]]) return value;
+    if ([view isKindOfClass:[UITableView class]] && view.window) {
+        [out addObject:view];
     }
 
-    Ivar iv = class_getInstanceVariable([item class], "_nsTitle");
-    if (iv) {
-        id value = object_getIvar(item, iv);
-        if ([value isKindOfClass:[NSString class]]) return value;
+    for (UIView *sub in view.subviews) {
+        WCRCollectTableViews(sub, out);
     }
-
-    return nil;
 }
 
-static BOOL WCRArrayHasGroupItem(NSArray *items) {
-    for (id item in items) {
-        if ([[WCRMenuItemTitle(item) ?: @""] isEqualToString:@"分组"]) {
-            return YES;
+static UITableView *WCRMainTable(void) {
+    NSMutableArray *tables = [NSMutableArray array];
+
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.hidden || w.alpha <= 0.01) continue;
+        WCRCollectTableViews(w, tables);
+    }
+
+    for (UITableView *tv in tables) {
+        if ([WCRClassName(tv) isEqualToString:@"MainFrameTableView"]) {
+            return tv;
         }
     }
-    return NO;
+
+    return tables.firstObject;
 }
 
-static void WCRSendObjectSetter(id obj, NSString *selectorName, id value) {
-    SEL sel = NSSelectorFromString(selectorName);
-    if (![obj respondsToSelector:sel]) return;
+#pragma mark - Right action UI
 
-    void (*fn)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
-    fn(obj, sel, value);
+@interface WCRRightGroupButtonTarget : NSObject
+- (void)wcr_groupTapped:(UIButton *)sender;
+@end
+
+static WCRRightGroupButtonTarget *gButtonTarget;
+
+static UIButton *WCRRightButtonForCell(UITableViewCell *cell, BOOL create) {
+    if (!cell) return nil;
+
+    UIButton *button = objc_getAssociatedObject(cell, kWCRRightButtonKey);
+    if (button || !create) return button;
+
+    button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.frame = CGRectMake(0, 0, kWCRButtonWidth, CGRectGetHeight(cell.bounds));
+    button.autoresizingMask = UIViewAutoresizingFlexibleHeight;
+    button.backgroundColor = [UIColor systemGreenColor];
+    [button setTitle:@"分组" forState:UIControlStateNormal];
+    [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    button.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightMedium];
+
+    [button addTarget:gButtonTarget
+               action:@selector(wcr_groupTapped:)
+     forControlEvents:UIControlEventTouchUpInside];
+
+    // Put the button under the normal cell content so sliding the contentView
+    // to the right reveals it.
+    [cell insertSubview:button belowSubview:cell.contentView];
+
+    objc_setAssociatedObject(cell,
+                             kWCRRightButtonKey,
+                             button,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    return button;
 }
 
-static void WCRSendDoubleSetter(id obj, NSString *selectorName, double value) {
-    SEL sel = NSSelectorFromString(selectorName);
-    if (![obj respondsToSelector:sel]) return;
-
-    void (*fn)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
-    fn(obj, sel, value);
+static BOOL WCRCellIsRightOpen(UITableViewCell *cell) {
+    NSNumber *value = objc_getAssociatedObject(cell, kWCRRightOpenKey);
+    return value.boolValue;
 }
 
-static void WCRSendBoolSetter(id obj, NSString *selectorName, BOOL value) {
-    SEL sel = NSSelectorFromString(selectorName);
-    if (![obj respondsToSelector:sel]) return;
-
-    void (*fn)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))objc_msgSend;
-    fn(obj, sel, value);
+static void WCRSetCellRightOpen(UITableViewCell *cell, BOOL open) {
+    if (!cell) return;
+    objc_setAssociatedObject(cell,
+                             kWCRRightOpenKey,
+                             @(open),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-static id WCRCreateGroupMenuItem(void) {
-    Class itemClass = NSClassFromString(@"MMMultiMenuItem");
-    if (!itemClass) return nil;
+static void WCRApplyRightOffset(UITableViewCell *cell, CGFloat x) {
+    if (!cell) return;
 
-    id item = [[itemClass alloc] init];
-    if (!item) return nil;
+    WCRRightButtonForCell(cell, YES);
 
-    WCRSendObjectSetter(item, @"setNsTitle:", @"分组");
+    // Cap the reveal. We only need one action.
+    x = MAX(0.0, MIN(kWCRButtonWidth, x));
 
-    // DIAG5 showed the normal buttons are around 88–99 pt wide.
-    WCRSendDoubleSetter(item, @"setMenuItemWidth:", 88.0);
+    CGAffineTransform t = CGAffineTransformMakeTranslation(x, 0);
+    cell.contentView.transform = t;
+}
 
-    // Use a distinct color only for this proof build.
-    UIColor *background = nil;
-    if (@available(iOS 13.0, *)) {
-        background = [UIColor systemGreenColor];
+static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
+    if (!cell) return;
+
+    void (^changes)(void) = ^{
+        cell.contentView.transform = CGAffineTransformIdentity;
+    };
+
+    if (animated) {
+        [UIView animateWithDuration:0.20
+                              delay:0
+                            options:UIViewAnimationOptionCurveEaseOut |
+                                    UIViewAnimationOptionBeginFromCurrentState
+                         animations:changes
+                         completion:nil];
     } else {
-        background = [UIColor colorWithRed:0.20 green:0.65 blue:0.35 alpha:1.0];
+        changes();
     }
 
-    WCRSendObjectSetter(item, @"setBackgroundColor:", background);
-    WCRSendObjectSetter(item, @"setTitleColor:", [UIColor whiteColor]);
-    WCRSendDoubleSetter(item, @"setTitleFontSize:", 17.0);
-    WCRSendBoolSetter(item, @"setBothShowIconAndTitle:", NO);
-
-    return item;
+    WCRSetCellRightOpen(cell, NO);
+    if (gOpenCell == cell) gOpenCell = nil;
 }
 
-static NSArray *WCRArrayByAddingGroupItem(id receiver, NSArray *items) {
-    if (![items isKindOfClass:[NSArray class]]) return items;
-    if (WCRArrayHasGroupItem(items)) return items;
+static void WCROpenCell(UITableViewCell *cell, BOOL animated) {
+    if (!cell) return;
 
-    Class newMainFrameCell = NSClassFromString(@"NewMainFrameCell");
-    if (!newMainFrameCell || ![receiver isKindOfClass:newMainFrameCell]) {
-        return items;
+    if (gOpenCell && gOpenCell != cell) {
+        WCRCloseCell(gOpenCell, YES);
     }
 
-    id groupItem = WCRCreateGroupMenuItem();
-    if (!groupItem) return items;
+    WCRRightButtonForCell(cell, YES);
 
-    NSMutableArray *result = [items mutableCopy];
+    void (^changes)(void) = ^{
+        cell.contentView.transform = CGAffineTransformMakeTranslation(kWCRButtonWidth, 0);
+    };
 
-    // Preserve Delete as the right-most / final action where possible.
-    NSUInteger deleteIndex = NSNotFound;
-    for (NSUInteger i = 0; i < result.count; i++) {
-        NSString *title = WCRMenuItemTitle(result[i]) ?: @"";
-        if ([title isEqualToString:@"删除"]) {
-            deleteIndex = i;
+    if (animated) {
+        [UIView animateWithDuration:0.20
+                              delay:0
+                            options:UIViewAnimationOptionCurveEaseOut |
+                                    UIViewAnimationOptionBeginFromCurrentState
+                         animations:changes
+                         completion:nil];
+    } else {
+        changes();
+    }
+
+    WCRSetCellRightOpen(cell, YES);
+    gOpenCell = cell;
+}
+
+@implementation WCRRightGroupButtonTarget
+
+- (void)wcr_groupTapped:(UIButton *)sender {
+    UITableViewCell *cell = nil;
+    UIView *v = sender.superview;
+
+    while (v) {
+        if ([v isKindOfClass:[UITableViewCell class]]) {
+            cell = (UITableViewCell *)v;
             break;
         }
-    }
-
-    if (deleteIndex != NSNotFound) {
-        [result insertObject:groupItem atIndex:deleteIndex];
-    } else {
-        [result addObject:groupItem];
-    }
-
-    return result;
-}
-
-#pragma mark - Menu array hooks
-
-static void WCRSetArrMenuItemsHook(id self, SEL _cmd, id items) {
-    NSArray *modified = WCRArrayByAddingGroupItem(self, items);
-
-    if (gOrigSetArrMenuItems) {
-        void (*fn)(id, SEL, id) = (void (*)(id, SEL, id))gOrigSetArrMenuItems;
-        fn(self, _cmd, modified);
-    }
-}
-
-static void WCRSetMenuItemsNoDeleteHook(id self, SEL _cmd, id items) {
-    NSArray *modified = WCRArrayByAddingGroupItem(self, items);
-
-    if (gOrigSetMenuItemsNoDelete) {
-        void (*fn)(id, SEL, id) = (void (*)(id, SEL, id))gOrigSetMenuItemsNoDelete;
-        fn(self, _cmd, modified);
-    }
-}
-
-static void WCRSetMenuItemsDefaultDeleteHook(id self, SEL _cmd, id items) {
-    NSArray *modified = WCRArrayByAddingGroupItem(self, items);
-
-    if (gOrigSetMenuItemsDefaultDelete) {
-        void (*fn)(id, SEL, id) = (void (*)(id, SEL, id))gOrigSetMenuItemsDefaultDelete;
-        fn(self, _cmd, modified);
-    }
-}
-
-#pragma mark - Button click hook
-
-static NSString *WCRButtonTitle(id button) {
-    if (![button isKindOfClass:[UIButton class]]) return nil;
-
-    UIButton *b = (UIButton *)button;
-    NSString *title = [b titleForState:UIControlStateNormal];
-    if (title.length) return title;
-
-    for (UIView *sub in b.subviews) {
-        if ([sub isKindOfClass:[UILabel class]]) {
-            NSString *text = ((UILabel *)sub).text;
-            if (text.length) return text;
-        }
-    }
-
-    return nil;
-}
-
-static void WCROnButtonClickedHook(id self, SEL _cmd, id sender) {
-    NSString *title = WCRButtonTitle(sender) ?: @"";
-
-    if ([title isEqualToString:@"分组"]) {
-        WCRShow(@"MIN_GROUP_UI_V1",
-                [NSString stringWithFormat:
-                    @"「分组」按钮已经进入微信原生左滑菜单。\n\n"
-                     "Cell: %@\n"
-                     "Button: %@\n\n"
-                     "本版本只证明按钮插入与点击链路。\n"
-                     "尚未执行真实分组操作。",
-                     WCRClassName(self),
-                     WCRClassName(sender)]);
-        return;
-    }
-
-    // All original actions must remain native and untouched.
-    if (gOrigOnButtonClicked) {
-        void (*fn)(id, SEL, id) = (void (*)(id, SEL, id))gOrigOnButtonClicked;
-        fn(self, _cmd, sender);
-    }
-}
-
-#pragma mark - Hook installer
-
-static BOOL WCRHookMethod(Class cls, SEL sel, IMP replacement, IMP *originalOut) {
-    if (!cls || !sel || !replacement || !originalOut) return NO;
-
-    Method method = class_getInstanceMethod(cls, sel);
-    if (!method) return NO;
-
-    IMP original = method_getImplementation(method);
-    if (!original) return NO;
-
-    *originalOut = original;
-    method_setImplementation(method, replacement);
-
-    return method_getImplementation(method) == replacement;
-}
-
-static void WCRInstallHooks(void) {
-    Class base = NSClassFromString(@"MMBaseMultiMenuTableViewCell");
-    Class cell = NSClassFromString(@"NewMainFrameCell");
-
-    if (base) {
-        gHookSetArr =
-            WCRHookMethod(base,
-                          NSSelectorFromString(@"setArrMenuItems:"),
-                          (IMP)WCRSetArrMenuItemsHook,
-                          &gOrigSetArrMenuItems);
-
-        gHookNoDelete =
-            WCRHookMethod(base,
-                          NSSelectorFromString(@"setMenuItemsWithNoDeleteBtn:"),
-                          (IMP)WCRSetMenuItemsNoDeleteHook,
-                          &gOrigSetMenuItemsNoDelete);
-
-        gHookDefaultDelete =
-            WCRHookMethod(base,
-                          NSSelectorFromString(@"setMenuItemsWithDefaultDeleteBtn:"),
-                          (IMP)WCRSetMenuItemsDefaultDeleteHook,
-                          &gOrigSetMenuItemsDefaultDelete);
-    }
-
-    if (cell) {
-        gHookButton =
-            WCRHookMethod(cell,
-                          NSSelectorFromString(@"onButtonClicked:"),
-                          (IMP)WCROnButtonClickedHook,
-                          &gOrigOnButtonClicked);
+        v = v.superview;
     }
 
     NSString *msg = [NSString stringWithFormat:
-        @"MMMultiMenuItem: %@\n"
-         "NewMainFrameCell: %@\n\n"
-         "setArrMenuItems hook: %@\n"
-         "setMenuItemsWithNoDeleteBtn hook: %@\n"
-         "setMenuItemsWithDefaultDeleteBtn hook: %@\n"
-         "onButtonClicked hook: %@\n\n"
-         "测试：找一个未分类普通好友左滑。\n"
-         "预期看到：标为已读 / 不显示 / 分组 / 删除",
-         NSClassFromString(@"MMMultiMenuItem") ? @"YES" : @"NO",
-         cell ? @"YES" : @"NO",
-         gHookSetArr ? @"YES" : @"NO",
-         gHookNoDelete ? @"YES" : @"NO",
-         gHookDefaultDelete ? @"YES" : @"NO",
-         gHookButton ? @"YES" : @"NO"];
+        @"右滑「分组」按钮已经工作。\n\n"
+         "Cell: %@\n\n"
+         "本版本只验证右滑交互和按钮点击。\n"
+         "尚未修改任何 WCRefine 分组数据。",
+         WCRClassName(cell)];
 
-    WCRShow(@"MIN_GROUP_UI_V1 Ready", msg);
+    WCRCloseCell(cell, YES);
+    WCRShow(@"RIGHT_GROUP_UI_V1", msg);
+}
+
+@end
+
+#pragma mark - Existing cell pan observer
+
+@interface WCRRightGroupPanObserver : NSObject
+- (void)wcr_handleCellPan:(UIPanGestureRecognizer *)pan;
+@end
+
+@implementation WCRRightGroupPanObserver
+
+- (void)wcr_handleCellPan:(UIPanGestureRecognizer *)pan {
+    UIView *view = pan.view;
+    if (![view isKindOfClass:NSClassFromString(@"NewMainFrameCell")]) return;
+
+    UITableViewCell *cell = (UITableViewCell *)view;
+
+    CGPoint tr = [pan translationInView:cell];
+    CGPoint vel = [pan velocityInView:cell];
+
+    BOOL horizontal = fabs(tr.x) > fabs(tr.y) * 1.15;
+    BOOL movingRight = tr.x > 0.0;
+
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        if (gOpenCell && gOpenCell != cell) {
+            WCRCloseCell(gOpenCell, YES);
+        }
+        return;
+    }
+
+    if (pan.state == UIGestureRecognizerStateChanged) {
+        if (!horizontal) return;
+
+        if (movingRight) {
+            CGFloat base = WCRCellIsRightOpen(cell) ? kWCRButtonWidth : 0.0;
+            CGFloat x = MIN(kWCRButtonWidth, base + tr.x);
+
+            // Run after WeChat's own handlePan: for this event so a no-op
+            // right-swipe implementation cannot immediately overwrite us.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                WCRApplyRightOffset(cell, x);
+            });
+        } else if (WCRCellIsRightOpen(cell)) {
+            CGFloat x = MAX(0.0, kWCRButtonWidth + tr.x);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                WCRApplyRightOffset(cell, x);
+            });
+        }
+
+        return;
+    }
+
+    if (pan.state == UIGestureRecognizerStateEnded ||
+        pan.state == UIGestureRecognizerStateCancelled ||
+        pan.state == UIGestureRecognizerStateFailed) {
+
+        if (!horizontal && !WCRCellIsRightOpen(cell)) return;
+
+        CGFloat projected = tr.x + vel.x * 0.08;
+        BOOL shouldOpen = NO;
+
+        if (WCRCellIsRightOpen(cell)) {
+            shouldOpen = projected > -kWCROpenThreshold;
+        } else {
+            shouldOpen = projected > kWCROpenThreshold;
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (shouldOpen) {
+                WCROpenCell(cell, YES);
+            } else {
+                WCRCloseCell(cell, YES);
+            }
+        });
+    }
+}
+
+@end
+
+#pragma mark - Attach to NewMainFrameCell pan recognizers
+
+static void WCRPrepareCell(UITableViewCell *cell) {
+    Class targetClass = NSClassFromString(@"NewMainFrameCell");
+    if (!targetClass || ![cell isKindOfClass:targetClass]) return;
+
+    WCRRightButtonForCell(cell, YES);
+
+    // A reused cell must not inherit an open transform from a prior row.
+    if (!WCRCellIsRightOpen(cell) && gOpenCell != cell) {
+        cell.contentView.transform = CGAffineTransformIdentity;
+    }
+
+    for (UIGestureRecognizer *gr in cell.gestureRecognizers) {
+        if (![gr isKindOfClass:[UIPanGestureRecognizer class]]) continue;
+
+        @synchronized (gObservedRecognizers) {
+            if (![gObservedRecognizers containsObject:gr]) {
+                [gr addTarget:gObserver
+                       action:@selector(wcr_handleCellPan:)];
+                [gObservedRecognizers addObject:gr];
+            }
+        }
+    }
+}
+
+static void WCRScan(BOOL showReady) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITableView *table = WCRMainTable();
+
+        if (!table) {
+            if (showReady && !gReadyShown) {
+                gReadyShown = YES;
+                WCRShow(@"RIGHT_GROUP_UI_V1 Ready",
+                        @"MainFrameTableView not found.");
+            }
+            return;
+        }
+
+        for (UITableViewCell *cell in table.visibleCells) {
+            WCRPrepareCell(cell);
+        }
+
+        if (showReady && !gReadyShown) {
+            gReadyShown = YES;
+
+            NSString *msg = [NSString stringWithFormat:
+                @"Table: %@\n"
+                 "Visible cells: %lu\n\n"
+                 "本版交互：\n"
+                 "左滑 = 微信原生，不修改\n"
+                 "右滑 = 显示一个「分组」按钮\n\n"
+                 "测试一个普通未分组好友即可。\n"
+                 "点击「分组」只弹确认框，不会真的改分组。",
+                 WCRClassName(table),
+                 (unsigned long)table.visibleCells.count];
+
+            WCRShow(@"RIGHT_GROUP_UI_V1 Ready", msg);
+        }
+    });
+}
+
+static void WCRRepeat(NSUInteger remaining) {
+    if (remaining == 0) return;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(0.8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        WCRScan(NO);
+        WCRRepeat(remaining - 1);
+    });
 }
 
 __attribute__((constructor))
-static void WCRMinGroupUIInit(void) {
+static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        // Delay until WeChat/WCRefine classes are loaded.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+        gObservedRecognizers = [NSHashTable weakObjectsHashTable];
+        gObserver = [WCRRightGroupPanObserver new];
+        gButtonTarget = [WCRRightGroupButtonTarget new];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(5.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            WCRInstallHooks();
+            WCRScan(YES);
+            WCRRepeat(45);
         });
     }
 }
