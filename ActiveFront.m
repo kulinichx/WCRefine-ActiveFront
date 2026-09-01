@@ -1,55 +1,29 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <mach-o/dyld.h>
+#import <objc/message.h>
+#import <stdarg.h>
 
-static NSString * const kProbeVersion = @"integration-probe-1";
+static NSString * const kDiagVersion = @"swipe-diag-2";
 
-static void ProbeLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
-static void ProbeLog(NSString *fmt, ...) {
+static void DLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
+static void DLog(NSString *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
     va_end(args);
-    NSLog(@"[WCRefineGroup PROBE %@] %@", kProbeVersion, msg);
+    NSLog(@"[WCRefineGroup DIAG %@] %@", kDiagVersion, msg);
 }
 
-static NSString *FindLoadedImage(NSString *needle) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *cname = _dyld_get_image_name(i);
-        if (!cname) continue;
-        NSString *name = [NSString stringWithUTF8String:cname];
-        if ([name rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return name;
-        }
-    }
-    return nil;
-}
+typedef id (*ObjcIdMsgSend0)(id, SEL);
+typedef id (*ObjcIdMsgSend1)(id, SEL, id);
+typedef id (*SwipeIMP)(id, SEL, id, id);
 
-static BOOL ClassExists(NSString *name) {
-    return NSClassFromString(name) != Nil;
-}
-
-static BOOL InstanceSelectorExists(NSString *className, NSString *selectorName) {
-    Class cls = NSClassFromString(className);
-    SEL sel = NSSelectorFromString(selectorName);
-    return cls && class_getInstanceMethod(cls, sel) != NULL;
-}
-
-static NSString *MethodInfo(NSString *className, NSString *selectorName) {
-    Class cls = NSClassFromString(className);
-    SEL sel = NSSelectorFromString(selectorName);
-    if (!cls) return [NSString stringWithFormat:@"%@: class missing", selectorName];
-
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return [NSString stringWithFormat:@"%@: selector missing", selectorName];
-
-    IMP imp = method_getImplementation(m);
-    const char *types = method_getTypeEncoding(m);
-    return [NSString stringWithFormat:@"%@: YES imp=%p types=%s",
-            selectorName, imp, types ?: "<nil>"];
-}
+static SwipeIMP gOrigModern = NULL;
+static SwipeIMP gOrigLegacy = NULL;
+static BOOL gModernInstalled = NO;
+static BOOL gLegacyInstalled = NO;
+static BOOL gAlertShown = NO;
 
 static UIViewController *TopViewController(void) {
     UIWindow *window = nil;
@@ -76,118 +50,311 @@ static UIViewController *TopViewController(void) {
     }
 
     UIViewController *vc = window.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
+    if (!vc) return nil;
 
-    if ([vc isKindOfClass:[UINavigationController class]]) {
-        vc = ((UINavigationController *)vc).visibleViewController ?: vc;
-    }
-    if ([vc isKindOfClass:[UITabBarController class]]) {
-        vc = ((UITabBarController *)vc).selectedViewController ?: vc;
+    BOOL changed = YES;
+    while (changed) {
+        changed = NO;
+        if (vc.presentedViewController) {
+            vc = vc.presentedViewController;
+            changed = YES;
+            continue;
+        }
+        if ([vc isKindOfClass:[UINavigationController class]]) {
+            UIViewController *next = ((UINavigationController *)vc).visibleViewController;
+            if (next && next != vc) {
+                vc = next;
+                changed = YES;
+                continue;
+            }
+        }
+        if ([vc isKindOfClass:[UITabBarController class]]) {
+            UIViewController *next = ((UITabBarController *)vc).selectedViewController;
+            if (next && next != vc) {
+                vc = next;
+                changed = YES;
+                continue;
+            }
+        }
     }
     return vc;
 }
 
-static void ShowProbeAlert(NSString *message) {
-    UIViewController *vc = TopViewController();
-    if (!vc) {
-        ProbeLog(@"cannot show alert: no foreground root view controller");
+static id Call0(id obj, SEL sel) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return nil;
+    return ((ObjcIdMsgSend0)objc_msgSend)(obj, sel);
+}
+
+static id Call1(id obj, SEL sel, id arg) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return nil;
+    return ((ObjcIdMsgSend1)objc_msgSend)(obj, sel, arg);
+}
+
+static id SessionAtIndexPath(id host, NSIndexPath *indexPath, NSString **usedSelector) {
+    SEL nativeSel = NSSelectorFromString(@"logicGetSessionAtIndexPath:");
+    if ([host respondsToSelector:nativeSel]) {
+        if (usedSelector) *usedSelector = NSStringFromSelector(nativeSel);
+        return Call1(host, nativeSel, indexPath);
+    }
+
+    SEL aliasSel = NSSelectorFromString(@"wcrGrouping_logicGetSessionAtIndexPath:");
+    if ([host respondsToSelector:aliasSel]) {
+        if (usedSelector) *usedSelector = NSStringFromSelector(aliasSel);
+        return Call1(host, aliasSel, indexPath);
+    }
+
+    if (usedSelector) *usedSelector = @"<none>";
+    return nil;
+}
+
+static NSString *UsernameForSession(id session) {
+    if (!session) return nil;
+
+    Class providerClass = NSClassFromString(@"WCRefineGroupDataProvider");
+    if (providerClass) {
+        id provider = Call0(providerClass, NSSelectorFromString(@"shared"));
+        NSString *username = Call1(provider,
+                                   NSSelectorFromString(@"usernameForNativeObject:"),
+                                   session);
+        if ([username isKindOfClass:[NSString class]] && username.length > 0) {
+            return username;
+        }
+    }
+
+    // Diagnostic fallbacks only; no business logic depends on these.
+    NSArray<NSString *> *selectors = @[
+        @"username", @"userName", @"m_nsUsrName", @"m_nsUserName",
+        @"sessionUserName", @"contactUserName"
+    ];
+
+    for (NSString *name in selectors) {
+        id value = Call0(session, NSSelectorFromString(name));
+        if ([value isKindOfClass:[NSString class]] && [value length] > 0) {
+            return value;
+        }
+    }
+
+    return nil;
+}
+
+static void ShowSwipeDiagnostic(NSString *path,
+                                id host,
+                                UITableView *tableView,
+                                NSIndexPath *indexPath,
+                                id session,
+                                NSString *lookupSel,
+                                id originalResult) {
+    NSString *sessionClass = session ? NSStringFromClass([session class]) : @"<nil>";
+    NSString *username = UsernameForSession(session) ?: @"<nil>";
+    NSString *hostClass = host ? NSStringFromClass([host class]) : @"<nil>";
+    NSString *tableClass = tableView ? NSStringFromClass([tableView class]) : @"<nil>";
+    NSString *resultClass = originalResult ? NSStringFromClass([originalResult class]) : @"<nil>";
+
+    DLog(@"SWIPE ENTERED path=%@ host=%@ table=%@ section=%ld row=%ld lookup=%@ session=%p sessionClass=%@ username=%@ originalClass=%@",
+         path,
+         hostClass,
+         tableClass,
+         (long)indexPath.section,
+         (long)indexPath.row,
+         lookupSel ?: @"<nil>",
+         session,
+         sessionClass,
+         username,
+         resultClass);
+
+    if (gAlertShown) return;
+    gAlertShown = YES;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *message = [NSString stringWithFormat:
+            @"PATH: %@\n\n"
+             "Host: %@\n"
+             "Table: %@\n"
+             "IndexPath: section=%ld row=%ld\n\n"
+             "Session lookup: %@\n"
+             "Session: %@\n"
+             "Session class: %@\n"
+             "Username: %@\n\n"
+             "Original result: %@\n\n"
+             "modern hook: %@\n"
+             "legacy hook: %@",
+             path,
+             hostClass,
+             tableClass,
+             (long)indexPath.section,
+             (long)indexPath.row,
+             lookupSel ?: @"<nil>",
+             session ? @"YES" : @"NO",
+             sessionClass,
+             username,
+             resultClass,
+             gModernInstalled ? @"YES" : @"NO",
+             gLegacyInstalled ? @"YES" : @"NO"];
+
+        UIViewController *vc = TopViewController();
+        if (!vc) {
+            DLog(@"cannot display swipe diagnostic alert: top VC missing");
+            return;
+        }
+
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:@"WCRefineGroup Swipe Diagnostic"
+                                                message:message
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                 style:UIAlertActionStyleDefault
+                                               handler:nil]];
+        [vc presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+static id HookModern(id self, SEL _cmd, id tableViewObj, id indexPathObj) {
+    id original = gOrigModern ? gOrigModern(self, _cmd, tableViewObj, indexPathObj) : nil;
+
+    UITableView *tableView =
+        [tableViewObj isKindOfClass:[UITableView class]] ? tableViewObj : nil;
+    NSIndexPath *indexPath =
+        [indexPathObj isKindOfClass:[NSIndexPath class]] ? indexPathObj : nil;
+
+    NSString *lookup = nil;
+    id session = indexPath ? SessionAtIndexPath(self, indexPath, &lookup) : nil;
+
+    ShowSwipeDiagnostic(@"MODERN",
+                        self,
+                        tableView,
+                        indexPath ?: [NSIndexPath indexPathForRow:0 inSection:0],
+                        session,
+                        lookup,
+                        original);
+
+    // Do not modify WCRefine/WeChat actions in this diagnostic build.
+    return original;
+}
+
+static id HookLegacy(id self, SEL _cmd, id tableViewObj, id indexPathObj) {
+    id original = gOrigLegacy ? gOrigLegacy(self, _cmd, tableViewObj, indexPathObj) : nil;
+
+    UITableView *tableView =
+        [tableViewObj isKindOfClass:[UITableView class]] ? tableViewObj : nil;
+    NSIndexPath *indexPath =
+        [indexPathObj isKindOfClass:[NSIndexPath class]] ? indexPathObj : nil;
+
+    NSString *lookup = nil;
+    id session = indexPath ? SessionAtIndexPath(self, indexPath, &lookup) : nil;
+
+    ShowSwipeDiagnostic(@"LEGACY",
+                        self,
+                        tableView,
+                        indexPath ?: [NSIndexPath indexPathForRow:0 inSection:0],
+                        session,
+                        lookup,
+                        original);
+
+    // Do not modify WCRefine/WeChat actions in this diagnostic build.
+    return original;
+}
+
+static BOOL InstallHook(Class cls,
+                        SEL sel,
+                        IMP replacement,
+                        SwipeIMP *origOut,
+                        BOOL *flag,
+                        NSString *label) {
+    if (*flag) return YES;
+    if (!cls) {
+        DLog(@"install %@ failed: class missing", label);
+        return NO;
+    }
+
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!method) {
+        DLog(@"install %@ failed: selector missing", label);
+        return NO;
+    }
+
+    IMP current = method_getImplementation(method);
+    const char *types = method_getTypeEncoding(method);
+
+    if (!current || !types) {
+        DLog(@"install %@ failed: invalid IMP/types", label);
+        return NO;
+    }
+
+    *origOut = (SwipeIMP)current;
+    class_replaceMethod(cls, sel, replacement, types);
+
+    Method verify = class_getInstanceMethod(cls, sel);
+    BOOL ok = verify && method_getImplementation(verify) == replacement;
+
+    if (ok) {
+        *flag = YES;
+        DLog(@"installed %@ selector=%@ oldIMP=%p newIMP=%p types=%s",
+             label, NSStringFromSelector(sel), current, replacement, types);
+    } else {
+        DLog(@"install %@ verification FAILED", label);
+    }
+
+    return ok;
+}
+
+static void InstallSwipeDiagnostics(void) {
+    Class mainFrame = NSClassFromString(@"NewMainFrameViewController");
+    if (!mainFrame) {
+        DLog(@"NewMainFrameViewController missing");
         return;
     }
 
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"WCRefineGroup Integration Probe"
-                                            message:message
-                                     preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                             style:UIAlertActionStyleDefault
-                                           handler:nil]];
-    [vc presentViewController:alert animated:YES completion:nil];
-}
+    BOOL modern = InstallHook(
+        mainFrame,
+        NSSelectorFromString(@"tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:"),
+        (IMP)HookModern,
+        &gOrigModern,
+        &gModernInstalled,
+        @"modern/native");
 
-static void RunProbe(void) {
-    NSString *selfImage = FindLoadedImage(@"WCRefineGroup");
-    NSString *wcrImage = FindLoadedImage(@"WCRefine.dylib");
+    BOOL legacy = InstallHook(
+        mainFrame,
+        NSSelectorFromString(@"tableView:editActionsForRowAtIndexPath:"),
+        (IMP)HookLegacy,
+        &gOrigLegacy,
+        &gLegacyInstalled,
+        @"legacy/native");
 
-    BOOL manager = ClassExists(@"WCRefineGroupManager");
-    BOOL provider = ClassExists(@"WCRefineGroupDataProvider");
-    BOOL quick = ClassExists(@"WCRQuickChatRuntime");
-    BOOL main = ClassExists(@"NewMainFrameViewController");
+    DLog(@"INSTALL RESULT modern=%d legacy=%d logicNative=%d logicAlias=%d",
+         modern,
+         legacy,
+         [mainFrame instancesRespondToSelector:NSSelectorFromString(@"logicGetSessionAtIndexPath:")],
+         [mainFrame instancesRespondToSelector:NSSelectorFromString(@"wcrGrouping_logicGetSessionAtIndexPath:")]);
 
-    BOOL logic = InstanceSelectorExists(@"NewMainFrameViewController",
-                                        @"logicGetSessionAtIndexPath:");
-    BOOL logicAlias = InstanceSelectorExists(@"NewMainFrameViewController",
-                                             @"wcrGrouping_logicGetSessionAtIndexPath:");
-    BOOL modern = InstanceSelectorExists(@"NewMainFrameViewController",
-                                         @"tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:");
-    BOOL modernAlias = InstanceSelectorExists(@"NewMainFrameViewController",
-                                              @"wcrGrouping_tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:");
-    BOOL legacy = InstanceSelectorExists(@"NewMainFrameViewController",
-                                         @"tableView:editActionsForRowAtIndexPath:");
-    BOOL legacyAlias = InstanceSelectorExists(@"NewMainFrameViewController",
-                                              @"wcrGrouping_tableView:editActionsForRowAtIndexPath:");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = TopViewController();
+        if (!vc) return;
 
-    ProbeLog(@"SELF IMAGE = %@", selfImage ?: @"NOT FOUND");
-    ProbeLog(@"WCREFINE IMAGE = %@", wcrImage ?: @"NOT FOUND");
-    ProbeLog(@"classes manager=%d provider=%d quick=%d main=%d",
-             manager, provider, quick, main);
-    ProbeLog(@"selectors logic=%d logicAlias=%d modern=%d modernAlias=%d legacy=%d legacyAlias=%d",
-             logic, logicAlias, modern, modernAlias, legacy, legacyAlias);
+        NSString *message = [NSString stringWithFormat:
+            @"modern/native hook: %@\n"
+             "legacy/native hook: %@\n\n"
+             "Now tap OK and left-swipe ONE normal ungrouped friend.",
+             modern ? @"YES" : @"NO",
+             legacy ? @"YES" : @"NO"];
 
-    ProbeLog(@"%@", MethodInfo(@"NewMainFrameViewController",
-                              @"logicGetSessionAtIndexPath:"));
-    ProbeLog(@"%@", MethodInfo(@"NewMainFrameViewController",
-                              @"wcrGrouping_logicGetSessionAtIndexPath:"));
-    ProbeLog(@"%@", MethodInfo(@"NewMainFrameViewController",
-                              @"tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:"));
-    ProbeLog(@"%@", MethodInfo(@"NewMainFrameViewController",
-                              @"wcrGrouping_tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:"));
-    ProbeLog(@"%@", MethodInfo(@"NewMainFrameViewController",
-                              @"tableView:editActionsForRowAtIndexPath:"));
-    ProbeLog(@"%@", MethodInfo(@"NewMainFrameViewController",
-                              @"wcrGrouping_tableView:editActionsForRowAtIndexPath:"));
-
-    BOOL integrated =
-        selfImage.length > 0 &&
-        wcrImage.length > 0 &&
-        manager && provider && main &&
-        (logic || logicAlias) &&
-        (modern || legacy);
-
-    NSString *message = [NSString stringWithFormat:
-        @"Result: %@\n\n"
-         "WCRefineGroup loaded: %@\n"
-         "WCRefine loaded: %@\n\n"
-         "Manager: %@\nProvider: %@\nQuickRuntime: %@\nMainFrame: %@\n\n"
-         "logic/native: %@\nlogic/alias: %@\n"
-         "modern/native: %@\nmodern/alias: %@\n"
-         "legacy/native: %@\nlegacy/alias: %@",
-         integrated ? @"PASS" : @"FAIL",
-         selfImage ? @"YES" : @"NO",
-         wcrImage ? @"YES" : @"NO",
-         manager ? @"YES" : @"NO",
-         provider ? @"YES" : @"NO",
-         quick ? @"YES" : @"NO",
-         main ? @"YES" : @"NO",
-         logic ? @"YES" : @"NO",
-         logicAlias ? @"YES" : @"NO",
-         modern ? @"YES" : @"NO",
-         modernAlias ? @"YES" : @"NO",
-         legacy ? @"YES" : @"NO",
-         legacyAlias ? @"YES" : @"NO"];
-
-    ProbeLog(@"FINAL RESULT = %@", integrated ? @"PASS" : @"FAIL");
-    ShowProbeAlert(message);
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:@"Swipe Diagnostic Ready"
+                                                message:message
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                 style:UIAlertActionStyleDefault
+                                               handler:nil]];
+        [vc presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 __attribute__((constructor))
-static void WCRefineGroupProbeEntry(void) {
+static void WCRefineGroupDiagEntry(void) {
     @autoreleasepool {
-        ProbeLog(@"constructor entered");
-
-        // First delayed check: enough time for WeChat/WCRefine startup and swizzling.
+        DLog(@"constructor entered");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            RunProbe();
+            InstallSwipeDiagnostics();
         });
     }
 }
