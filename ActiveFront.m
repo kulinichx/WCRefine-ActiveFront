@@ -1,18 +1,22 @@
-// ActiveFront.SWIPE_DIAG5.m
-// WCRefineGroup - Swipe Diagnostic 5
+// ActiveFront.SWIPE_DIAG6.m
+// WCRefineGroup - Swipe Diagnostic 6
 //
-// DIAG4 result:
-// - The real row is NewMainFrameCell.
-// - A UIPanGestureRecognizer is installed directly on NewMainFrameCell.
-// - The revealed action buttons are MenuButton instances:
-//   "标为已读" / "不显示" / "删除".
+// DIAG5 established the real menu stack:
+//   NewMainFrameCell -> MMMultiMenuTableViewCell -> MMBaseMultiMenuTableViewCell
+//   NewMainFrameCell.handlePan:
+//   MenuButton -> NewMainFrameCell.onButtonClicked:
 //
-// DIAG5 goal:
-// 1) Trace the NewMainFrameCell pan recognizer.
-// 2) Inspect NewMainFrameCell's swipe/menu/action-related selectors.
-// 3) Inspect each visible MenuButton's target/action.
-// 4) Print each button's superview chain.
-// This is diagnostic only; it does not add the "分组" button.
+// DIAG6 goal:
+//   Inspect the REAL menu model objects and menu-related ivars without changing behavior.
+//   We need this before inserting a native "分组" item.
+//
+// What DIAG6 reports after one left swipe:
+//   1) menu-related ivars on NewMainFrameCell and superclasses
+//   2) arrays/collections that contain menu item model objects
+//   3) each menu item class + useful selector inventory
+//   4) MenuButton runtime ivars and target/action
+//
+// Diagnostic only. It does NOT add/execute any menu action.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -21,9 +25,9 @@
 static NSHashTable *gObservedRecognizers;
 static id gObserver;
 static BOOL gReadyShown = NO;
-static BOOL gReportedThisGesture = NO;
+static BOOL gReported = NO;
 
-#pragma mark - Helpers
+#pragma mark - Generic helpers
 
 static NSString *WCRClassName(id obj) {
     return obj ? NSStringFromClass([obj class]) : @"<nil>";
@@ -35,6 +39,7 @@ static UIViewController *WCRTopVC(void) {
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
         if (w.hidden || w.alpha <= 0.01) continue;
         if (w.windowLevel != UIWindowLevelNormal) continue;
+
         if (w.isKeyWindow) {
             window = w;
             break;
@@ -165,136 +170,261 @@ static NSString *WCRButtonText(UIButton *button) {
     return @"";
 }
 
-#pragma mark - Interesting method inventory
+#pragma mark - Runtime reading
 
-static BOOL WCRInterestingSelector(NSString *name) {
-    NSString *s = name.lowercaseString;
+static id WCRReadObjectIvar(id obj, Ivar iv) {
+    if (!obj || !iv) return nil;
+    const char *type = ivar_getTypeEncoding(iv);
+    if (!type || type[0] != '@') return nil;
 
-    return [s containsString:@"swipe"] ||
-           [s containsString:@"pan"] ||
-           [s containsString:@"gesture"] ||
-           [s containsString:@"menu"] ||
-           [s containsString:@"action"] ||
-           [s containsString:@"edit"] ||
-           [s containsString:@"delete"] ||
-           [s containsString:@"read"] ||
-           [s containsString:@"hide"] ||
-           [s containsString:@"show"] ||
-           [s containsString:@"button"] ||
-           [s containsString:@"more"];
+    @try {
+        return object_getIvar(obj, iv);
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
 }
 
-static NSArray<NSString *> *WCRMethodInventory(Class cls, NSUInteger maxCount) {
+static BOOL WCRNameLooksMenuRelated(NSString *name) {
+    NSString *s = name.lowercaseString;
+    return [s containsString:@"menu"] ||
+           [s containsString:@"item"] ||
+           [s containsString:@"button"] ||
+           [s containsString:@"action"] ||
+           [s containsString:@"option"] ||
+           [s containsString:@"more"] ||
+           [s containsString:@"edit"] ||
+           [s containsString:@"delete"];
+}
+
+static NSString *WCRSafeDescription(id obj) {
+    if (!obj) return @"<nil>";
+
+    if ([obj isKindOfClass:[NSString class]] ||
+        [obj isKindOfClass:[NSNumber class]]) {
+        NSString *d = [obj description];
+        return d.length > 120 ? [[d substringToIndex:120] stringByAppendingString:@"…"] : d;
+    }
+
+    if ([obj isKindOfClass:[NSArray class]]) {
+        return [NSString stringWithFormat:@"NSArray count=%lu", (unsigned long)[(NSArray *)obj count]];
+    }
+
+    if ([obj isKindOfClass:[NSSet class]]) {
+        return [NSString stringWithFormat:@"NSSet count=%lu", (unsigned long)[(NSSet *)obj count]];
+    }
+
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        return [NSString stringWithFormat:@"NSDictionary count=%lu", (unsigned long)[(NSDictionary *)obj count]];
+    }
+
+    return [NSString stringWithFormat:@"<%@ %p>", WCRClassName(obj), obj];
+}
+
+static NSArray<NSString *> *WCRInterestingMethods(Class cls, NSUInteger limit) {
     NSMutableOrderedSet *items = [NSMutableOrderedSet orderedSet];
 
     Class c = cls;
     NSInteger depth = 0;
 
-    while (c && depth < 5) {
+    while (c && depth < 4) {
         unsigned int count = 0;
         Method *methods = class_copyMethodList(c, &count);
 
         for (unsigned int i = 0; i < count; i++) {
-            NSString *selName = NSStringFromSelector(method_getName(methods[i]));
-            if (!WCRInterestingSelector(selName)) continue;
+            NSString *name = NSStringFromSelector(method_getName(methods[i]));
+            if (!WCRNameLooksMenuRelated(name) &&
+                ![name.lowercaseString containsString:@"title"] &&
+                ![name.lowercaseString containsString:@"color"] &&
+                ![name.lowercaseString containsString:@"handler"] &&
+                ![name.lowercaseString containsString:@"target"] &&
+                ![name.lowercaseString containsString:@"selector"] &&
+                ![name.lowercaseString containsString:@"block"]) {
+                continue;
+            }
 
             [items addObject:
-                [NSString stringWithFormat:@"%@.%@",
-                 NSStringFromClass(c), selName]];
+                [NSString stringWithFormat:@"%@.%@", NSStringFromClass(c), name]];
         }
 
         if (methods) free(methods);
-
         c = class_getSuperclass(c);
         depth++;
     }
 
     NSArray *all = items.array;
-    if (all.count <= maxCount) return all;
-    return [all subarrayWithRange:NSMakeRange(0, maxCount)];
+    if (all.count <= limit) return all;
+    return [all subarrayWithRange:NSMakeRange(0, limit)];
 }
 
-#pragma mark - UIGestureRecognizer private target/action diagnostics
+static NSString *WCRObjectIvarSummary(id obj, NSUInteger maxLines) {
+    if (!obj) return @"<nil>";
 
-static id WCRObjectIvar(id obj, const char *name) {
-    if (!obj || !name) return nil;
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
 
     Class c = [obj class];
-    while (c) {
-        Ivar iv = class_getInstanceVariable(c, name);
-        if (iv) {
-            const char *type = ivar_getTypeEncoding(iv);
-            if (type && type[0] == '@') {
-                return object_getIvar(obj, iv);
+    NSInteger depth = 0;
+
+    while (c && depth < 5 && lines.count < maxLines) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(c, &count);
+
+        for (unsigned int i = 0; i < count && lines.count < maxLines; i++) {
+            Ivar iv = ivars[i];
+            NSString *name = [NSString stringWithUTF8String:ivar_getName(iv) ?: ""];
+            if (!WCRNameLooksMenuRelated(name) &&
+                ![name.lowercaseString containsString:@"title"] &&
+                ![name.lowercaseString containsString:@"color"] &&
+                ![name.lowercaseString containsString:@"tag"] &&
+                ![name.lowercaseString containsString:@"type"] &&
+                ![name.lowercaseString containsString:@"block"] &&
+                ![name.lowercaseString containsString:@"target"] &&
+                ![name.lowercaseString containsString:@"selector"]) {
+                continue;
             }
-            return nil;
-        }
-        c = class_getSuperclass(c);
-    }
 
-    return nil;
-}
-
-static SEL WCRSELIvar(id obj, const char *name) {
-    if (!obj || !name) return NULL;
-
-    Class c = [obj class];
-    while (c) {
-        Ivar iv = class_getInstanceVariable(c, name);
-        if (iv) {
             const char *type = ivar_getTypeEncoding(iv);
-            if (!type || type[0] != ':') return NULL;
+            NSString *typeStr = type ? [NSString stringWithUTF8String:type] : @"?";
 
-            ptrdiff_t offset = ivar_getOffset(iv);
-            uint8_t *bytes = (uint8_t *)(__bridge void *)obj;
-            SEL value = NULL;
-            memcpy(&value, bytes + offset, sizeof(SEL));
-            return value;
+            if (type && type[0] == '@') {
+                id value = WCRReadObjectIvar(obj, iv);
+                [lines addObject:
+                    [NSString stringWithFormat:@"%@.%@ (%@) = %@",
+                     NSStringFromClass(c), name, typeStr, WCRSafeDescription(value)]];
+            } else {
+                [lines addObject:
+                    [NSString stringWithFormat:@"%@.%@ (%@)",
+                     NSStringFromClass(c), name, typeStr]];
+            }
         }
+
+        if (ivars) free(ivars);
         c = class_getSuperclass(c);
+        depth++;
     }
 
-    return NULL;
-}
-
-static NSString *WCRGestureTargets(UIGestureRecognizer *gr) {
-    NSMutableArray *lines = [NSMutableArray array];
-
-    id targets = WCRObjectIvar(gr, "_targets");
-    if ([targets isKindOfClass:[NSArray class]]) {
-        for (id record in (NSArray *)targets) {
-            id target = WCRObjectIvar(record, "_target");
-            SEL action = WCRSELIvar(record, "_action");
-
-            [lines addObject:
-                [NSString stringWithFormat:@"target=%@ action=%@",
-                 WCRClassName(target),
-                 action ? NSStringFromSelector(action) : @"<nil>"]];
-        }
-    }
-
-    if (lines.count == 0) return @"<not resolved>";
+    if (lines.count == 0) return @"<no matching ivars>";
     return [lines componentsJoinedByString:@"\n"];
 }
 
-#pragma mark - UIButton target/action diagnostics
+#pragma mark - Discover menu-model collections
 
-static NSString *WCRButtonActions(UIButton *button) {
+static void WCRAppendCollectionDetails(NSMutableString *out,
+                                       NSString *ownerClass,
+                                       NSString *ivarName,
+                                       id collection) {
+    NSArray *array = nil;
+
+    if ([collection isKindOfClass:[NSArray class]]) {
+        array = collection;
+    } else if ([collection isKindOfClass:[NSSet class]]) {
+        array = [(NSSet *)collection allObjects];
+    } else {
+        return;
+    }
+
+    if (array.count == 0) return;
+
+    [out appendFormat:@"\nCOLLECTION %@.%@ count=%lu\n",
+     ownerClass, ivarName, (unsigned long)array.count];
+
+    NSUInteger limit = MIN((NSUInteger)8, array.count);
+
+    for (NSUInteger i = 0; i < limit; i++) {
+        id item = array[i];
+
+        [out appendFormat:
+            @"\n  [%lu] class=%@\n"
+             "  ivars:\n%@\n"
+             "  selectors:\n%@\n",
+             (unsigned long)i,
+             WCRClassName(item),
+             WCRObjectIvarSummary(item, 18),
+             [[WCRInterestingMethods([item class], 18)
+               componentsJoinedByString:@"\n"] ?: @"<none>"]];
+    }
+}
+
+static NSString *WCRCellMenuModelReport(id cell) {
+    NSMutableString *out = [NSMutableString string];
+
+    [out appendString:@"CELL MENU IVARS:\n"];
+    [out appendString:WCRObjectIvarSummary(cell, 60)];
+    [out appendString:@"\n"];
+
+    Class c = [cell class];
+    NSInteger depth = 0;
+
+    while (c && depth < 6) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(c, &count);
+
+        for (unsigned int i = 0; i < count; i++) {
+            Ivar iv = ivars[i];
+            NSString *name = [NSString stringWithUTF8String:ivar_getName(iv) ?: ""];
+            if (!WCRNameLooksMenuRelated(name)) continue;
+
+            id value = WCRReadObjectIvar(cell, iv);
+            if (!value) continue;
+
+            WCRAppendCollectionDetails(out, NSStringFromClass(c), name, value);
+        }
+
+        if (ivars) free(ivars);
+        c = class_getSuperclass(c);
+        depth++;
+    }
+
+    return out;
+}
+
+#pragma mark - Visible buttons
+
+static void WCRCollectMenuButtons(UIView *view, NSMutableArray<UIButton *> *out) {
+    if (!view || view.hidden || view.alpha <= 0.01) return;
+
+    if ([view isKindOfClass:[UIButton class]]) {
+        UIButton *b = (UIButton *)view;
+        NSString *cls = WCRClassName(b);
+        NSString *text = WCRButtonText(b);
+
+        if ([cls containsString:@"MenuButton"] ||
+            [text containsString:@"已读"] ||
+            [text containsString:@"不显示"] ||
+            [text containsString:@"删除"]) {
+            [out addObject:b];
+        }
+    }
+
+    for (UIView *sub in view.subviews) {
+        WCRCollectMenuButtons(sub, out);
+    }
+}
+
+static NSArray<UIButton *> *WCRButtonsForCell(UITableViewCell *cell) {
+    NSMutableArray<UIButton *> *arr = [NSMutableArray array];
+
+    WCRCollectMenuButtons(cell, arr);
+
+    if (cell.superview) {
+        for (UIView *sub in cell.superview.subviews) {
+            if (sub == cell) continue;
+            WCRCollectMenuButtons(sub, arr);
+        }
+    }
+
+    return [NSMutableOrderedSet orderedSetWithArray:arr].array;
+}
+
+static NSString *WCRButtonTargets(UIButton *button) {
     NSMutableArray *lines = [NSMutableArray array];
 
-    NSSet *targets = [button allTargets];
-    for (id target in targets) {
+    for (id target in button.allTargets) {
         NSArray *actions = [button actionsForTarget:target
                                    forControlEvent:UIControlEventTouchUpInside];
 
         if (actions.count == 0) {
-            actions = [button actionsForTarget:target
-                               forControlEvent:UIControlEventPrimaryActionTriggered];
-        }
-
-        if (actions.count == 0) {
             [lines addObject:
-                [NSString stringWithFormat:@"target=%@ action=<none for TouchUpInside>",
+                [NSString stringWithFormat:@"target=%@ action=<none>",
                  WCRClassName(target)]];
         } else {
             for (NSString *action in actions) {
@@ -305,231 +435,112 @@ static NSString *WCRButtonActions(UIButton *button) {
         }
     }
 
-    if (lines.count == 0) return @"<no UIControl targets>";
-    return [lines componentsJoinedByString:@"\n"];
+    return lines.count ? [lines componentsJoinedByString:@"\n"] : @"<none>";
 }
 
-static NSString *WCRSuperviewChain(UIView *view, UIView *stop) {
-    NSMutableArray *names = [NSMutableArray array];
+static NSString *WCRButtonsReport(UITableViewCell *cell) {
+    NSArray<UIButton *> *buttons = WCRButtonsForCell(cell);
+    NSMutableString *out =
+        [NSMutableString stringWithFormat:@"VISIBLE BUTTONS: %lu\n",
+         (unsigned long)buttons.count];
 
-    UIView *v = view;
-    NSInteger depth = 0;
+    NSUInteger index = 0;
+    for (UIButton *b in buttons) {
+        index++;
 
-    while (v && depth < 8) {
-        [names addObject:WCRClassName(v)];
-        if (v == stop) break;
-        v = v.superview;
-        depth++;
+        [out appendFormat:
+            @"\n[%lu] %@ text=\"%@\"\n"
+             "targets:\n%@\n"
+             "button ivars:\n%@\n",
+             (unsigned long)index,
+             WCRClassName(b),
+             WCRButtonText(b),
+             WCRButtonTargets(b),
+             WCRObjectIvarSummary(b, 24)];
     }
 
-    return [names componentsJoinedByString:@" <- "];
-}
-
-#pragma mark - Find action buttons
-
-static void WCRCollectMenuButtons(UIView *view,
-                                  UITableViewCell *cell,
-                                  NSMutableArray<UIButton *> *out) {
-    if (!view || view.hidden || view.alpha <= 0.01) return;
-
-    if ([view isKindOfClass:[UIButton class]]) {
-        UIButton *b = (UIButton *)view;
-        NSString *className = WCRClassName(b);
-        NSString *text = WCRButtonText(b);
-
-        BOOL menuClass = [className containsString:@"MenuButton"];
-        BOOL knownTitle =
-            [text containsString:@"已读"] ||
-            [text containsString:@"不显示"] ||
-            [text containsString:@"删除"];
-
-        if (menuClass || knownTitle) {
-            [out addObject:b];
-        }
-    }
-
-    for (UIView *sub in view.subviews) {
-        WCRCollectMenuButtons(sub, cell, out);
-    }
-}
-
-static NSArray<UIButton *> *WCRActionButtonsForCell(UITableViewCell *cell) {
-    NSMutableArray<UIButton *> *buttons = [NSMutableArray array];
-
-    // Scan the cell.
-    WCRCollectMenuButtons(cell, cell, buttons);
-
-    // The action container may be inserted next to the cell.
-    UIView *parent = cell.superview;
-    if (parent) {
-        for (UIView *sub in parent.subviews) {
-            if (sub == cell) continue;
-            WCRCollectMenuButtons(sub, cell, buttons);
-        }
-    }
-
-    // Deduplicate.
-    NSMutableOrderedSet *set = [NSMutableOrderedSet orderedSetWithArray:buttons];
-    return set.array;
-}
-
-#pragma mark - Build report after swipe
-
-static NSString *WCRReport(UITableView *table,
-                           NSIndexPath *indexPath,
-                           UITableViewCell *cell,
-                           UIGestureRecognizer *triggerGR) {
-
-    NSMutableString *s = [NSMutableString string];
-
-    [s appendFormat:
-        @"Table: %@\n"
-         "Delegate: %@\n"
-         "IndexPath: %@\n"
-         "Cell: %@\n"
-         "Cell.super: %@\n\n",
-         WCRClassName(table),
-         WCRClassName(table.delegate),
-         indexPath
-            ? [NSString stringWithFormat:@"section=%ld row=%ld",
-               (long)indexPath.section, (long)indexPath.row]
-            : @"<nil>",
-         WCRClassName(cell),
-         cell ? NSStringFromClass(class_getSuperclass([cell class])) : @"<nil>"];
-
-    [s appendFormat:
-        @"TRIGGER GESTURE:\n"
-         "%@ on %@\n%@\n\n",
-         WCRClassName(triggerGR),
-         WCRClassName(triggerGR.view),
-         WCRGestureTargets(triggerGR)];
-
-    if (cell) {
-        [s appendString:@"CELL GESTURES:\n"];
-
-        if (cell.gestureRecognizers.count == 0) {
-            [s appendString:@"<none>\n"];
-        } else {
-            for (UIGestureRecognizer *gr in cell.gestureRecognizers) {
-                [s appendFormat:
-                    @"%@\n%@\n",
-                     WCRClassName(gr),
-                     WCRGestureTargets(gr)];
-            }
-        }
-
-        [s appendString:@"\nCELL SELECTOR INVENTORY:\n"];
-        NSArray *methods = WCRMethodInventory([cell class], 30);
-        if (methods.count) {
-            [s appendString:[methods componentsJoinedByString:@"\n"]];
-        } else {
-            [s appendString:@"<none>"];
-        }
-        [s appendString:@"\n\n"];
-    }
-
-    NSArray<UIButton *> *buttons = cell ? WCRActionButtonsForCell(cell) : @[];
-
-    [s appendFormat:@"VISIBLE ACTION BUTTONS: %lu\n",
-     (unsigned long)buttons.count];
-
-    NSInteger idx = 0;
-    for (UIButton *button in buttons) {
-        idx++;
-        NSString *text = WCRButtonText(button);
-
-        [s appendFormat:
-            @"\n[%ld] %@ text=\"%@\"\n"
-             "frame=(%.1f %.1f %.1f %.1f)\n"
-             "actions:\n%@\n"
-             "chain:\n%@\n",
-             (long)idx,
-             WCRClassName(button),
-             text,
-             button.frame.origin.x,
-             button.frame.origin.y,
-             button.frame.size.width,
-             button.frame.size.height,
-             WCRButtonActions(button),
-             WCRSuperviewChain(button, cell)];
-    }
-
-    return s;
+    return out;
 }
 
 #pragma mark - Observer
 
-@interface WCRSwipeDiag5Observer : NSObject
-- (void)wcr_pan:(UIGestureRecognizer *)gr;
+@interface WCRSwipeDiag6Observer : NSObject
+- (void)wcr_pan:(UIPanGestureRecognizer *)pan;
 @end
 
-@implementation WCRSwipeDiag5Observer
+@implementation WCRSwipeDiag6Observer
 
-- (void)wcr_pan:(UIGestureRecognizer *)gr {
-    if (![gr isKindOfClass:[UIPanGestureRecognizer class]]) return;
+- (void)wcr_pan:(UIPanGestureRecognizer *)pan {
+    UITableView *table = WCRNearestTable(pan.view);
 
-    UIPanGestureRecognizer *pan = (UIPanGestureRecognizer *)gr;
-
-    UITableView *table = WCRNearestTable(gr.view);
     if (!table) {
-        UITableView *candidate = WCRMainTable();
-        if (candidate && WCRIsDescendant(gr.view, candidate)) {
-            table = candidate;
-        }
+        UITableView *main = WCRMainTable();
+        if (main && WCRIsDescendant(pan.view, main)) table = main;
     }
+
     if (!table) return;
 
     CGPoint tr = [pan translationInView:table];
 
-    BOOL left =
-        tr.x < -12.0 &&
-        fabs(tr.x) > fabs(tr.y) * 1.1;
+    BOOL left = tr.x < -15.0 && fabs(tr.x) > fabs(tr.y) * 1.1;
 
-    if ((gr.state == UIGestureRecognizerStateChanged ||
-         gr.state == UIGestureRecognizerStateEnded) &&
+    if ((pan.state == UIGestureRecognizerStateChanged ||
+         pan.state == UIGestureRecognizerStateEnded) &&
         left &&
-        !gReportedThisGesture) {
+        !gReported) {
 
-        gReportedThisGesture = YES;
+        gReported = YES;
 
-        CGPoint p = [pan locationInView:table];
-        NSIndexPath *ip = [table indexPathForRowAtPoint:p];
+        CGPoint point = [pan locationInView:table];
+        NSIndexPath *ip = [table indexPathForRowAtPoint:point];
         UITableViewCell *cell = ip ? [table cellForRowAtIndexPath:ip] : nil;
 
-        // If this recognizer is attached to the cell itself, prefer that cell.
-        if ([gr.view isKindOfClass:[UITableViewCell class]]) {
-            cell = (UITableViewCell *)gr.view;
-            NSIndexPath *realIP = [table indexPathForCell:cell];
-            if (realIP) ip = realIP;
+        if ([pan.view isKindOfClass:[UITableViewCell class]]) {
+            cell = (UITableViewCell *)pan.view;
+            NSIndexPath *real = [table indexPathForCell:cell];
+            if (real) ip = real;
         }
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(0.35 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.38 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            NSString *report = WCRReport(table, ip, cell, gr);
-            WCRShow(@"SWIPE_DIAG5 HIT", report);
+            NSMutableString *report = [NSMutableString stringWithFormat:
+                @"Table: %@\n"
+                 "IndexPath: %@\n"
+                 "Cell: %@\n"
+                 "Cell.super: %@\n\n",
+                 WCRClassName(table),
+                 ip ? [NSString stringWithFormat:@"section=%ld row=%ld",
+                       (long)ip.section, (long)ip.row] : @"<nil>",
+                 WCRClassName(cell),
+                 cell ? NSStringFromClass(class_getSuperclass([cell class])) : @"<nil>"];
+
+            if (cell) {
+                [report appendString:WCRCellMenuModelReport(cell)];
+                [report appendString:@"\n\n"];
+                [report appendString:WCRButtonsReport(cell)];
+            }
+
+            WCRShow(@"SWIPE_DIAG6 HIT", report);
         });
     }
 
-    if (gr.state == UIGestureRecognizerStateEnded ||
-        gr.state == UIGestureRecognizerStateCancelled ||
-        gr.state == UIGestureRecognizerStateFailed) {
+    if (pan.state == UIGestureRecognizerStateEnded ||
+        pan.state == UIGestureRecognizerStateCancelled ||
+        pan.state == UIGestureRecognizerStateFailed) {
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(0.9 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            gReportedThisGesture = NO;
+            gReported = NO;
         });
     }
 }
 
 @end
 
-#pragma mark - Attach observers
+#pragma mark - Attach to real cell pan recognizers
 
-static void WCRAttachRecursively(UIView *view, UITableView *table) {
+static void WCRAttachToView(UIView *view, UITableView *table) {
     if (!view) return;
-
     if (view != table && !WCRIsDescendant(view, table)) return;
 
     for (UIGestureRecognizer *gr in view.gestureRecognizers) {
@@ -544,7 +555,7 @@ static void WCRAttachRecursively(UIView *view, UITableView *table) {
     }
 
     for (UIView *sub in view.subviews) {
-        WCRAttachRecursively(sub, table);
+        WCRAttachToView(sub, table);
     }
 }
 
@@ -555,61 +566,56 @@ static void WCRScan(BOOL showReady) {
         if (!table) {
             if (showReady && !gReadyShown) {
                 gReadyShown = YES;
-                WCRShow(@"SWIPE_DIAG5 Ready",
-                        @"MainFrameTableView not found.\n"
-                         "Stay on the WeChat conversation home page.");
+                WCRShow(@"SWIPE_DIAG6 Ready",
+                        @"MainFrameTableView not found.");
             }
             return;
         }
 
-        WCRAttachRecursively(table, table);
+        WCRAttachToView(table, table);
 
         if (showReady && !gReadyShown) {
             gReadyShown = YES;
 
-            NSMutableString *msg = [NSMutableString stringWithFormat:
+            NSString *msg = [NSString stringWithFormat:
                 @"Table: %@\n"
                  "Delegate: %@\n"
-                 "DataSource: %@\n\n"
                  "Visible cells: %lu\n\n"
-                 "Tap OK, then left-swipe ONE normal ungrouped friend.\n\n"
-                 "DIAG5 will report:\n"
-                 "• NewMainFrameCell pan target/action\n"
-                 "• Cell swipe/menu selectors\n"
-                 "• MenuButton target/action\n"
-                 "• MenuButton superview chain",
+                 "DIAG5 confirmed:\n"
+                 "NewMainFrameCell.handlePan:\n"
+                 "MenuButton -> NewMainFrameCell.onButtonClicked:\n\n"
+                 "DIAG6 now inspects the menu MODEL objects.\n\n"
+                 "Tap OK, then left-swipe ONE normal ungrouped friend.\n"
+                 "Do NOT tap any existing action button.",
                  WCRClassName(table),
                  WCRClassName(table.delegate),
-                 WCRClassName(table.dataSource),
                  (unsigned long)table.visibleCells.count];
 
-            WCRShow(@"SWIPE_DIAG5 Ready", msg);
+            WCRShow(@"SWIPE_DIAG6 Ready", msg);
         }
     });
 }
 
-static void WCRRepeatScan(NSUInteger remaining) {
+static void WCRRepeat(NSUInteger remaining) {
     if (remaining == 0) return;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t)(1.0 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         WCRScan(NO);
-        WCRRepeatScan(remaining - 1);
+        WCRRepeat(remaining - 1);
     });
 }
 
 __attribute__((constructor))
-static void WCRSwipeDiag5Init(void) {
+static void WCRSwipeDiag6Init(void) {
     @autoreleasepool {
         gObservedRecognizers = [NSHashTable weakObjectsHashTable];
-        gObserver = [WCRSwipeDiag5Observer new];
+        gObserver = [WCRSwipeDiag6Observer new];
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(6.0 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             WCRScan(YES);
-            WCRRepeatScan(30);
+            WCRRepeat(30);
         });
     }
 }
