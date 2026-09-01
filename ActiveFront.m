@@ -1,4 +1,4 @@
-// ActiveFront.RIGHT_GROUP_UI_V1.m
+// ActiveFront.RIGHT_GROUP_UI_V1_1.m
 // WCRefineGroup - Minimal RIGHT swipe "分组" proof
 //
 // Design goal:
@@ -168,6 +168,10 @@ static UIButton *WCRRightButtonForCell(UITableViewCell *cell, BOOL create) {
     [button setTitle:@"分组" forState:UIControlStateNormal];
     [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     button.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightMedium];
+    // WeChat's NewMainFrameCell uses transparent/custom content layers.
+    // Therefore a button placed "below contentView" is NOT guaranteed to be
+    // visually covered. Keep it hidden until a real right-swipe starts.
+    button.hidden = YES;
 
     [button addTarget:gButtonTarget
                action:@selector(wcr_groupTapped:)
@@ -201,10 +205,14 @@ static void WCRSetCellRightOpen(UITableViewCell *cell, BOOL open) {
 static void WCRApplyRightOffset(UITableViewCell *cell, CGFloat x) {
     if (!cell) return;
 
-    WCRRightButtonForCell(cell, YES);
+    UIButton *button = WCRRightButtonForCell(cell, YES);
 
     // Cap the reveal. We only need one action.
     x = MAX(0.0, MIN(kWCRButtonWidth, x));
+
+    // Critical fix: only make the custom action visible while there is a
+    // genuine positive reveal distance.
+    button.hidden = (x <= 0.5);
 
     CGAffineTransform t = CGAffineTransformMakeTranslation(x, 0);
     cell.contentView.transform = t;
@@ -213,8 +221,14 @@ static void WCRApplyRightOffset(UITableViewCell *cell, CGFloat x) {
 static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
     if (!cell) return;
 
+    UIButton *button = WCRRightButtonForCell(cell, NO);
+
     void (^changes)(void) = ^{
         cell.contentView.transform = CGAffineTransformIdentity;
+    };
+
+    void (^finish)(void) = ^{
+        if (button) button.hidden = YES;
     };
 
     if (animated) {
@@ -223,9 +237,12 @@ static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
                             options:UIViewAnimationOptionCurveEaseOut |
                                     UIViewAnimationOptionBeginFromCurrentState
                          animations:changes
-                         completion:nil];
+                         completion:^(__unused BOOL finished) {
+            finish();
+        }];
     } else {
         changes();
+        finish();
     }
 
     WCRSetCellRightOpen(cell, NO);
@@ -239,7 +256,8 @@ static void WCROpenCell(UITableViewCell *cell, BOOL animated) {
         WCRCloseCell(gOpenCell, YES);
     }
 
-    WCRRightButtonForCell(cell, YES);
+    UIButton *button = WCRRightButtonForCell(cell, YES);
+    button.hidden = NO;
 
     void (^changes)(void) = ^{
         cell.contentView.transform = CGAffineTransformMakeTranslation(kWCRButtonWidth, 0);
@@ -282,7 +300,7 @@ static void WCROpenCell(UITableViewCell *cell, BOOL animated) {
          WCRClassName(cell)];
 
     WCRCloseCell(cell, YES);
-    WCRShow(@"RIGHT_GROUP_UI_V1", msg);
+    WCRShow(@"RIGHT_GROUP_UI_V1_1", msg);
 }
 
 @end
@@ -369,11 +387,13 @@ static void WCRPrepareCell(UITableViewCell *cell) {
     Class targetClass = NSClassFromString(@"NewMainFrameCell");
     if (!targetClass || ![cell isKindOfClass:targetClass]) return;
 
-    WCRRightButtonForCell(cell, YES);
-
-    // A reused cell must not inherit an open transform from a prior row.
+    // Do not pre-create/reveal a button for every visible row.
+    // Create it lazily only when the user actually starts a right swipe.
     if (!WCRCellIsRightOpen(cell) && gOpenCell != cell) {
         cell.contentView.transform = CGAffineTransformIdentity;
+
+        UIButton *existing = WCRRightButtonForCell(cell, NO);
+        if (existing) existing.hidden = YES;
     }
 
     for (UIGestureRecognizer *gr in cell.gestureRecognizers) {
@@ -396,7 +416,7 @@ static void WCRScan(BOOL showReady) {
         if (!table) {
             if (showReady && !gReadyShown) {
                 gReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_1 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -420,7 +440,7 @@ static void WCRScan(BOOL showReady) {
                  WCRClassName(table),
                  (unsigned long)table.visibleCells.count];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1 Ready", msg);
+            WCRShow(@"RIGHT_GROUP_UI_V1_1 Ready", msg);
         }
     });
 }
