@@ -1,4 +1,4 @@
-// ActiveFront.RIGHT_GROUP_UI_V1_1.m
+// ActiveFront.RIGHT_GROUP_UI_V1_2.m
 // WCRefineGroup - Minimal RIGHT swipe "分组" proof
 //
 // Design goal:
@@ -29,8 +29,8 @@ static id gObserver;
 static __weak UITableViewCell *gOpenCell = nil;
 static BOOL gReadyShown = NO;
 
-static const CGFloat kWCRButtonWidth = 88.0;
-static const CGFloat kWCROpenThreshold = 42.0;
+static const CGFloat kWCRButtonWidth = 76.0;
+static const CGFloat kWCROpenThreshold = 36.0;
 
 #pragma mark - Helpers
 
@@ -161,25 +161,37 @@ static UIButton *WCRRightButtonForCell(UITableViewCell *cell, BOOL create) {
     UIButton *button = objc_getAssociatedObject(cell, kWCRRightButtonKey);
     if (button || !create) return button;
 
-    button = [UIButton buttonWithType:UIButtonTypeSystem];
-    button.frame = CGRectMake(0, 0, kWCRButtonWidth, CGRectGetHeight(cell.bounds));
+    button = [UIButton buttonWithType:UIButtonTypeCustom];
+    button.frame = CGRectMake(0, 0, 0, CGRectGetHeight(cell.bounds));
     button.autoresizingMask = UIViewAutoresizingFlexibleHeight;
-    button.backgroundColor = [UIColor systemGreenColor];
+
+    // Use a restrained WeChat-like blue-gray instead of the very bright
+    // system green used by the proof build.
+    button.backgroundColor = [UIColor colorWithRed:87.0/255.0
+                                             green:107.0/255.0
+                                              blue:149.0/255.0
+                                             alpha:1.0];
+
     [button setTitle:@"分组" forState:UIControlStateNormal];
     [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightMedium];
-    // WeChat's NewMainFrameCell uses transparent/custom content layers.
-    // Therefore a button placed "below contentView" is NOT guaranteed to be
-    // visually covered. Keep it hidden until a real right-swipe starts.
+    button.titleLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
+    button.titleLabel.adjustsFontSizeToFitWidth = YES;
+    button.contentEdgeInsets = UIEdgeInsetsMake(0, 8, 0, 8);
+
+    // Flat action surface: no standalone pill/rounded rectangle.
+    button.layer.cornerRadius = 0.0;
+    button.layer.masksToBounds = YES;
     button.hidden = YES;
+    button.alpha = 0.0;
 
     [button addTarget:gButtonTarget
                action:@selector(wcr_groupTapped:)
      forControlEvents:UIControlEventTouchUpInside];
 
-    // Put the button under the normal cell content so sliding the contentView
-    // to the right reveals it.
-    [cell insertSubview:button belowSubview:cell.contentView];
+    // Keep the action above the rounded/transparent WeChat content layer.
+    // During the drag we grow its width exactly with the reveal distance.
+    [cell addSubview:button];
+    [cell bringSubviewToFront:button];
 
     objc_setAssociatedObject(cell,
                              kWCRRightButtonKey,
@@ -207,12 +219,13 @@ static void WCRApplyRightOffset(UITableViewCell *cell, CGFloat x) {
 
     UIButton *button = WCRRightButtonForCell(cell, YES);
 
-    // Cap the reveal. We only need one action.
+    // Cap the reveal. We only need one compact action.
     x = MAX(0.0, MIN(kWCRButtonWidth, x));
 
-    // Critical fix: only make the custom action visible while there is a
-    // genuine positive reveal distance.
     button.hidden = (x <= 0.5);
+    button.frame = CGRectMake(0, 0, x, CGRectGetHeight(cell.bounds));
+    button.alpha = MIN(1.0, MAX(0.0, x / 32.0));
+    [cell bringSubviewToFront:button];
 
     CGAffineTransform t = CGAffineTransformMakeTranslation(x, 0);
     cell.contentView.transform = t;
@@ -225,6 +238,10 @@ static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
 
     void (^changes)(void) = ^{
         cell.contentView.transform = CGAffineTransformIdentity;
+        if (button) {
+            button.frame = CGRectMake(0, 0, 0, CGRectGetHeight(cell.bounds));
+            button.alpha = 0.0;
+        }
     };
 
     void (^finish)(void) = ^{
@@ -258,8 +275,11 @@ static void WCROpenCell(UITableViewCell *cell, BOOL animated) {
 
     UIButton *button = WCRRightButtonForCell(cell, YES);
     button.hidden = NO;
+    [cell bringSubviewToFront:button];
 
     void (^changes)(void) = ^{
+        button.frame = CGRectMake(0, 0, kWCRButtonWidth, CGRectGetHeight(cell.bounds));
+        button.alpha = 1.0;
         cell.contentView.transform = CGAffineTransformMakeTranslation(kWCRButtonWidth, 0);
     };
 
@@ -300,7 +320,7 @@ static void WCROpenCell(UITableViewCell *cell, BOOL animated) {
          WCRClassName(cell)];
 
     WCRCloseCell(cell, YES);
-    WCRShow(@"RIGHT_GROUP_UI_V1_1", msg);
+    WCRShow(@"RIGHT_GROUP_UI_V1_2", msg);
 }
 
 @end
@@ -393,7 +413,11 @@ static void WCRPrepareCell(UITableViewCell *cell) {
         cell.contentView.transform = CGAffineTransformIdentity;
 
         UIButton *existing = WCRRightButtonForCell(cell, NO);
-        if (existing) existing.hidden = YES;
+        if (existing) {
+            existing.hidden = YES;
+            existing.alpha = 0.0;
+            existing.frame = CGRectMake(0, 0, 0, CGRectGetHeight(cell.bounds));
+        }
     }
 
     for (UIGestureRecognizer *gr in cell.gestureRecognizers) {
@@ -416,7 +440,7 @@ static void WCRScan(BOOL showReady) {
         if (!table) {
             if (showReady && !gReadyShown) {
                 gReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_1 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_2 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -440,7 +464,7 @@ static void WCRScan(BOOL showReady) {
                  WCRClassName(table),
                  (unsigned long)table.visibleCells.count];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_1 Ready", msg);
+            WCRShow(@"RIGHT_GROUP_UI_V1_2 Ready", msg);
         }
     });
 }
