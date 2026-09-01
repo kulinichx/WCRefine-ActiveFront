@@ -339,8 +339,8 @@ static void WCRAppendCollectionDetails(NSMutableString *out,
              (unsigned long)i,
              WCRClassName(item),
              WCRObjectIvarSummary(item, 18),
-             [[WCRInterestingMethods([item class], 18)
-               componentsJoinedByString:@"\n"] ?: @"<none>"]];
+             ([WCRInterestingMethods([item class], 18)
+               componentsJoinedByString:@"\n"] ?: @"<none>")];
     }
 }
 
