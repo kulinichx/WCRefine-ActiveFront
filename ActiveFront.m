@@ -1,4 +1,4 @@
-// ActiveFront.RIGHT_GROUP_UI_V1_2.m
+// ActiveFront.RIGHT_GROUP_UI_V1_3.m
 // WCRefineGroup - Minimal RIGHT swipe "分组" proof
 //
 // Design goal:
@@ -29,8 +29,11 @@ static id gObserver;
 static __weak UITableViewCell *gOpenCell = nil;
 static BOOL gReadyShown = NO;
 
-static const CGFloat kWCRButtonWidth = 76.0;
-static const CGFloat kWCROpenThreshold = 36.0;
+static const CGFloat kWCRButtonWidth = 72.0;
+static const CGFloat kWCROpenThreshold = 34.0;
+static const CGFloat kWCRVerticalInset = 2.0;
+static const CGFloat kWCRLeftCornerRadius = 12.0;
+
 
 #pragma mark - Helpers
 
@@ -147,6 +150,29 @@ static UITableView *WCRMainTable(void) {
     return tables.firstObject;
 }
 
+
+static void WCRApplyLeftOnlyMask(UIButton *button) {
+    if (!button) return;
+
+    CGRect bounds = button.bounds;
+    if (bounds.size.width <= 0.5 || bounds.size.height <= 0.5) {
+        button.layer.mask = nil;
+        return;
+    }
+
+    UIBezierPath *path =
+        [UIBezierPath bezierPathWithRoundedRect:bounds
+                              byRoundingCorners:(UIRectCornerTopLeft |
+                                                 UIRectCornerBottomLeft)
+                                    cornerRadii:CGSizeMake(kWCRLeftCornerRadius,
+                                                         kWCRLeftCornerRadius)];
+
+    CAShapeLayer *mask = [CAShapeLayer layer];
+    mask.frame = bounds;
+    mask.path = path.CGPath;
+    button.layer.mask = mask;
+}
+
 #pragma mark - Right action UI
 
 @interface WCRRightGroupButtonTarget : NSObject
@@ -162,19 +188,22 @@ static UIButton *WCRRightButtonForCell(UITableViewCell *cell, BOOL create) {
     if (button || !create) return button;
 
     button = [UIButton buttonWithType:UIButtonTypeCustom];
-    button.frame = CGRectMake(0, 0, 0, CGRectGetHeight(cell.bounds));
+    button.frame = CGRectMake(0,
+                              kWCRVerticalInset,
+                              0,
+                              MAX(0.0, CGRectGetHeight(cell.bounds) - 2.0 * kWCRVerticalInset));
     button.autoresizingMask = UIViewAutoresizingFlexibleHeight;
 
     // Use a restrained WeChat-like blue-gray instead of the very bright
     // system green used by the proof build.
-    button.backgroundColor = [UIColor colorWithRed:87.0/255.0
-                                             green:107.0/255.0
-                                              blue:149.0/255.0
+    button.backgroundColor = [UIColor colorWithRed:92.0/255.0
+                                             green:109.0/255.0
+                                              blue:143.0/255.0
                                              alpha:1.0];
 
     [button setTitle:@"分组" forState:UIControlStateNormal];
     [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
+    button.titleLabel.font = [UIFont systemFontOfSize:15.5 weight:UIFontWeightMedium];
     button.titleLabel.adjustsFontSizeToFitWidth = YES;
     button.contentEdgeInsets = UIEdgeInsetsMake(0, 8, 0, 8);
 
@@ -223,8 +252,12 @@ static void WCRApplyRightOffset(UITableViewCell *cell, CGFloat x) {
     x = MAX(0.0, MIN(kWCRButtonWidth, x));
 
     button.hidden = (x <= 0.5);
-    button.frame = CGRectMake(0, 0, x, CGRectGetHeight(cell.bounds));
-    button.alpha = MIN(1.0, MAX(0.0, x / 32.0));
+    button.frame = CGRectMake(0,
+                              kWCRVerticalInset,
+                              x,
+                              MAX(0.0, CGRectGetHeight(cell.bounds) - 2.0 * kWCRVerticalInset));
+    button.alpha = MIN(1.0, MAX(0.0, x / 30.0));
+    WCRApplyLeftOnlyMask(button);
     [cell bringSubviewToFront:button];
 
     CGAffineTransform t = CGAffineTransformMakeTranslation(x, 0);
@@ -239,8 +272,12 @@ static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
     void (^changes)(void) = ^{
         cell.contentView.transform = CGAffineTransformIdentity;
         if (button) {
-            button.frame = CGRectMake(0, 0, 0, CGRectGetHeight(cell.bounds));
+            button.frame = CGRectMake(0,
+                                      kWCRVerticalInset,
+                                      0,
+                                      MAX(0.0, CGRectGetHeight(cell.bounds) - 2.0 * kWCRVerticalInset));
             button.alpha = 0.0;
+            WCRApplyLeftOnlyMask(button);
         }
     };
 
@@ -278,8 +315,12 @@ static void WCROpenCell(UITableViewCell *cell, BOOL animated) {
     [cell bringSubviewToFront:button];
 
     void (^changes)(void) = ^{
-        button.frame = CGRectMake(0, 0, kWCRButtonWidth, CGRectGetHeight(cell.bounds));
+        button.frame = CGRectMake(0,
+                                  kWCRVerticalInset,
+                                  kWCRButtonWidth,
+                                  MAX(0.0, CGRectGetHeight(cell.bounds) - 2.0 * kWCRVerticalInset));
         button.alpha = 1.0;
+        WCRApplyLeftOnlyMask(button);
         cell.contentView.transform = CGAffineTransformMakeTranslation(kWCRButtonWidth, 0);
     };
 
@@ -320,7 +361,7 @@ static void WCROpenCell(UITableViewCell *cell, BOOL animated) {
          WCRClassName(cell)];
 
     WCRCloseCell(cell, YES);
-    WCRShow(@"RIGHT_GROUP_UI_V1_2", msg);
+    WCRShow(@"RIGHT_GROUP_UI_V1_3", msg);
 }
 
 @end
@@ -416,7 +457,11 @@ static void WCRPrepareCell(UITableViewCell *cell) {
         if (existing) {
             existing.hidden = YES;
             existing.alpha = 0.0;
-            existing.frame = CGRectMake(0, 0, 0, CGRectGetHeight(cell.bounds));
+            existing.frame = CGRectMake(0,
+                                        kWCRVerticalInset,
+                                        0,
+                                        MAX(0.0, CGRectGetHeight(cell.bounds) - 2.0 * kWCRVerticalInset));
+            WCRApplyLeftOnlyMask(existing);
         }
     }
 
@@ -440,7 +485,7 @@ static void WCRScan(BOOL showReady) {
         if (!table) {
             if (showReady && !gReadyShown) {
                 gReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_2 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_3 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -458,13 +503,14 @@ static void WCRScan(BOOL showReady) {
                  "Visible cells: %lu\n\n"
                  "本版交互：\n"
                  "左滑 = 微信原生，不修改\n"
-                 "右滑 = 显示一个「分组」按钮\n\n"
+                 "右滑 = 显示一个「分组」按钮\n"
+                 "样式 = 左侧圆角、右侧直边、窄按钮\n\n"
                  "测试一个普通未分组好友即可。\n"
                  "点击「分组」只弹确认框，不会真的改分组。",
                  WCRClassName(table),
                  (unsigned long)table.visibleCells.count];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_2 Ready", msg);
+            WCRShow(@"RIGHT_GROUP_UI_V1_3 Ready", msg);
         }
     });
 }
