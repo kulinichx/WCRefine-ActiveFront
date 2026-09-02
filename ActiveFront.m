@@ -1,4 +1,4 @@
-// ActiveFront.RIGHT_GROUP_UI_V1_6_LEADING_NATIVE.m
+// ActiveFront.RIGHT_GROUP_UI_V1_6_1_LEADING_NATIVE_COMPILE_FIX.m
 // WCRefineGroup - Native RIGHT-swipe "分组" proof
 //
 // Goal:
@@ -200,6 +200,11 @@ WCRLeadingActionsHook(id self,
                 UIContextualAction *action,
                 UIView *sourceView,
                 void (^completionHandler)(BOOL)) {
+
+            // Theos build uses -Werror; explicitly mark UIKit callback
+            // parameters as intentionally unused in this proof build.
+            (void)action;
+            (void)sourceView;
 
             // Tell UIKit the action completed so its native swipe container closes.
             if (completionHandler) {
