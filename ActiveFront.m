@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_v1_9_1_CANONICAL_ROW_BINDING.m
-// WCRefine ActiveFront - v1.9.1: bind swipe eligibility from WCRefine's own willDisplay row resolver.
+// ActiveFront.RIGHT_v1_9_1_1_COMPILE_FIX.m
+// WCRefine ActiveFront - v1.9.1.1: compile fix for row-debug gesture.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -40,7 +40,7 @@ static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.9.1";
+static NSString * const kWCRAFVersion = @"1.9.1.1";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -1550,7 +1550,7 @@ static void WCRShowCanonicalRowDebug(UITableViewCell *cell) {
 
 @interface WCRRowDebugController : NSObject
 + (instancetype)shared;
-- (void)handleLongPress:(UILongPressGestureRecognizer *)gesture;
+- (void)handleDebugTap:(UITapGestureRecognizer *)gesture;
 @end
 
 @implementation WCRRowDebugController
@@ -1564,8 +1564,8 @@ static void WCRShowCanonicalRowDebug(UITableViewCell *cell) {
     return controller;
 }
 
-- (void)handleLongPress:(UILongPressGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateBegan) return;
+- (void)handleDebugTap:(UITapGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateRecognized) return;
     if (![gesture.view isKindOfClass:[UITableViewCell class]]) return;
 
     WCRShowCanonicalRowDebug((UITableViewCell *)gesture.view);
@@ -1576,18 +1576,20 @@ static void WCRShowCanonicalRowDebug(UITableViewCell *cell) {
 static void WCRAttachDebugGesture(UITableViewCell *cell) {
     if (!cell) return;
 
-    UILongPressGestureRecognizer *existing =
+    UITapGestureRecognizer *existing =
         objc_getAssociatedObject(cell, kWCRDebugLongPressKey);
     if (existing) return;
 
-    UILongPressGestureRecognizer *debug =
-        [[UILongPressGestureRecognizer alloc]
+    UITapGestureRecognizer *debug =
+        [[UITapGestureRecognizer alloc]
             initWithTarget:[WCRRowDebugController shared]
-                    action:@selector(handleLongPress:)];
+                    action:@selector(handleDebugTap:)];
 
-    debug.minimumPressDuration = 0.75;
-    debug.minimumNumberOfTouches = 2;
-    debug.maximumNumberOfTouches = 2;
+    // Diagnostic gesture: two-finger double tap.
+    // UITapGestureRecognizer supports required touch/tap counts directly,
+    // unlike UILongPressGestureRecognizer.
+    debug.numberOfTouchesRequired = 2;
+    debug.numberOfTapsRequired = 2;
     debug.cancelsTouchesInView = NO;
 
     [cell addGestureRecognizer:debug];
@@ -2361,7 +2363,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_9_1 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_9_1_1 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -2384,7 +2386,7 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.9.1：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.9.1.1：右滑 = 分组 / 保持 / 回组\n"
                  "行身份直接绑定 WCRefine 自己的 session resolver。\n"
                  "WCRefine 组内列表不挂独立右滑手势。\n"
                  "左滑继续使用微信原生菜单。\n"
@@ -2397,7 +2399,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_9_1 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_9_1_1 Ready", message);
         }
     });
 }
@@ -2416,7 +2418,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.9.1");
+        WCRAF_LOG(@"dylib loaded; starting v1.9.1.1");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
