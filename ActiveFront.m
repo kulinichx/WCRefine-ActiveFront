@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_v1_8_3_LEFT_MENU_GUARD.m
-// WCRefine ActiveFront - v1.8.3: protect WeChat left-swipe close gesture.
+// ActiveFront.RIGHT_v1_8_4_NATIVE_CLOSE_LATCH.m
+// WCRefine ActiveFront - v1.8.4: latch native-left-menu state from touch-down.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -31,10 +31,11 @@ static const void *kWCRTrackingKey     = &kWCRTrackingKey;
 static const void *kWCRStartOffsetKey  = &kWCRStartOffsetKey;
 static const void *kWCRBaseTransformKey = &kWCRBaseTransformKey;
 static const void *kWCRBoundUsernameKey = &kWCRBoundUsernameKey;
+static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.8.3";
+static NSString * const kWCRAFVersion = @"1.8.4";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -1074,6 +1075,72 @@ static BOOL WCRSwipeActionViewVisibleRecursive(UIView *view,
     return NO;
 }
 
+
+static BOOL WCRViewContainsControlRecursive(UIView *view) {
+    if (!view || view.hidden || view.alpha <= 0.01) return NO;
+
+    if ([view isKindOfClass:[UIControl class]]) {
+        return YES;
+    }
+
+    for (UIView *subview in view.subviews) {
+        if (WCRViewContainsControlRecursive(subview)) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL WCRLargeRightEdgeActionSiblingVisible(UITableViewCell *cell,
+                                                   UIView *ourActionView) {
+    if (!cell) return NO;
+
+    CGFloat cellWidth = CGRectGetWidth(cell.bounds);
+    CGFloat cellHeight = CGRectGetHeight(cell.bounds);
+    if (cellWidth <= 1.0 || cellHeight <= 1.0) return NO;
+
+    for (UIView *subview in cell.subviews) {
+        if (subview == cell.contentView ||
+            subview == ourActionView ||
+            subview.hidden ||
+            subview.alpha <= 0.01) {
+            continue;
+        }
+
+        CGRect rect = [subview convertRect:subview.bounds toView:cell];
+
+        BOOL occupiesRightEdge =
+            CGRectGetWidth(rect) >= 44.0 &&
+            CGRectGetHeight(rect) >= cellHeight * 0.55 &&
+            CGRectGetMaxX(rect) >= cellWidth - 3.0 &&
+            CGRectGetMinX(rect) >= cellWidth * 0.20;
+
+        if (!occupiesRightEdge) continue;
+
+        NSString *className =
+            [NSStringFromClass([subview class]) lowercaseString];
+
+        // First use private-class hints when available.
+        if ([className containsString:@"swipe"] ||
+            [className containsString:@"action"] ||
+            [className containsString:@"delete"] ||
+            [className containsString:@"confirmation"] ||
+            [className containsString:@"pull"]) {
+            return YES;
+        }
+
+        // Fallback for WeChat/iOS versions whose private class names changed:
+        // a large direct sibling occupying the cell's right edge and
+        // containing controls is characteristic of the native left-swipe menu.
+        if (WCRViewContainsControlRecursive(subview)) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
 static BOOL WCRWeChatLeftSwipeMenuVisible(UITableViewCell *cell) {
     if (!cell) return NO;
 
@@ -1106,6 +1173,11 @@ static BOOL WCRWeChatLeftSwipeMenuVisible(UITableViewCell *cell) {
         return YES;
     }
 
+    // Geometry fallback for private class-name changes.
+    if (WCRLargeRightEdgeActionSiblingVisible(cell, ourActionView)) {
+        return YES;
+    }
+
     return NO;
 }
 
@@ -1125,6 +1197,67 @@ static void WCRSuppressOurActionForLeftMenu(UITableViewCell *cell) {
     WCRSetBool(cell, kWCROpenKey, NO);
     WCRSetBool(cell, kWCRTrackingKey, NO);
     WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
+}
+
+
+#pragma mark - Touch-down latch
+
+@interface WCRRightPanGestureRecognizer : UIPanGestureRecognizer
+@end
+
+@implementation WCRRightPanGestureRecognizer
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches
+           withEvent:(UIEvent *)event {
+    BOOL nativeMenuWasVisible = NO;
+
+    if ([self.view isKindOfClass:[UITableViewCell class]]) {
+        UITableViewCell *cell = (UITableViewCell *)self.view;
+        nativeMenuWasVisible = WCRWeChatLeftSwipeMenuVisible(cell);
+
+        if (nativeMenuWasVisible) {
+            WCRSuppressOurActionForLeftMenu(cell);
+        }
+    }
+
+    // Latch the state from the FIRST touch-down. Even if WeChat's menu starts
+    // disappearing before gestureRecognizerShouldBegin: is queried, this
+    // gesture remains reserved exclusively for closing the native menu.
+    objc_setAssociatedObject(self,
+                             kWCRNativeCloseLatchKey,
+                             @(nativeMenuWasVisible),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    [super touchesBegan:touches withEvent:event];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches
+           withEvent:(UIEvent *)event {
+    [super touchesEnded:touches withEvent:event];
+
+    objc_setAssociatedObject(self,
+                             kWCRNativeCloseLatchKey,
+                             @NO,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches
+               withEvent:(UIEvent *)event {
+    [super touchesCancelled:touches withEvent:event];
+
+    objc_setAssociatedObject(self,
+                             kWCRNativeCloseLatchKey,
+                             @NO,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+@end
+
+static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) {
+    NSNumber *value =
+        objc_getAssociatedObject(gestureRecognizer,
+                                 kWCRNativeCloseLatchKey);
+    return value.boolValue;
 }
 
 #pragma mark - Controller
@@ -1164,7 +1297,15 @@ static void WCRSuppressOurActionForLeftMenu(UITableViewCell *cell) {
 
     CGPoint velocity = [pan velocityInView:cell];
 
-    // Highest-priority guard:
+    // Absolute highest-priority guard: this touch began while WeChat's
+    // left-swipe menu was already open. The entire gesture belongs to WeChat
+    // even if that menu visually disappears before shouldBegin is evaluated.
+    if (WCRPanLatchedForNativeClose(gestureRecognizer)) {
+        WCRSuppressOurActionForLeftMenu(cell);
+        return NO;
+    }
+
+    // Highest-priority live-state guard:
     // if WeChat's native LEFT-swipe menu is already visible, a rightward pan
     // means "close WeChat's menu", not "open WCRefine's right-swipe menu".
     //
@@ -1205,11 +1346,14 @@ static void WCRSuppressOurActionForLeftMenu(UITableViewCell *cell) {
 
     (void)gestureRecognizer;
 
-    // Allow WeChat/table recognizers to keep receiving events. Direction
-    // gating in gestureRecognizerShouldBegin keeps our recognizer out of LEFT
-    // and vertical gestures.
+    // Horizontal ownership must be exclusive. Allowing simultaneous pan
+    // recognition is what made the native left menu and WCRefine menu appear
+    // together intermittently.
+    //
+    // Vertical scrolling is unaffected because our right-only recognizer fails
+    // its shouldBegin direction test before the table's vertical pan proceeds.
     if ([otherGestureRecognizer isKindOfClass:[UIPanGestureRecognizer class]]) {
-        return YES;
+        return NO;
     }
     return NO;
 }
@@ -1228,6 +1372,18 @@ static void WCRSuppressOurActionForLeftMenu(UITableViewCell *cell) {
 
     switch (pan.state) {
         case UIGestureRecognizerStateBegan: {
+            if (WCRPanLatchedForNativeClose(pan) ||
+                WCRWeChatLeftSwipeMenuVisible(cell)) {
+                WCRSuppressOurActionForLeftMenu(cell);
+
+                // Cancel only our recognizer. Do not touch WeChat's views or
+                // transforms; its recognizer remains responsible for closing
+                // the native left-swipe menu.
+                pan.enabled = NO;
+                pan.enabled = YES;
+                break;
+            }
+
             if (!WCRPrepareActionForCell(cell)) {
                 WCRCloseCell(cell, NO);
                 break;
@@ -1449,7 +1605,7 @@ static void WCRAttachToCell(UITableViewCell *cell) {
         [cell insertSubview:actionView belowSubview:cell.contentView];
 
         pan =
-            [[UIPanGestureRecognizer alloc]
+            [[WCRRightPanGestureRecognizer alloc]
                 initWithTarget:[WCRRightSwipeController shared]
                         action:@selector(handlePan:)];
 
@@ -1809,7 +1965,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_8_3 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_8_4 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -1832,7 +1988,7 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.8.3：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.8.4：右滑 = 分组 / 保持 / 回组\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
                  WCRClassName(tableView),
@@ -1843,7 +1999,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_8_3 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_8_4 Ready", message);
         }
     });
 }
@@ -1862,7 +2018,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.8.3");
+        WCRAF_LOG(@"dylib loaded; starting v1.8.4");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
