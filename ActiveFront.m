@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_GROUP_UI_V1_8_1_REFRESH_FIX.m
-// WCRefine ActiveFront - v1.8 real actions + right-swipe reset/refresh fix.
+// ActiveFront.RIGHT_GROUP_UI_V1_8_2_REUSE_RESET_FIX.m
+// WCRefine ActiveFront - v1.8.2 cell-reuse / auto-return UI reset fix.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -30,10 +30,11 @@ static const void *kWCROpenKey         = &kWCROpenKey;
 static const void *kWCRTrackingKey     = &kWCRTrackingKey;
 static const void *kWCRStartOffsetKey  = &kWCRStartOffsetKey;
 static const void *kWCRBaseTransformKey = &kWCRBaseTransformKey;
+static const void *kWCRBoundUsernameKey = &kWCRBoundUsernameKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.8.1";
+static NSString * const kWCRAFVersion = @"1.8.2";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -372,6 +373,50 @@ static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
         changes();
         finish(YES);
     }
+}
+
+
+static void WCRHardResetCellVisual(UITableViewCell *cell,
+                                   BOOL clearBinding) {
+    if (!cell) return;
+
+    UIView *actionView =
+        objc_getAssociatedObject(cell, kWCRActionViewKey);
+    UIButton *button =
+        objc_getAssociatedObject(cell, kWCRButtonKey);
+
+    [cell.contentView.layer removeAllAnimations];
+    [actionView.layer removeAllAnimations];
+
+    // If this cell was still carrying one of our offsets, first restore the
+    // exact WeChat baseline captured before the right-swipe.
+    if (WCRHasBaseTransform(cell)) {
+        cell.contentView.transform = WCRBaseTransform(cell);
+    }
+
+    actionView.hidden = YES;
+    [button setTitle:@"" forState:UIControlStateNormal];
+
+    WCRSetBool(cell, kWCROpenKey, NO);
+    WCRSetBool(cell, kWCRTrackingKey, NO);
+    WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
+
+    // The next row/session that occupies this reusable cell must establish a
+    // fresh baseline. Keeping a transform captured for the previous row is
+    // what caused occasional alignment / overlay artifacts after auto-return.
+    objc_setAssociatedObject(cell,
+                             kWCRBaseTransformKey,
+                             nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    if (clearBinding) {
+        objc_setAssociatedObject(cell,
+                                 kWCRBoundUsernameKey,
+                                 nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    [cell setNeedsLayout];
 }
 
 static void WCROpenCell(UITableViewCell *cell) {
@@ -779,6 +824,39 @@ static WCRRightActionKind WCRActionKindForCell(UITableViewCell *cell,
     if (usernameOut) *usernameOut = username;
 
     return kind;
+}
+
+
+static NSString *WCRUsernameForCell(UITableViewCell *cell) {
+    NSString *username = nil;
+
+    (void)WCRActionKindForCell(cell,
+                               NULL,
+                               NULL,
+                               NULL,
+                               NULL,
+                               &username);
+
+    return username;
+}
+
+static void WCRCloseVisibleRightSwipeForUsername(NSString *username) {
+    if (username.length == 0) return;
+
+    UITableView *tableView = WCRMainTable();
+    if (!tableView) return;
+
+    for (UITableViewCell *cell in tableView.visibleCells) {
+        if (!WCRIsMainFrameCell(cell)) continue;
+
+        NSString *cellUsername = WCRUsernameForCell(cell);
+        if (![cellUsername isEqualToString:username]) continue;
+
+        // Hide before the provider/table refresh can remove/reuse the row.
+        // This prevents a visible “保持/分组/回组” view from travelling with a
+        // recycled NewMainFrameCell into another conversation.
+        WCRHardResetCellVisual(cell, NO);
+    }
 }
 
 static NSString *WCRTitleForActionKind(WCRRightActionKind kind) {
@@ -1211,6 +1289,29 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     UITableView *tableView = WCRTableForCell(cell);
     if (!WCRIsMainFrameTable(tableView)) return;
 
+    NSString *currentUsername = WCRUsernameForCell(cell);
+    NSString *boundUsername =
+        objc_getAssociatedObject(cell, kWCRBoundUsernameKey);
+
+    // UITableView recycles NewMainFrameCell objects. If the same cell object
+    // now represents another session, no swipe UI state may survive the old
+    // session. Auto-return after reading is a common path that causes exactly
+    // this reuse.
+    if (boundUsername.length > 0 &&
+        currentUsername.length > 0 &&
+        ![boundUsername isEqualToString:currentUsername]) {
+        WCRHardResetCellVisual(cell, YES);
+        boundUsername = nil;
+    }
+
+    if (currentUsername.length > 0 &&
+        ![boundUsername isEqualToString:currentUsername]) {
+        objc_setAssociatedObject(cell,
+                                 kWCRBoundUsernameKey,
+                                 [currentUsername copy],
+                                 OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+
     UIPanGestureRecognizer *pan =
         objc_getAssociatedObject(cell, kWCRPanKey);
 
@@ -1285,6 +1386,16 @@ static void WCRAttachToCell(UITableViewCell *cell) {
 
     WCRLayoutAction(cell);
     WCRPrepareActionForCell(cell);
+
+    // Reconcile the visual state on every scan. A valid action title does not
+    // mean its view should be visible: closed rows must always keep the action
+    // layer hidden behind the cell. This also self-heals interrupted animations.
+    if (!WCRBool(cell, kWCROpenKey) &&
+        !WCRBool(cell, kWCRTrackingKey)) {
+        UIView *actionView =
+            objc_getAssociatedObject(cell, kWCRActionViewKey);
+        actionView.hidden = YES;
+    }
 
     // Re-run this because WeChat may add/recreate its cell recognizers later.
     WCRWirePanPriority(cell, pan);
@@ -1402,6 +1513,10 @@ static void hook_noteRead(id self,
         valid && WCRIsSurfaced(username);
 
     if (wasSurfaced) {
+        // The row may disappear/reorder immediately after the read is
+        // consumed. Clear its right-swipe view before that table mutation.
+        WCRCloseVisibleRightSwipeForUsername(username);
+
         WCRPersistSurfaced(username, NO);
         WCRAF_LOG(@"read consumed surfaced: %@", username);
     }
@@ -1589,7 +1704,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_8_1 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_8_2 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -1612,7 +1727,7 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.8.1：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.8.2：右滑 = 分组 / 保持 / 回组\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
                  WCRClassName(tableView),
@@ -1623,7 +1738,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_8_1 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_8_2 Ready", message);
         }
     });
 }
@@ -1642,7 +1757,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.8.1");
+        WCRAF_LOG(@"dylib loaded; starting v1.8.2");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
