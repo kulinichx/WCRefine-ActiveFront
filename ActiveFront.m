@@ -1,9 +1,10 @@
-// ActiveFront.RIGHT_v1_9_5_REJECT_GROUP_ENTRIES_AND_WECOM_DIAGNOSTIC.m
-// WCRefine ActiveFront - v1.9.5 diagnostic candidate built on the v1.9.2 state machine.
-// Identity fix: rendered m_cellData stays authoritative, but WCRefine synthetic
-// WCRefine_groupEntry_* rows are rejected and never fall through to indexPath.
-// WeCom step: no nickname layout is changed yet; sys_other rows only gain a
-// single-finger long-press diagnostic for OpenIM/enterprise identity + UILabel frames.
+// ActiveFront.RIGHT_v1_9_6_OPENIM_LABEL_LAYOUT_FIX.m
+// WCRefine ActiveFront - v1.9.6 candidate built on the v1.9.2 state machine.
+// Identity path is unchanged from v1.9.5: rendered m_cellData stays authoritative,
+// while WCRefine_groupEntry_* synthetic rows are rejected and fail closed.
+// WeCom layout fix: only sys_other rows whose rendered username contains @openim
+// can have their same-line MMCPLabel title/company frames adjusted. Long-press
+// diagnostics remain available for verification.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -42,10 +43,11 @@ static const void *kWCRCanonicalScopeKey = &kWCRCanonicalScopeKey;
 static const void *kWCRDebugLongPressKey = &kWCRDebugLongPressKey;
 static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 static const void *kWCRWeComDebugGestureKey = &kWCRWeComDebugGestureKey;
+static const void *kWCRWeComLayoutScheduledKey = &kWCRWeComLayoutScheduledKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.9.5";
+static NSString * const kWCRAFVersion = @"1.9.6";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -1705,7 +1707,7 @@ static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) 
     return value.boolValue;
 }
 
-#pragma mark - sys_other WeCom diagnostic (no layout mutation)
+#pragma mark - sys_other WeCom diagnostic + OpenIM-only layout
 
 static NSString * const kWCROtherGroupingId = @"sys_other";
 
@@ -1956,6 +1958,283 @@ static void WCRAttachWeComDebugGesture(UITableViewCell *cell) {
     [cell addGestureRecognizer:debug];
     objc_setAssociatedObject(cell, kWCRWeComDebugGestureKey, debug,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+
+// The on-device diagnostic established the actual overlapping pair for WeCom:
+// - rendered username: <digits>@openim, scope=4
+// - primary title: white MMCPLabel
+// - auxiliary enterprise name: orange MMCPLabel whose text begins with '@'
+// Both labels sit on the same title baseline.  We therefore identify the real
+// rendered pair from the view tree instead of relying on m_nickNameLabel.
+static NSString *WCRPlainLabelText(UILabel *label) {
+    if (!label) return nil;
+    NSString *text = label.attributedText.length > 0 ?
+        label.attributedText.string : label.text;
+    if (![text isKindOfClass:[NSString class]]) return nil;
+    return [text stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+static CGFloat WCRMeasuredLabelWidth(UILabel *label) {
+    if (!label) return 0.0;
+
+    NSAttributedString *attributed = label.attributedText;
+    if (attributed.length > 0) {
+        CGRect rect =
+            [attributed boundingRectWithSize:
+                            CGSizeMake(CGFLOAT_MAX,
+                                       MAX(ceil(label.bounds.size.height), 64.0))
+                                    options:(NSStringDrawingUsesLineFragmentOrigin |
+                                             NSStringDrawingUsesFontLeading)
+                                    context:nil];
+        return ceil(rect.size.width);
+    }
+
+    NSString *text = WCRPlainLabelText(label);
+    if (text.length == 0) return 0.0;
+
+    UIFont *font = label.font ?: [UIFont systemFontOfSize:17.0];
+    CGRect rect =
+        [text boundingRectWithSize:
+                  CGSizeMake(CGFLOAT_MAX, MAX(ceil(font.lineHeight), 64.0))
+                           options:(NSStringDrawingUsesLineFragmentOrigin |
+                                    NSStringDrawingUsesFontLeading)
+                        attributes:@{ NSFontAttributeName : font }
+                           context:nil];
+    return ceil(rect.size.width);
+}
+
+static BOOL WCRCellIsOpenIMEnterpriseRow(UITableViewCell *cell) {
+    if (!cell || !WCRCellBelongsToOtherGrouping(cell)) return NO;
+
+    id session = nil;
+    NSString *username = nil;
+    NSUInteger scope = 0;
+    BOOL ok = WCRIdentityFromCandidate(WCRRenderedCellData(cell),
+                                       &session,
+                                       &username,
+                                       &scope);
+    (void)session;
+    (void)scope;
+    return ok && WCRIsWeComOpenIMUsername(username);
+}
+
+static BOOL WCRFindOpenIMTitlePair(UITableViewCell *cell,
+                                   UILabel **nameOut,
+                                   UILabel **companyOut) {
+    if (nameOut) *nameOut = nil;
+    if (companyOut) *companyOut = nil;
+    if (!cell) return NO;
+
+    NSMutableArray<UILabel *> *labels = [NSMutableArray array];
+    WCRCollectLabelsInViewTree(cell, labels);
+
+    UILabel *bestName = nil;
+    UILabel *bestCompany = nil;
+    CGFloat bestScore = CGFLOAT_MAX;
+
+    for (UILabel *company in labels) {
+        if (company.hidden || company.alpha <= 0.01) continue;
+
+        NSString *companyText = WCRPlainLabelText(company);
+        if (companyText.length == 0 ||
+            (![companyText hasPrefix:@"@"] &&
+             ![companyText hasPrefix:@"＠"])) {
+            continue;
+        }
+
+        // The captured enterprise company label is MMCPLabel. Requiring the
+        // same concrete label class for the title prevents preview/date labels
+        // from being selected accidentally.
+        NSString *companyClass = WCRClassName(company);
+        if (![companyClass isEqualToString:@"MMCPLabel"]) continue;
+
+        CGRect companyRect = [company convertRect:company.bounds toView:cell];
+        CGFloat companyCenterY = CGRectGetMidY(companyRect);
+
+        for (UILabel *name in labels) {
+            if (name == company || name.hidden || name.alpha <= 0.01) continue;
+            if (![WCRClassName(name) isEqualToString:companyClass]) continue;
+
+            NSString *nameText = WCRPlainLabelText(name);
+            if (nameText.length == 0 ||
+                [nameText hasPrefix:@"@"] ||
+                [nameText hasPrefix:@"＠"]) {
+                continue;
+            }
+
+            CGRect nameRect = [name convertRect:name.bounds toView:cell];
+            if (CGRectGetMinX(nameRect) >= CGRectGetMinX(companyRect)) continue;
+
+            CGFloat tolerance =
+                MAX(5.0, MIN(CGRectGetHeight(nameRect),
+                             CGRectGetHeight(companyRect)) * 0.30);
+            CGFloat dy = fabs(CGRectGetMidY(nameRect) - companyCenterY);
+            if (dy > tolerance) continue;
+
+            // Prefer the pair on exactly the same baseline, then the title
+            // whose leading edge is closest to the left of the company label.
+            CGFloat horizontalGap =
+                MAX(0.0, CGRectGetMinX(companyRect) - CGRectGetMinX(nameRect));
+            CGFloat score = dy * 100.0 + horizontalGap;
+            if (!bestCompany || score < bestScore) {
+                bestName = name;
+                bestCompany = company;
+                bestScore = score;
+            }
+        }
+    }
+
+    if (!bestName || !bestCompany) return NO;
+    if (nameOut) *nameOut = bestName;
+    if (companyOut) *companyOut = bestCompany;
+    return YES;
+}
+
+static UILabel *WCRFindTitleLineTimeLabel(UITableViewCell *cell,
+                                          UILabel *nameLabel,
+                                          UILabel *companyLabel) {
+    if (!cell || !nameLabel) return nil;
+
+    NSMutableArray<UILabel *> *labels = [NSMutableArray array];
+    WCRCollectLabelsInViewTree(cell, labels);
+
+    CGRect nameRect = [nameLabel convertRect:nameLabel.bounds toView:cell];
+    CGFloat titleCenterY = CGRectGetMidY(nameRect);
+    UILabel *best = nil;
+    CGFloat bestX = CGFLOAT_MAX;
+
+    for (UILabel *label in labels) {
+        if (label == nameLabel || label == companyLabel) continue;
+        if (label.hidden || label.alpha <= 0.01) continue;
+
+        NSString *text = WCRPlainLabelText(label);
+        if (text.length == 0) continue;
+
+        CGRect rect = [label convertRect:label.bounds toView:cell];
+        if (CGRectGetMinX(rect) <= CGRectGetMinX(nameRect) + 120.0) continue;
+        if (CGRectGetHeight(rect) > CGRectGetHeight(nameRect) + 4.0) continue;
+
+        CGFloat dy = fabs(CGRectGetMidY(rect) - titleCenterY);
+        if (dy > 8.0) continue;
+
+        CGFloat x = CGRectGetMinX(rect);
+        if (!best || x < bestX) {
+            best = label;
+            bestX = x;
+        }
+    }
+
+    return best;
+}
+
+static void WCRSetLabelFrameInCell(UILabel *label,
+                                   UITableViewCell *cell,
+                                   CGRect frameInCell) {
+    if (!label || !cell || !label.superview) return;
+    CGRect local = [cell convertRect:frameInCell toView:label.superview];
+    CGRect current = label.frame;
+    if (fabs(current.origin.x - local.origin.x) < 0.25 &&
+        fabs(current.origin.y - local.origin.y) < 0.25 &&
+        fabs(current.size.width - local.size.width) < 0.25 &&
+        fabs(current.size.height - local.size.height) < 0.25) {
+        return;
+    }
+    label.frame = local;
+}
+
+static void WCRApplyOpenIMEnterpriseLabelLayout(UITableViewCell *cell) {
+    if (!cell || !cell.window) return;
+    if (!WCRCellIsOpenIMEnterpriseRow(cell)) return;
+
+    UILabel *nameLabel = nil;
+    UILabel *companyLabel = nil;
+    if (!WCRFindOpenIMTitlePair(cell, &nameLabel, &companyLabel)) return;
+
+    CGRect nameRect = [nameLabel convertRect:nameLabel.bounds toView:cell];
+    CGRect companyRect = [companyLabel convertRect:companyLabel.bounds toView:cell];
+    CGFloat nameX = CGRectGetMinX(nameRect);
+
+    UILabel *timeLabel =
+        WCRFindTitleLineTimeLabel(cell, nameLabel, companyLabel);
+    CGFloat rightLimit = CGRectGetWidth(cell.bounds) - 12.0;
+    if (timeLabel) {
+        CGRect timeRect = [timeLabel convertRect:timeLabel.bounds toView:cell];
+        if (CGRectGetMinX(timeRect) > nameX + 80.0) {
+            rightLimit = MIN(rightLimit, CGRectGetMinX(timeRect) - 8.0);
+        }
+    }
+
+    CGFloat available = rightLimit - nameX;
+    if (available <= 40.0) return;
+
+    const CGFloat gap = 6.0;
+    CGFloat nameDesired = WCRMeasuredLabelWidth(nameLabel) + 2.0;
+    CGFloat companyDesired = WCRMeasuredLabelWidth(companyLabel) + 2.0;
+    if (nameDesired <= 0.0 || companyDesired <= 0.0) return;
+
+    // Only intervene when glyphs can actually collide, the company reaches the
+    // time area, or a previous pass collapsed the company label to zero width.
+    BOOL glyphCollision =
+        (nameX + nameDesired + gap) > CGRectGetMinX(companyRect);
+    BOOL companyHitsTime = CGRectGetMaxX(companyRect) > rightLimit;
+    BOOL needsReuseRepair = CGRectGetWidth(companyRect) < 1.0;
+    if (!glyphCollision && !companyHitsTime && !needsReuseRepair) return;
+
+    nameLabel.numberOfLines = 1;
+    nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    nameLabel.clipsToBounds = YES;
+    companyLabel.numberOfLines = 1;
+    companyLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    companyLabel.clipsToBounds = YES;
+
+    CGRect newNameRect = nameRect;
+    CGRect newCompanyRect = companyRect;
+
+    // Primary contact name always wins.  The orange enterprise name only uses
+    // space left after the full primary title; if that remainder is too small,
+    // collapse it to width zero (without hidden=YES, so reused cells self-heal).
+    CGFloat titleWidth = MIN(nameDesired, available);
+    CGFloat remainingAfterTitle =
+        rightLimit - (nameX + titleWidth + gap);
+    CGFloat minCompanyVisible = 42.0;
+
+    if (remainingAfterTitle >= minCompanyVisible) {
+        newNameRect.size.width = titleWidth;
+        newCompanyRect.origin.x = nameX + titleWidth + gap;
+        newCompanyRect.size.width =
+            MIN(companyDesired, MAX(0.0, remainingAfterTitle));
+    } else {
+        newNameRect.size.width = available;
+        newCompanyRect.origin.x = rightLimit;
+        newCompanyRect.size.width = 0.0;
+    }
+
+    WCRSetLabelFrameInCell(nameLabel, cell, newNameRect);
+    WCRSetLabelFrameInCell(companyLabel, cell, newCompanyRect);
+}
+
+static void WCRScheduleOpenIMEnterpriseLabelLayout(UITableViewCell *cell) {
+    if (!cell || !WCRCellBelongsToOtherGrouping(cell)) return;
+
+    WCRApplyOpenIMEnterpriseLabelLayout(cell);
+
+    NSNumber *scheduled =
+        objc_getAssociatedObject(cell, kWCRWeComLayoutScheduledKey);
+    if (scheduled.boolValue) return;
+
+    objc_setAssociatedObject(cell, kWCRWeComLayoutScheduledKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    __weak UITableViewCell *weakCell = cell;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITableViewCell *strongCell = weakCell;
+        if (!strongCell) return;
+        objc_setAssociatedObject(strongCell, kWCRWeComLayoutScheduledKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        WCRApplyOpenIMEnterpriseLabelLayout(strongCell);
+    });
 }
 
 #pragma mark - Controller
@@ -2745,6 +3024,8 @@ static void hook_cellPrepareForReuse(id self, SEL _cmd) {
 
     UITableViewCell *cell = (UITableViewCell *)self;
     WCRRemoveWeComDebugGesture(cell);
+    objc_setAssociatedObject(cell, kWCRWeComLayoutScheduledKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     WCRHardResetCellVisual(cell, YES);
     WCRClearCanonicalRowBinding(cell);
 }
@@ -2758,6 +3039,7 @@ static void hook_cellLayoutSubviews(id self, SEL _cmd) {
 
     UITableViewCell *cell = (UITableViewCell *)self;
     WCRAttachWeComDebugGesture(cell);
+    WCRScheduleOpenIMEnterpriseLabelLayout(cell);
 }
 
 static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
@@ -2988,7 +3270,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_9_5 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_9_6 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -3011,9 +3293,9 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.9.5 diagnostic：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.9.6 candidate：右滑 = 分组 / 保持 / 回组\n"
                  "可见 Cell.cellData 为权威身份；WCRefine_groupEntry_* 入口强制禁用右滑。\n"
-                 "sys_other 组内仅增加两指双击 WeCom 诊断，不修改昵称布局。\n"
+                 "sys_other 中仅 @openim 企业微信行启用主标题优先防重叠；单指长按仍可诊断。\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
                  WCRClassName(tableView),
@@ -3024,7 +3306,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_9_5 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_9_6 Ready", message);
         }
     });
 }
@@ -3043,7 +3325,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.9.5 diagnostic candidate");
+        WCRAF_LOG(@"dylib loaded; starting v1.9.6 OpenIM layout candidate");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
