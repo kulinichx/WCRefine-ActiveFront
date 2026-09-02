@@ -1,6 +1,7 @@
-// ActiveFront.RIGHT_v1_9_2_OTHER_NICKNAME_LAYOUT_FIX.m
-// WCRefine ActiveFront - v1.9.2 stable baseline + "其它" nickname overlap layout fix.
-// ActiveFront right-swipe gesture/state machine below is intentionally unchanged.
+// ActiveFront.RIGHT_v1_9_3_RELIABILITY_AND_OTHER_LAYOUT_FIX.m
+// WCRefine ActiveFront - v1.9.3 reliability fix built on the v1.9.2 stable state machine.
+// Fixes: late/reused home-row pan attachment, live-session fallback, and final-pass "其它" nickname layout.
+// ActiveFront 分组/保持/回组 state semantics remain unchanged from v1.9.2.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -9,7 +10,7 @@
 //
 // Real actions:
 // - ungrouped -> 分组 (pick an existing WCRefine custom group)
-// - grouped + Surfaced -> 保持
+// - grouped + !Held -> 保持
 // - grouped + Held -> 回组
 //
 // ActiveFront never replaces WCRefine's group database. It only uses WCRefine's
@@ -41,7 +42,7 @@ static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.9.2";
+static NSString * const kWCRAFVersion = @"1.9.3";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -118,6 +119,10 @@ typedef NS_ENUM(NSInteger, WCRRightActionKind) {
     WCRRightActionReturn
 };
 
+// Forward declaration: refresh hooks schedule short post-refresh reconciliations
+// so rows inserted/reused after the startup scan window still receive ActiveFront.
+static void WCRScan(BOOL showReady);
+
 #pragma mark - Helpers
 
 static NSString *WCRClassName(id obj) {
@@ -151,6 +156,17 @@ static UITableView *WCRTableForCell(UITableViewCell *cell) {
     while (v) {
         if ([v isKindOfClass:[UITableView class]]) {
             return (UITableView *)v;
+        }
+        v = v.superview;
+    }
+    return nil;
+}
+
+static UITableViewCell *WCRCellForDescendantView(UIView *view) {
+    UIView *v = view;
+    while (v) {
+        if ([v isKindOfClass:[UITableViewCell class]]) {
+            return (UITableViewCell *)v;
         }
         v = v.superview;
     }
@@ -280,6 +296,18 @@ static BOOL WCRIsOtherGroupingController(id controller) {
 
     return [groupId isKindOfClass:[NSString class]] &&
            [groupId isEqualToString:kWCROtherGroupingId];
+}
+
+static BOOL WCRCellBelongsToOtherGrouping(UITableViewCell *cell) {
+    if (!cell) return NO;
+
+    UITableView *tableView = WCRTableForCell(cell);
+    if (!tableView) return NO;
+
+    UIViewController *owner = WCRViewControllerForView(tableView);
+    if (WCRIsOtherGroupingController(owner)) return YES;
+
+    return WCRIsOtherGroupingController(tableView.delegate);
 }
 
 static void WCRAdjustOtherGroupingNicknameCell(UITableViewCell *cell) {
@@ -942,6 +970,19 @@ static BOOL WCRSessionUnreadState(id session, BOOL *knownOut) {
     return NO;
 }
 
+static void WCRScheduleVisibleHomeReconcile(void) {
+    // WCRefine rebuilds its snapshot asynchronously. Reconcile a few times
+    // around that mutation instead of relying on the finite startup scan.
+    const NSTimeInterval delays[] = {0.05, 0.25, 0.70};
+    for (NSUInteger i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(delays[i] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            WCRScan(NO);
+        });
+    }
+}
+
 static void WCRRefreshHome(id host, NSString *reason) {
     [[NSNotificationCenter defaultCenter]
         postNotificationName:kWCRHomeGroupsDidChangeNotification
@@ -951,6 +992,8 @@ static void WCRRefreshHome(id host, NSString *reason) {
         [(NewMainFrameViewController *)host
             wcrGrouping_scheduleRefreshForTrigger:(reason ?: @"active_front")];
     }
+
+    WCRScheduleVisibleHomeReconcile();
 }
 
 static void WCRRefreshHomeDeferred(id host, NSString *reason) {
@@ -965,6 +1008,7 @@ static void WCRRefreshHomeGlobal(__unused NSString *reason) {
         [[NSNotificationCenter defaultCenter]
             postNotificationName:kWCRHomeGroupsDidChangeNotification
                           object:nil];
+        WCRScheduleVisibleHomeReconcile();
     });
 }
 
@@ -1061,36 +1105,121 @@ static void WCRClearCanonicalRowBinding(UITableViewCell *cell) {
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static BOOL WCRCandidateIsEligibleConversation(id candidate,
+                                               WCRefineGroupDataProvider *provider,
+                                               id *sessionOut,
+                                               NSString **usernameOut,
+                                               NSUInteger *scopeOut) {
+    if (!candidate || !provider) return NO;
+
+    id native = [provider nativeSessionFromObject:candidate];
+    if (!native) native = candidate;
+
+    NSString *username = [provider usernameForNativeObject:native];
+    NSUInteger scope = [provider groupScopeForNativeSession:native];
+
+    BOOL eligible =
+        [username isKindOfClass:[NSString class]] &&
+        username.length > 0 &&
+        (scope == 1 || scope == 2);
+
+    if (!eligible) return NO;
+
+    if (sessionOut) *sessionOut = native;
+    if (usernameOut) *usernameOut = username;
+    if (scopeOut) *scopeOut = scope;
+    return YES;
+}
+
+static id WCRResolveCurrentHomeSession(NewMainFrameViewController *host,
+                                       NSIndexPath *indexPath,
+                                       NSString **usernameOut,
+                                       NSUInteger *scopeOut,
+                                       NSString **sourceOut) {
+    if (!host || !indexPath) return nil;
+
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    if (!provider) return nil;
+
+    id primaryObject = nil;
+    if ([host respondsToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
+        primaryObject = [host wcrGrouping_logicGetSessionAtIndexPath:indexPath];
+    }
+
+    id primarySession = nil;
+    NSString *primaryUsername = nil;
+    NSUInteger primaryScope = 0;
+    BOOL primaryOK = WCRCandidateIsEligibleConversation(primaryObject,
+                                                         provider,
+                                                         &primarySession,
+                                                         &primaryUsername,
+                                                         &primaryScope);
+
+    // WCRefine exposes a second projection-aware accessor for the exact row's
+    // cell data. During snapshot rebuilds it can be current when the session
+    // accessor is temporarily nil/stale. Canonicalize it through WCRefine's
+    // own nativeSessionFromObject: instead of guessing by class/prefix.
+    id cellData = nil;
+    if ([host respondsToSelector:@selector(wcrGrouping_logicGetCellDataAtIndexPath:)]) {
+        cellData = [host wcrGrouping_logicGetCellDataAtIndexPath:indexPath];
+    }
+
+    id secondarySession = nil;
+    NSString *secondaryUsername = nil;
+    NSUInteger secondaryScope = 0;
+    BOOL secondaryOK = WCRCandidateIsEligibleConversation(cellData,
+                                                           provider,
+                                                           &secondarySession,
+                                                           &secondaryUsername,
+                                                           &secondaryScope);
+
+    // If both are valid but disagree during a projection mutation, prefer the
+    // cell-data candidate because it is bound to the row being rendered now.
+    if (secondaryOK &&
+        (!primaryOK || ![secondaryUsername isEqualToString:primaryUsername])) {
+        if (primaryOK && ![secondaryUsername isEqualToString:primaryUsername]) {
+            WCRAF_LOG(@"live resolver mismatch index=%ld/%ld session=%@ cellData=%@; prefer cellData",
+                      (long)indexPath.section,
+                      (long)indexPath.row,
+                      primaryUsername,
+                      secondaryUsername);
+        }
+        if (usernameOut) *usernameOut = secondaryUsername;
+        if (scopeOut) *scopeOut = secondaryScope;
+        if (sourceOut) *sourceOut = @"cellData";
+        return secondarySession;
+    }
+
+    if (primaryOK) {
+        if (usernameOut) *usernameOut = primaryUsername;
+        if (scopeOut) *scopeOut = primaryScope;
+        if (sourceOut) *sourceOut = @"session";
+        return primarySession;
+    }
+
+    if (sourceOut) *sourceOut = @"none";
+    return nil;
+}
+
 static void WCRBindCanonicalHomeRow(UITableViewCell *cell,
                                     NewMainFrameViewController *host,
                                     UITableView *tableView,
                                     NSIndexPath *indexPath) {
     if (!cell || !host || !tableView || !indexPath) return;
 
-    // Use WCRefine's own canonical visible-row resolver. This is the same
-    // method the original Tweak.xm calls when WCRefine asks for swipe actions.
-    id resolvedSession = nil;
-    if ([host respondsToSelector:
-            @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
-        resolvedSession =
-            [host wcrGrouping_logicGetSessionAtIndexPath:indexPath];
-    }
-
-    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    // Resolve from WCRefine's current projection. v1.9.3 keeps the v1.9.2
+    // friend/chatroom boundary, but adds WCRefine's exact cell-data resolver as
+    // a race-safe fallback while the home snapshot is mutating.
     NSString *username = nil;
     NSUInteger scope = 0;
-    BOOL eligibleConversation = NO;
-
-    if (provider && resolvedSession) {
-        username = [provider usernameForNativeObject:resolvedSession];
-        scope = [provider groupScopeForNativeSession:resolvedSession];
-
-        // Exact original ActiveFront business boundary:
-        // 1 = friend, 2 = chat room.
-        eligibleConversation =
-            username.length > 0 &&
-            (scope == 1 || scope == 2);
-    }
+    NSString *resolverSource = nil;
+    id resolvedSession =
+        WCRResolveCurrentHomeSession(host,
+                                     indexPath,
+                                     &username,
+                                     &scope,
+                                     &resolverSource);
+    BOOL eligibleConversation = resolvedSession != nil;
 
     NSString *oldCanonicalUsername =
         objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey);
@@ -1122,14 +1251,15 @@ static void WCRBindCanonicalHomeRow(UITableViewCell *cell,
                              @(eligibleConversation ? scope : 0),
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    WCRAF_LOG(@"canonical row %@ index=%ld/%ld session=%@ user=%@ scope=%lu eligible=%d",
+    WCRAF_LOG(@"canonical row %@ index=%ld/%ld session=%@ user=%@ scope=%lu eligible=%d source=%@",
               WCRClassName(cell),
               (long)indexPath.section,
               (long)indexPath.row,
               WCRClassName(resolvedSession),
               username ?: @"<nil>",
               (unsigned long)scope,
-              eligibleConversation);
+              eligibleConversation,
+              resolverSource ?: @"<nil>");
 }
 
 static id WCRSessionForCell(UITableViewCell *cell,
@@ -1147,32 +1277,21 @@ static id WCRSessionForCell(UITableViewCell *cell,
     if (!host) return nil;
 
     // IMPORTANT:
-    // A home refresh / keep / return can reorder rows without producing a new
-    // willDisplay callback for every still-visible cell.  The diagnostic data
-    // proved that a cell could therefore keep canonicalUser=A while WCRefine's
-    // current resolver for the same visible indexPath already returned user=B.
-    //
-    // Resolve the CURRENT row again at gesture/action time.  This is
-    // WCRefine's own projection-aware resolver, not WeChat's native index map.
-    id session = nil;
-    if ([host respondsToSelector:
-            @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
-        session =
-            [host wcrGrouping_logicGetSessionAtIndexPath:indexPath];
-    }
-
-    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    // A home refresh / incoming unread projection can reorder rows without a
+    // reliable willDisplay callback for every visible/reused cell. Resolve the
+    // CURRENT row again at gesture/action time. The primary source remains
+    // WCRefine's session resolver; v1.9.3 adds WCRefine's own cell-data path as
+    // a fallback for snapshot-transition races.
     NSString *username = nil;
     NSUInteger scope = 0;
-    BOOL eligibleConversation = NO;
-
-    if (provider && session) {
-        username = [provider usernameForNativeObject:session];
-        scope = [provider groupScopeForNativeSession:session];
-        eligibleConversation =
-            username.length > 0 &&
-            (scope == 1 || scope == 2);
-    }
+    NSString *resolverSource = nil;
+    id session =
+        WCRResolveCurrentHomeSession(host,
+                                     indexPath,
+                                     &username,
+                                     &scope,
+                                     &resolverSource);
+    BOOL eligibleConversation = session != nil;
 
     if (!eligibleConversation) {
         // This visible row is a WCRefine group/category/service/official/other
@@ -1196,6 +1315,11 @@ static id WCRSessionForCell(UITableViewCell *cell,
         objc_setAssociatedObject(cell, kWCRCanonicalScopeKey, @0,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+        WCRAF_LOG(@"action resolve failed index=%ld/%ld cell=%@ source=%@",
+                  (long)indexPath.section,
+                  (long)indexPath.row,
+                  WCRClassName(cell),
+                  resolverSource ?: @"none");
         return nil;
     }
 
@@ -2323,9 +2447,13 @@ static void WCRAttachToCell(UITableViewCell *cell) {
 
 static UITableViewCell *(*orig_otherGroupCellForRow)(id, SEL, UITableView *, NSIndexPath *) = NULL;
 static void (*orig_otherGroupViewDidLayoutSubviews)(id, SEL) = NULL;
+static void (*orig_otherMainItemViewLayoutSubviews)(id, SEL) = NULL;
+static void (*orig_otherFakeItemViewLayoutSubviews)(id, SEL) = NULL;
 
 static BOOL gWCRHookOtherGroupCellForRow = NO;
 static BOOL gWCRHookOtherGroupLayout = NO;
+static BOOL gWCRHookOtherMainItemLayout = NO;
+static BOOL gWCRHookOtherFakeItemLayout = NO;
 
 static UITableViewCell *hook_otherGroupCellForRow(id self,
                                                    SEL _cmd,
@@ -2353,6 +2481,31 @@ static void hook_otherGroupViewDidLayoutSubviews(id self, SEL _cmd) {
     WCRAdjustVisibleOtherGroupingNicknameCells(self);
 }
 
+static void WCRAdjustOtherNicknameFromItemView(id itemView) {
+    if (![itemView isKindOfClass:[UIView class]]) return;
+
+    UITableViewCell *cell = WCRCellForDescendantView((UIView *)itemView);
+    if (!cell || !WCRCellBelongsToOtherGrouping(cell)) return;
+
+    // This runs after MainFrameItemView/FakeMainFrameItemView's own native
+    // layout pass, so WCRefine/WeChat cannot immediately overwrite our frames.
+    WCRAdjustOtherGroupingNicknameCell(cell);
+}
+
+static void hook_otherMainItemViewLayoutSubviews(id self, SEL _cmd) {
+    if (orig_otherMainItemViewLayoutSubviews) {
+        orig_otherMainItemViewLayoutSubviews(self, _cmd);
+    }
+    WCRAdjustOtherNicknameFromItemView(self);
+}
+
+static void hook_otherFakeItemViewLayoutSubviews(id self, SEL _cmd) {
+    if (orig_otherFakeItemViewLayoutSubviews) {
+        orig_otherFakeItemViewLayoutSubviews(self, _cmd);
+    }
+    WCRAdjustOtherNicknameFromItemView(self);
+}
+
 #pragma mark - ActiveFront projection runtime hooks
 
 static BOOL (*orig_configExcludeUnread)(id, SEL) = NULL;
@@ -2362,6 +2515,7 @@ static void (*orig_noteRead)(id, SEL, NSString *) = NULL;
 static void (*orig_activeViewDidAppear)(id, SEL, BOOL) = NULL;
 static void (*orig_groupingWillDisplay)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *) = NULL;
 static void (*orig_cellPrepareForReuse)(id, SEL) = NULL;
+static void (*orig_cellDidMoveToWindow)(id, SEL) = NULL;
 
 static BOOL gWCRHookConfig = NO;
 static BOOL gWCRHookProvider = NO;
@@ -2370,6 +2524,7 @@ static BOOL gWCRHookRead = NO;
 static BOOL gWCRHookHome = NO;
 static BOOL gWCRHookWillDisplay = NO;
 static BOOL gWCRHookCellReuse = NO;
+static BOOL gWCRHookCellDidMoveToWindow = NO;
 static BOOL gWCRBootstrapCloseScheduled = NO;
 
 static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
@@ -2453,6 +2608,10 @@ static void hook_noteIncoming(id self,
 
     if (grouped) {
         WCRRefreshHomeGlobal(@"active_front_incoming");
+    } else if (valid) {
+        // Even an ungrouped incoming row can be newly inserted/reused. It does
+        // not need a projection refresh, but it still needs the ActiveFront pan.
+        WCRScheduleVisibleHomeReconcile();
     }
 }
 
@@ -2532,6 +2691,33 @@ static void hook_cellPrepareForReuse(id self, SEL _cmd) {
     WCRClearCanonicalRowBinding(cell);
 }
 
+static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
+    if (orig_cellDidMoveToWindow) {
+        orig_cellDidMoveToWindow(self, _cmd);
+    }
+
+    if (![self isKindOfClass:[UITableViewCell class]]) return;
+
+    UITableViewCell *cell = (UITableViewCell *)self;
+    if (!cell.window) return;
+
+    // This is an independent row-lifecycle safety net. WCRefine can rebuild
+    // or reinsert a home row without the custom willDisplay hook being ready
+    // at that exact moment. Once the cell reaches a window, attach on the next
+    // run-loop turn, then once more after the snapshot/indexPath settles.
+    __weak UITableViewCell *weakCell = cell;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITableViewCell *strongCell = weakCell;
+        if (strongCell.window) WCRAttachToCell(strongCell);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(0.15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UITableViewCell *strongCell = weakCell;
+        if (strongCell.window) WCRAttachToCell(strongCell);
+    });
+}
+
 static BOOL WCRInstallInstanceHook(Class cls,
                                    SEL sel,
                                    IMP replacement,
@@ -2595,15 +2781,44 @@ static void WCRTryInstallOtherNicknameHooks(NSUInteger attemptsRemaining) {
                 (IMP *)&orig_otherGroupViewDidLayoutSubviews);
     }
 
-    if (gWCRHookOtherGroupCellForRow && gWCRHookOtherGroupLayout) {
-        WCRAF_LOG(@"other nickname layout hooks installed cell=1 layout=1");
+    Class mainItemView = NSClassFromString(@"MainFrameItemView");
+    if (!gWCRHookOtherMainItemLayout && mainItemView) {
+        gWCRHookOtherMainItemLayout =
+            WCRInstallInstanceHook(
+                mainItemView,
+                @selector(layoutSubviews),
+                (IMP)hook_otherMainItemViewLayoutSubviews,
+                (IMP *)&orig_otherMainItemViewLayoutSubviews);
+    }
+
+    Class fakeItemView = NSClassFromString(@"FakeMainFrameItemView");
+    if (!gWCRHookOtherFakeItemLayout && fakeItemView) {
+        gWCRHookOtherFakeItemLayout =
+            WCRInstallInstanceHook(
+                fakeItemView,
+                @selector(layoutSubviews),
+                (IMP)hook_otherFakeItemViewLayoutSubviews,
+                (IMP *)&orig_otherFakeItemViewLayoutSubviews);
+    }
+
+    BOOL hasFinalItemLayoutHook =
+        gWCRHookOtherMainItemLayout || gWCRHookOtherFakeItemLayout;
+
+    if (gWCRHookOtherGroupCellForRow &&
+        gWCRHookOtherGroupLayout &&
+        hasFinalItemLayoutHook) {
+        WCRAF_LOG(@"other nickname layout hooks installed cell=1 controllerLayout=1 item=%d fake=%d",
+                  gWCRHookOtherMainItemLayout,
+                  gWCRHookOtherFakeItemLayout);
         return;
     }
 
     if (attemptsRemaining == 0) {
-        WCRAF_LOG(@"other nickname layout hooks incomplete cell=%d layout=%d",
+        WCRAF_LOG(@"other nickname layout hooks incomplete cell=%d controllerLayout=%d item=%d fake=%d",
                   gWCRHookOtherGroupCellForRow,
-                  gWCRHookOtherGroupLayout);
+                  gWCRHookOtherGroupLayout,
+                  gWCRHookOtherMainItemLayout,
+                  gWCRHookOtherFakeItemLayout);
         return;
     }
 
@@ -2711,31 +2926,50 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                 (IMP *)&orig_cellPrepareForReuse);
     }
 
+    if (!gWCRHookCellDidMoveToWindow && mainFrameCell) {
+        gWCRHookCellDidMoveToWindow =
+            WCRInstallInstanceHook(
+                mainFrameCell,
+                @selector(didMoveToWindow),
+                (IMP)hook_cellDidMoveToWindow,
+                (IMP *)&orig_cellDidMoveToWindow);
+    }
+
     if (gWCRHookProvider) {
         WCRScheduleBootstrapUnreadFallbackClose();
     }
 
+    // v1.9.2 accidentally stopped retrying once the five projection hooks
+    // were installed, even if willDisplay/prepareForReuse were still missing.
+    // That left newly inserted/reused rows without our pan after the finite
+    // startup scan ended. Treat row lifecycle hooks as mandatory too.
     BOOL allInstalled =
         gWCRHookConfig &&
         gWCRHookProvider &&
         gWCRHookIncoming &&
         gWCRHookRead &&
-        gWCRHookHome;
+        gWCRHookHome &&
+        gWCRHookWillDisplay &&
+        gWCRHookCellReuse &&
+        gWCRHookCellDidMoveToWindow;
 
     if (allInstalled) {
-        WCRAF_LOG(@"business hooks installed config=1 provider=1 incoming=1 read=1 home=1");
+        WCRAF_LOG(@"business hooks installed config=1 provider=1 incoming=1 read=1 home=1 willDisplay=1 reuse=1 didMove=1");
         WCRPruneStaleActiveFrontState();
         WCRRefreshHomeGlobal(@"active_front_hooks_installed");
         return;
     }
 
     if (attemptsRemaining == 0) {
-        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d incoming=%d read=%d home=%d",
+        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d incoming=%d read=%d home=%d willDisplay=%d reuse=%d didMove=%d",
                   gWCRHookConfig,
                   gWCRHookProvider,
                   gWCRHookIncoming,
                   gWCRHookRead,
-                  gWCRHookHome);
+                  gWCRHookHome,
+                  gWCRHookWillDisplay,
+                  gWCRHookCellReuse,
+                  gWCRHookCellDidMoveToWindow);
         return;
     }
 
@@ -2756,7 +2990,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_9_2 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_9_3 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -2778,8 +3012,8 @@ static void WCRScan(BOOL showReady) {
             NSString *message = [NSString stringWithFormat:
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
-                 "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.9.2：右滑 = 分组 / 保持 / 回组\n"
+                 "Hooks: C%d P%d I%d R%d H%d W%d U%d M%d\n\n"
+                 "v1.9.3：右滑 = 分组 / 保持 / 回组\n"
                  "行身份直接绑定 WCRefine 自己的 session resolver。\n"
                  "WCRefine 组内列表不挂独立右滑手势。\n"
                  "左滑继续使用微信原生菜单。\n"
@@ -2790,9 +3024,12 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookProvider,
                  gWCRHookIncoming,
                  gWCRHookRead,
-                 gWCRHookHome];
+                 gWCRHookHome,
+                 gWCRHookWillDisplay,
+                 gWCRHookCellReuse,
+                 gWCRHookCellDidMoveToWindow];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_9_2 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_9_3 Ready", message);
         }
     });
 }
@@ -2811,7 +3048,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.9.2");
+        WCRAF_LOG(@"dylib loaded; starting v1.9.3");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
