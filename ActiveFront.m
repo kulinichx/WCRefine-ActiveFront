@@ -1,5 +1,6 @@
-// ActiveFront.RIGHT_v1_9_2_LIVE_SESSION_STATE_FIX.m
-// WCRefine ActiveFront - v1.9.2: live row session + grouped-visible action semantics.
+// ActiveFront.RIGHT_v1_9_2_OTHER_NICKNAME_LAYOUT_FIX.m
+// WCRefine ActiveFront - v1.9.2 stable baseline + "其它" nickname overlap layout fix.
+// ActiveFront right-swipe gesture/state machine below is intentionally unchanged.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -103,6 +104,13 @@ static void WCRAFLog(NSString *format, ...) {
 - (void)viewDidAppear:(BOOL)animated;
 @end
 
+// WCRefine's own group-detail list controller.  Only the special groupId
+// "sys_other" is touched by the nickname overlap guard below.
+@interface WCRGroupingSessionListViewController : UIViewController
+@property(nonatomic, copy) NSString *groupId;
+@property(nonatomic, strong) UITableView *tableView;
+@end
+
 typedef NS_ENUM(NSInteger, WCRRightActionKind) {
     WCRRightActionNone = 0,
     WCRRightActionGroup,
@@ -173,6 +181,239 @@ static BOOL WCRIsGroupingSessionListController(id controller) {
 
     return [WCRClassName(controller)
         isEqualToString:@"WCRGroupingSessionListViewController"];
+}
+
+
+#pragma mark - "其它" group nickname overlap guard (layout only)
+
+static NSString * const kWCROtherGroupingId = @"sys_other";
+static const void *kWCROtherNickCollapsedKey = &kWCROtherNickCollapsedKey;
+
+static id WCRSafeValueForKey(id object, NSString *key) {
+    if (!object || key.length == 0) return nil;
+
+    @try {
+        return [object valueForKey:key];
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+static UIView *WCRFindSubviewByClassNames(UIView *root,
+                                          NSSet<NSString *> *names) {
+    if (!root || names.count == 0) return nil;
+
+    for (UIView *subview in root.subviews) {
+        if ([names containsObject:NSStringFromClass([subview class])]) {
+            return subview;
+        }
+
+        UIView *nested = WCRFindSubviewByClassNames(subview, names);
+        if (nested) return nested;
+    }
+
+    return nil;
+}
+
+static UIView *WCROtherItemViewForCell(UITableViewCell *cell) {
+    if (!cell) return nil;
+
+    id direct = WCRSafeValueForKey(cell, @"m_itemView");
+    if ([direct isKindOfClass:[UIView class]]) {
+        return (UIView *)direct;
+    }
+
+    // Mirror the fallback used by WCRefine itself when m_itemView is not
+    // directly readable. This stays local to the group-detail cell.
+    NSSet<NSString *> *classNames =
+        [NSSet setWithObjects:@"MainFrameItemView", @"FakeMainFrameItemView", nil];
+
+    UIView *root = cell.contentView ?: (UIView *)cell;
+    return WCRFindSubviewByClassNames(root, classNames);
+}
+
+static UILabel *WCROtherLabelForKey(UIView *itemView, NSString *key) {
+    id value = WCRSafeValueForKey(itemView, key);
+    if ([value isKindOfClass:[UILabel class]]) {
+        return (UILabel *)value;
+    }
+    return nil;
+}
+
+static BOOL WCRLabelHasText(UILabel *label) {
+    return label.text.length > 0 || label.attributedText.length > 0;
+}
+
+static CGFloat WCRSingleLineNaturalLabelWidth(UILabel *label) {
+    if (!label) return 0.0;
+
+    CGFloat width = 0.0;
+    NSAttributedString *attributed = label.attributedText;
+
+    if (attributed.length > 0) {
+        CGRect rect =
+            [attributed boundingRectWithSize:CGSizeMake(CGFLOAT_MAX,
+                                                         MAX(ceil(label.bounds.size.height), 64.0))
+                                  options:(NSStringDrawingUsesLineFragmentOrigin |
+                                           NSStringDrawingUsesFontLeading)
+                                  context:nil];
+        width = ceil(rect.size.width);
+    } else if (label.text.length > 0) {
+        UIFont *font = label.font ?: [UIFont systemFontOfSize:17.0];
+        width = ceil([label.text sizeWithAttributes:@{NSFontAttributeName: font}].width);
+    }
+
+    if (!isfinite(width) || width < 0.0) return 0.0;
+    return width + 1.0; // avoid a one-pixel glyph clip at fractional scales
+}
+
+static BOOL WCRIsOtherGroupingController(id controller) {
+    if (!WCRIsGroupingSessionListController(controller)) return NO;
+
+    NSString *groupId = nil;
+    if ([controller respondsToSelector:@selector(groupId)]) {
+        groupId = [(WCRGroupingSessionListViewController *)controller groupId];
+    }
+    if (![groupId isKindOfClass:[NSString class]]) {
+        groupId = WCRSafeValueForKey(controller, @"groupId");
+    }
+
+    return [groupId isKindOfClass:[NSString class]] &&
+           [groupId isEqualToString:kWCROtherGroupingId];
+}
+
+static void WCRAdjustOtherGroupingNicknameCell(UITableViewCell *cell) {
+    if (!cell) return;
+
+    UIView *itemView = WCROtherItemViewForCell(cell);
+    if (!itemView) return;
+
+    UILabel *nameLabel = WCROtherLabelForKey(itemView, @"m_nameLabel");
+    UILabel *nickLabel = WCROtherLabelForKey(itemView, @"m_nickNameLabel");
+    UILabel *timeLabel = WCROtherLabelForKey(itemView, @"m_timeLabel");
+
+    // Respect WCRefine's own display-mode / visibility decisions. This guard
+    // only resolves a horizontal collision; it never turns a nickname on.
+    if (!nameLabel || !nickLabel ||
+        nameLabel.hidden || nickLabel.hidden ||
+        nameLabel.alpha <= 0.01 || nickLabel.alpha <= 0.01 ||
+        !WCRLabelHasText(nameLabel) || !WCRLabelHasText(nickLabel)) {
+        return;
+    }
+
+    CGRect nameFrame = nameLabel.frame;
+    CGRect nickFrame = nickLabel.frame;
+
+    if (CGRectIsNull(nameFrame) || CGRectIsInfinite(nameFrame) ||
+        CGRectIsNull(nickFrame) || CGRectIsInfinite(nickFrame) ||
+        nameFrame.size.height <= 0.0 || nickFrame.size.height <= 0.0) {
+        return;
+    }
+
+    // Only touch the same-line nickname mode that can overlap the primary
+    // title. Vertical / below-title nickname modes are left exactly native.
+    CGFloat rowDelta = fabs(CGRectGetMidY(nameFrame) - CGRectGetMidY(nickFrame));
+    CGFloat sameLineTolerance = MAX(8.0,
+                                    MIN(nameFrame.size.height, nickFrame.size.height) * 0.55);
+    if (rowDelta > sameLineTolerance) return;
+
+    CGFloat nameNaturalWidth = WCRSingleLineNaturalLabelWidth(nameLabel);
+    CGFloat nickNaturalWidth = WCRSingleLineNaturalLabelWidth(nickLabel);
+    if (nameNaturalWidth <= 0.0 || nickNaturalWidth <= 0.0) return;
+
+    CGFloat startX = CGRectGetMinX(nameFrame);
+    CGFloat rightBoundary = CGRectGetWidth(itemView.bounds) - 12.0;
+
+    if (timeLabel && !timeLabel.hidden && timeLabel.alpha > 0.01) {
+        CGRect timeFrame = timeLabel.frame;
+        if (!CGRectIsNull(timeFrame) && !CGRectIsInfinite(timeFrame) &&
+            timeFrame.size.width > 1.0 &&
+            CGRectGetMinX(timeFrame) > startX + 24.0) {
+            // The date/time label has higher priority: never move or resize it.
+            rightBoundary = MIN(rightBoundary, CGRectGetMinX(timeFrame) - 6.0);
+        }
+    }
+
+    CGFloat availableWidth = floor(rightBoundary - startX);
+    if (!isfinite(availableWidth) || availableWidth <= 24.0) return;
+
+    BOOL wasCollapsed =
+        [objc_getAssociatedObject(nickLabel, kWCROtherNickCollapsedKey) boolValue];
+
+    // Preserve spacing from a normal native row whenever the frame still
+    // contains a sane gap. If this row is already colliding/collapsed, use a
+    // conservative four-point gap rather than deriving a negative/huge gap.
+    CGFloat currentGap = CGRectGetMinX(nickFrame) - (startX + nameNaturalWidth);
+    CGFloat spacing = (currentGap >= 2.0 && currentGap <= 16.0) ? currentGap : 4.0;
+
+    // Pixel-for-pixel no-op for ordinary short rows. `wasCollapsed` bypasses
+    // this return once after reuse so a cell previously collapsed for a very
+    // long username can self-heal for a shorter row.
+    if (!wasCollapsed &&
+        startX + nameNaturalWidth + spacing <= CGRectGetMinX(nickFrame)) {
+        return;
+    }
+
+    nameLabel.numberOfLines = 1;
+    nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    nickLabel.numberOfLines = 1;
+    nickLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+
+    CGFloat nickFontSize = nickLabel.font ? nickLabel.font.pointSize : 14.0;
+    CGFloat minimumUsefulNickWidth =
+        MAX(34.0, MIN(nickNaturalWidth, nickFontSize * 2.5));
+
+    if (nameNaturalWidth + spacing + nickNaturalWidth <= availableWidth) {
+        // Both fit: keep the primary title intact and place nickname after it.
+        nameFrame.size.width = nameNaturalWidth;
+        nickFrame.origin.x = startX + nameNaturalWidth + spacing;
+        nickFrame.size.width = nickNaturalWidth;
+        objc_setAssociatedObject(nickLabel,
+                                 kWCROtherNickCollapsedKey,
+                                 nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else if (nameNaturalWidth + spacing + minimumUsefulNickWidth <= availableWidth) {
+        // Mild shortage: primary title wins; orange nickname gets only the
+        // remainder and truncates at its tail.
+        nameFrame.size.width = nameNaturalWidth;
+        nickFrame.origin.x = startX + nameNaturalWidth + spacing;
+        nickFrame.size.width = MAX(0.0, rightBoundary - nickFrame.origin.x);
+        objc_setAssociatedObject(nickLabel,
+                                 kWCROtherNickCollapsedKey,
+                                 nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else {
+        // Very long primary title: give it the whole safe title area and
+        // collapse only the auxiliary nickname. Zero width is used instead of
+        // changing `hidden`, avoiding a sticky hidden flag across cell reuse.
+        nameFrame.size.width = availableWidth;
+        nickFrame.origin.x = rightBoundary;
+        nickFrame.size.width = 0.0;
+        objc_setAssociatedObject(nickLabel,
+                                 kWCROtherNickCollapsedKey,
+                                 @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    nameLabel.frame = CGRectIntegral(nameFrame);
+    nickLabel.frame = CGRectIntegral(nickFrame);
+}
+
+static void WCRAdjustVisibleOtherGroupingNicknameCells(id controller) {
+    if (!WCRIsOtherGroupingController(controller)) return;
+
+    UITableView *tableView = nil;
+    if ([controller respondsToSelector:@selector(tableView)]) {
+        tableView = [(WCRGroupingSessionListViewController *)controller tableView];
+    }
+    if (![tableView isKindOfClass:[UITableView class]]) {
+        tableView = WCRSafeValueForKey(controller, @"tableView");
+    }
+    if (![tableView isKindOfClass:[UITableView class]]) return;
+
+    for (UITableViewCell *cell in tableView.visibleCells) {
+        WCRAdjustOtherGroupingNicknameCell(cell);
+    }
 }
 
 static BOOL WCRIsActiveFrontHomeTable(UITableView *tableView) {
@@ -2078,6 +2319,40 @@ static void WCRAttachToCell(UITableViewCell *cell) {
 }
 
 
+#pragma mark - "其它" group nickname layout hooks
+
+static UITableViewCell *(*orig_otherGroupCellForRow)(id, SEL, UITableView *, NSIndexPath *) = NULL;
+static void (*orig_otherGroupViewDidLayoutSubviews)(id, SEL) = NULL;
+
+static BOOL gWCRHookOtherGroupCellForRow = NO;
+static BOOL gWCRHookOtherGroupLayout = NO;
+
+static UITableViewCell *hook_otherGroupCellForRow(id self,
+                                                   SEL _cmd,
+                                                   UITableView *tableView,
+                                                   NSIndexPath *indexPath) {
+    UITableViewCell *cell =
+        orig_otherGroupCellForRow ?
+            orig_otherGroupCellForRow(self, _cmd, tableView, indexPath) :
+            nil;
+
+    if (cell && WCRIsOtherGroupingController(self)) {
+        WCRAdjustOtherGroupingNicknameCell(cell);
+    }
+
+    return cell;
+}
+
+static void hook_otherGroupViewDidLayoutSubviews(id self, SEL _cmd) {
+    if (orig_otherGroupViewDidLayoutSubviews) {
+        orig_otherGroupViewDidLayoutSubviews(self, _cmd);
+    }
+
+    // Native layout may rewrite label frames after cellForRow. Reconcile the
+    // visible sys_other rows only after that pass completes.
+    WCRAdjustVisibleOtherGroupingNicknameCells(self);
+}
+
 #pragma mark - ActiveFront projection runtime hooks
 
 static BOOL (*orig_configExcludeUnread)(id, SEL) = NULL;
@@ -2298,6 +2573,48 @@ static BOOL WCRInstallInstanceHook(Class cls,
     return YES;
 }
 
+static void WCRTryInstallOtherNicknameHooks(NSUInteger attemptsRemaining) {
+    Class groupList =
+        NSClassFromString(@"WCRGroupingSessionListViewController");
+
+    if (!gWCRHookOtherGroupCellForRow && groupList) {
+        gWCRHookOtherGroupCellForRow =
+            WCRInstallInstanceHook(
+                groupList,
+                @selector(tableView:cellForRowAtIndexPath:),
+                (IMP)hook_otherGroupCellForRow,
+                (IMP *)&orig_otherGroupCellForRow);
+    }
+
+    if (!gWCRHookOtherGroupLayout && groupList) {
+        gWCRHookOtherGroupLayout =
+            WCRInstallInstanceHook(
+                groupList,
+                @selector(viewDidLayoutSubviews),
+                (IMP)hook_otherGroupViewDidLayoutSubviews,
+                (IMP *)&orig_otherGroupViewDidLayoutSubviews);
+    }
+
+    if (gWCRHookOtherGroupCellForRow && gWCRHookOtherGroupLayout) {
+        WCRAF_LOG(@"other nickname layout hooks installed cell=1 layout=1");
+        return;
+    }
+
+    if (attemptsRemaining == 0) {
+        WCRAF_LOG(@"other nickname layout hooks incomplete cell=%d layout=%d",
+                  gWCRHookOtherGroupCellForRow,
+                  gWCRHookOtherGroupLayout);
+        return;
+    }
+
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW,
+                      (int64_t)(0.25 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+            WCRTryInstallOtherNicknameHooks(attemptsRemaining - 1);
+        });
+}
+
 static void WCRScheduleBootstrapUnreadFallbackClose(void) {
     if (gWCRBootstrapCloseScheduled) return;
     gWCRBootstrapCloseScheduled = YES;
@@ -2509,6 +2826,13 @@ static void WCRRightGroupUIInit(void) {
                           (int64_t)(4.0 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{
                 WCRTryInstallBusinessHooks(80);
+            });
+
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW,
+                          (int64_t)(4.2 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+                WCRTryInstallOtherNicknameHooks(80);
             });
 
         dispatch_after(
