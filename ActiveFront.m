@@ -1,12 +1,9 @@
-// ActiveFront.RIGHT_v1_9_7_OPENIM_FINAL_PASS_FIX.m
-// WCRefine ActiveFront - v1.9.7 candidate built on the v1.9.2 state machine.
-// Identity path is unchanged from v1.9.5: rendered m_cellData stays authoritative,
-// while WCRefine_groupEntry_* synthetic rows are rejected and fail closed.
-// WeCom layout fix: only sys_other rows whose rendered username contains @openim
-// can have their same-line MMCPLabel title/company frames adjusted. v1.9.7 adds
-// controller-final-pass and didMoveToWindow reconciliation so native nested layout
-// cannot silently win after NewMainFrameCell's own layoutSubviews hook. Long-press
-// diagnostics now report layout-attempt/applied counters for verification.
+// ActiveFront.RIGHT_v1_9_5_REJECT_GROUP_ENTRIES_AND_WECOM_DIAGNOSTIC.m
+// WCRefine ActiveFront - v1.9.5 diagnostic candidate built on the v1.9.2 state machine.
+// Identity fix: rendered m_cellData stays authoritative, but WCRefine synthetic
+// WCRefine_groupEntry_* rows are rejected and never fall through to indexPath.
+// WeCom step: no nickname layout is changed yet; sys_other rows only gain a
+// single-finger long-press diagnostic for OpenIM/enterprise identity + UILabel frames.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -42,17 +39,11 @@ static const void *kWCRCanonicalKnownKey = &kWCRCanonicalKnownKey;
 static const void *kWCRCanonicalSessionKey = &kWCRCanonicalSessionKey;
 static const void *kWCRCanonicalUsernameKey = &kWCRCanonicalUsernameKey;
 static const void *kWCRCanonicalScopeKey = &kWCRCanonicalScopeKey;
-static const void *kWCRDebugLongPressKey = &kWCRDebugLongPressKey;
 static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
-static const void *kWCRWeComDebugGestureKey = &kWCRWeComDebugGestureKey;
-static const void *kWCRWeComLayoutScheduledKey = &kWCRWeComLayoutScheduledKey;
-static const void *kWCRWeComLayoutAttemptCountKey = &kWCRWeComLayoutAttemptCountKey;
-static const void *kWCRWeComLayoutAppliedCountKey = &kWCRWeComLayoutAppliedCountKey;
-static const void *kWCRWeComLayoutLastFrameKey = &kWCRWeComLayoutLastFrameKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.9.7";
+static NSString * const kWCRAFVersion = @"1.9.5";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -1712,801 +1703,10 @@ static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) 
     return value.boolValue;
 }
 
-#pragma mark - sys_other WeCom diagnostic + OpenIM-only layout
-
-static NSString * const kWCROtherGroupingId = @"sys_other";
-
-static NSString *WCRGroupingControllerId(id controller) {
-    if (!WCRIsGroupingSessionListController(controller)) return nil;
-
-    if ([controller respondsToSelector:@selector(groupId)]) {
-        id value = [(WCRGroupingSessionListViewController *)controller groupId];
-        if ([value isKindOfClass:[NSString class]]) return value;
-    }
-
-    id value = WCRObjectIvarNamed(controller, "_groupId");
-    if (![value isKindOfClass:[NSString class]]) {
-        value = WCRObjectIvarNamed(controller, "groupId");
-    }
-    return [value isKindOfClass:[NSString class]] ? value : nil;
-}
-
-static BOOL WCRCellBelongsToOtherGrouping(UITableViewCell *cell) {
-    if (!cell) return NO;
-
-    UITableView *tableView = WCRTableForCell(cell);
-    if (!tableView) return NO;
-
-    id owner = WCRViewControllerForView(tableView);
-    if (!WCRIsGroupingSessionListController(owner)) {
-        owner = tableView.delegate;
-    }
-    if (!WCRIsGroupingSessionListController(owner)) return NO;
-
-    return [[[WCRGroupingControllerId(owner) lowercaseString] copy]
-        isEqualToString:kWCROtherGroupingId];
-}
-
-static void WCRCollectLabelsInViewTree(UIView *root,
-                                       NSMutableArray<UILabel *> *labels) {
-    if (!root || !labels) return;
-
-    if ([root isKindOfClass:[UILabel class]]) {
-        [labels addObject:(UILabel *)root];
-    }
-
-    for (UIView *subview in root.subviews) {
-        WCRCollectLabelsInViewTree(subview, labels);
-    }
-}
-
-static BOOL WCRViewTreeContainsClassNamed(UIView *root,
-                                          NSString *className) {
-    if (!root || className.length == 0) return NO;
-    if ([WCRClassName(root) isEqualToString:className]) return YES;
-
-    for (UIView *subview in root.subviews) {
-        if (WCRViewTreeContainsClassNamed(subview, className)) return YES;
-    }
-    return NO;
-}
-
-static BOOL WCRIsWeComOpenIMUsername(NSString *username) {
-    if (![username isKindOfClass:[NSString class]] || username.length == 0) {
-        return NO;
-    }
-    return [username.lowercaseString containsString:@"@openim"];
-}
-
-static NSString *WCRDebugLabelText(UILabel *label) {
-    if (!label) return @"<nil>";
-    NSString *text = label.attributedText.length > 0 ?
-        label.attributedText.string : label.text;
-    if (![text isKindOfClass:[NSString class]] || text.length == 0) {
-        return @"<empty>";
-    }
-    return [[text stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"]
-        stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"];
-}
-
-static NSString *WCRDebugColorString(UIColor *color) {
-    if (!color) return @"<nil>";
-
-    CGFloat r = 0.0, g = 0.0, b = 0.0, a = 0.0;
-    if ([color getRed:&r green:&g blue:&b alpha:&a]) {
-        return [NSString stringWithFormat:@"rgba(%.2f,%.2f,%.2f,%.2f)",
-                r, g, b, a];
-    }
-
-    CGFloat w = 0.0;
-    if ([color getWhite:&w alpha:&a]) {
-        return [NSString stringWithFormat:@"wa(%.2f,%.2f)", w, a];
-    }
-
-    return [color description] ?: @"<color>";
-}
-
-static NSString *WCRDescribeLabelsForDebug(UITableViewCell *cell) {
-    if (!cell) return @"LABELS: <no cell>";
-
-    NSMutableArray<UILabel *> *labels = [NSMutableArray array];
-    WCRCollectLabelsInViewTree(cell, labels);
-
-    NSMutableString *out =
-        [NSMutableString stringWithFormat:@"LABELS count=%lu\n",
-         (unsigned long)labels.count];
-
-    NSUInteger index = 0;
-    for (UILabel *label in labels) {
-        CGRect rect = [label convertRect:label.bounds toView:cell];
-        [out appendFormat:
-            @"[%lu] %@ text=%@ frame=(%.1f,%.1f,%.1f,%.1f) hidden=%d alpha=%.2f color=%@\n",
-            (unsigned long)index,
-            WCRClassName(label),
-            WCRDebugLabelText(label),
-            rect.origin.x, rect.origin.y,
-            rect.size.width, rect.size.height,
-            label.hidden,
-            label.alpha,
-            WCRDebugColorString(label.textColor)];
-        index++;
-    }
-
-    return out;
-}
-
-static void WCRShowWeComRowDebug(UITableViewCell *cell) {
-    if (!cell || !WCRCellBelongsToOtherGrouping(cell)) return;
-
-    UITableView *tableView = WCRTableForCell(cell);
-    NSIndexPath *indexPath = tableView ? [tableView indexPathForCell:cell] : nil;
-    id owner = tableView ? WCRViewControllerForView(tableView) : nil;
-    if (!WCRIsGroupingSessionListController(owner)) owner = tableView.delegate;
-
-    id cellData = WCRRenderedCellData(cell);
-    id session = nil;
-    NSString *username = nil;
-    NSUInteger scope = 0;
-    BOOL hasIdentity =
-        WCRIdentityFromCandidate(cellData, &session, &username, &scope);
-
-    BOOL openIM = WCRIsWeComOpenIMUsername(username);
-    BOOL enterpriseItem =
-        WCRViewTreeContainsClassNamed(cell, @"EnterpriseSessionItemView");
-    NSNumber *layoutAttempts =
-        objc_getAssociatedObject(cell, kWCRWeComLayoutAttemptCountKey);
-    NSNumber *layoutApplied =
-        objc_getAssociatedObject(cell, kWCRWeComLayoutAppliedCountKey);
-    NSString *layoutLastFrame =
-        objc_getAssociatedObject(cell, kWCRWeComLayoutLastFrameKey);
-
-    NSString *message =
-        [NSString stringWithFormat:
-            @"groupId=%@\n"
-             "index=%ld/%ld\n"
-             "cell=%@ table=%@ owner=%@\n\n"
-             "cellData=%@\n"
-             "identityOK=%d session=%@\n"
-             "username=%@\n"
-             "scope=%lu\n"
-             "contains@openim=%d\n"
-             "EnterpriseSessionItemView=%d\n"
-             "layoutAttempts=%lu layoutApplied=%lu\n"
-             "layoutLast=%@\n\n%@",
-             WCRGroupingControllerId(owner) ?: @"<nil>",
-             (long)(indexPath ? indexPath.section : -1),
-             (long)(indexPath ? indexPath.row : -1),
-             WCRClassName(cell),
-             WCRClassName(tableView),
-             WCRClassName(owner),
-             WCRClassName(cellData),
-             hasIdentity,
-             WCRClassName(session),
-             username ?: @"<nil>",
-             (unsigned long)scope,
-             openIM,
-             enterpriseItem,
-             (unsigned long)layoutAttempts.unsignedIntegerValue,
-             (unsigned long)layoutApplied.unsignedIntegerValue,
-             layoutLastFrame ?: @"<none>",
-             WCRDescribeLabelsForDebug(cell)];
-
-    UIViewController *presenter = WCRTopVC();
-    if (!presenter) return;
-
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"WeCom Row Debug"
-                                            message:message
-                                     preferredStyle:UIAlertControllerStyleAlert];
-
-    [alert addAction:
-        [UIAlertAction actionWithTitle:@"复制"
-                                 style:UIAlertActionStyleDefault
-                               handler:^(__unused UIAlertAction *action) {
-            [UIPasteboard generalPasteboard].string = message;
-        }]];
-
-    [alert addAction:
-        [UIAlertAction actionWithTitle:@"关闭"
-                                 style:UIAlertActionStyleCancel
-                               handler:nil]];
-
-    [presenter presentViewController:alert animated:YES completion:nil];
-}
-
-@interface WCRWeComDebugController : NSObject
-+ (instancetype)shared;
-- (void)handleWeComDebugLongPress:(UILongPressGestureRecognizer *)gesture;
-@end
-
-@implementation WCRWeComDebugController
-
-+ (instancetype)shared {
-    static WCRWeComDebugController *controller = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        controller = [WCRWeComDebugController new];
-    });
-    return controller;
-}
-
-- (void)handleWeComDebugLongPress:(UILongPressGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateBegan) return;
-    if (![gesture.view isKindOfClass:[UITableViewCell class]]) return;
-    WCRShowWeComRowDebug((UITableViewCell *)gesture.view);
-}
-
-@end
-
-static void WCRRemoveWeComDebugGesture(UITableViewCell *cell) {
-    if (!cell) return;
-
-    UIGestureRecognizer *gesture =
-        objc_getAssociatedObject(cell, kWCRWeComDebugGestureKey);
-    if (gesture) {
-        [cell removeGestureRecognizer:gesture];
-        objc_setAssociatedObject(cell, kWCRWeComDebugGestureKey, nil,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-}
-
-static void WCRAttachWeComDebugGesture(UITableViewCell *cell) {
-    if (!cell) return;
-
-    if (!WCRCellBelongsToOtherGrouping(cell)) {
-        WCRRemoveWeComDebugGesture(cell);
-        return;
-    }
-
-    if (objc_getAssociatedObject(cell, kWCRWeComDebugGestureKey)) return;
-
-    UILongPressGestureRecognizer *debug =
-        [[UILongPressGestureRecognizer alloc]
-            initWithTarget:[WCRWeComDebugController shared]
-                    action:@selector(handleWeComDebugLongPress:)];
-    debug.minimumPressDuration = 0.65;
-    debug.numberOfTouchesRequired = 1;
-    debug.allowableMovement = 12.0;
-    // Once the long press is recognized, cancel the cell's pending tap so the
-    // diagnostic does not also enter the conversation on finger-up.
-    debug.cancelsTouchesInView = YES;
-
-    [cell addGestureRecognizer:debug];
-    objc_setAssociatedObject(cell, kWCRWeComDebugGestureKey, debug,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-
-// The on-device diagnostic established the actual overlapping pair for WeCom:
-// - rendered username: <digits>@openim, scope=4
-// - primary title: white MMCPLabel
-// - auxiliary enterprise name: orange MMCPLabel whose text begins with '@'
-// Both labels sit on the same title baseline.  We therefore identify the real
-// rendered pair from the view tree instead of relying on m_nickNameLabel.
-static NSString *WCRPlainLabelText(UILabel *label) {
-    if (!label) return nil;
-    NSString *text = label.attributedText.length > 0 ?
-        label.attributedText.string : label.text;
-    if (![text isKindOfClass:[NSString class]]) return nil;
-    return [text stringByTrimmingCharactersInSet:
-        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-}
-
-static CGFloat WCRMeasuredLabelWidth(UILabel *label) {
-    if (!label) return 0.0;
-
-    NSAttributedString *attributed = label.attributedText;
-    if (attributed.length > 0) {
-        CGRect rect =
-            [attributed boundingRectWithSize:
-                            CGSizeMake(CGFLOAT_MAX,
-                                       MAX(ceil(label.bounds.size.height), 64.0))
-                                    options:(NSStringDrawingUsesLineFragmentOrigin |
-                                             NSStringDrawingUsesFontLeading)
-                                    context:nil];
-        return ceil(rect.size.width);
-    }
-
-    NSString *text = WCRPlainLabelText(label);
-    if (text.length == 0) return 0.0;
-
-    UIFont *font = label.font ?: [UIFont systemFontOfSize:17.0];
-    CGRect rect =
-        [text boundingRectWithSize:
-                  CGSizeMake(CGFLOAT_MAX, MAX(ceil(font.lineHeight), 64.0))
-                           options:(NSStringDrawingUsesLineFragmentOrigin |
-                                    NSStringDrawingUsesFontLeading)
-                        attributes:@{ NSFontAttributeName : font }
-                           context:nil];
-    return ceil(rect.size.width);
-}
-
-static BOOL WCRCellIsOpenIMEnterpriseRow(UITableViewCell *cell) {
-    if (!cell || !WCRCellBelongsToOtherGrouping(cell)) return NO;
-
-    id session = nil;
-    NSString *username = nil;
-    NSUInteger scope = 0;
-    BOOL ok = WCRIdentityFromCandidate(WCRRenderedCellData(cell),
-                                       &session,
-                                       &username,
-                                       &scope);
-    (void)session;
-    (void)scope;
-    return ok && WCRIsWeComOpenIMUsername(username);
-}
-
-static BOOL WCRFindOpenIMTitlePair(UITableViewCell *cell,
-                                   UILabel **nameOut,
-                                   UILabel **companyOut) {
-    if (nameOut) *nameOut = nil;
-    if (companyOut) *companyOut = nil;
-    if (!cell) return NO;
-
-    NSMutableArray<UILabel *> *labels = [NSMutableArray array];
-    WCRCollectLabelsInViewTree(cell, labels);
-
-    UILabel *bestName = nil;
-    UILabel *bestCompany = nil;
-    CGFloat bestScore = CGFLOAT_MAX;
-
-    for (UILabel *company in labels) {
-        if (company.hidden || company.alpha <= 0.01) continue;
-
-        NSString *companyText = WCRPlainLabelText(company);
-        if (companyText.length == 0 ||
-            (![companyText hasPrefix:@"@"] &&
-             ![companyText hasPrefix:@"＠"])) {
-            continue;
-        }
-
-        // The captured enterprise company label is MMCPLabel. Requiring the
-        // same concrete label class for the title prevents preview/date labels
-        // from being selected accidentally.
-        NSString *companyClass = WCRClassName(company);
-        if (![companyClass isEqualToString:@"MMCPLabel"]) continue;
-
-        CGRect companyRect = [company convertRect:company.bounds toView:cell];
-        CGFloat companyCenterY = CGRectGetMidY(companyRect);
-
-        for (UILabel *name in labels) {
-            if (name == company || name.hidden || name.alpha <= 0.01) continue;
-            if (![WCRClassName(name) isEqualToString:companyClass]) continue;
-
-            NSString *nameText = WCRPlainLabelText(name);
-            if (nameText.length == 0 ||
-                [nameText hasPrefix:@"@"] ||
-                [nameText hasPrefix:@"＠"]) {
-                continue;
-            }
-
-            CGRect nameRect = [name convertRect:name.bounds toView:cell];
-            if (CGRectGetMinX(nameRect) >= CGRectGetMinX(companyRect)) continue;
-
-            CGFloat tolerance =
-                MAX(5.0, MIN(CGRectGetHeight(nameRect),
-                             CGRectGetHeight(companyRect)) * 0.30);
-            CGFloat dy = fabs(CGRectGetMidY(nameRect) - companyCenterY);
-            if (dy > tolerance) continue;
-
-            // Prefer the pair on exactly the same baseline, then the title
-            // whose leading edge is closest to the left of the company label.
-            CGFloat horizontalGap =
-                MAX(0.0, CGRectGetMinX(companyRect) - CGRectGetMinX(nameRect));
-            CGFloat score = dy * 100.0 + horizontalGap;
-            if (!bestCompany || score < bestScore) {
-                bestName = name;
-                bestCompany = company;
-                bestScore = score;
-            }
-        }
-    }
-
-    if (!bestName || !bestCompany) return NO;
-    if (nameOut) *nameOut = bestName;
-    if (companyOut) *companyOut = bestCompany;
-    return YES;
-}
-
-static UILabel *WCRFindTitleLineTimeLabel(UITableViewCell *cell,
-                                          UILabel *nameLabel,
-                                          UILabel *companyLabel) {
-    if (!cell || !nameLabel) return nil;
-
-    NSMutableArray<UILabel *> *labels = [NSMutableArray array];
-    WCRCollectLabelsInViewTree(cell, labels);
-
-    CGRect nameRect = [nameLabel convertRect:nameLabel.bounds toView:cell];
-    CGFloat titleCenterY = CGRectGetMidY(nameRect);
-    UILabel *best = nil;
-    CGFloat bestX = CGFLOAT_MAX;
-
-    for (UILabel *label in labels) {
-        if (label == nameLabel || label == companyLabel) continue;
-        if (label.hidden || label.alpha <= 0.01) continue;
-
-        NSString *text = WCRPlainLabelText(label);
-        if (text.length == 0) continue;
-
-        CGRect rect = [label convertRect:label.bounds toView:cell];
-        if (CGRectGetMinX(rect) <= CGRectGetMinX(nameRect) + 120.0) continue;
-        if (CGRectGetHeight(rect) > CGRectGetHeight(nameRect) + 4.0) continue;
-
-        CGFloat dy = fabs(CGRectGetMidY(rect) - titleCenterY);
-        if (dy > 8.0) continue;
-
-        CGFloat x = CGRectGetMinX(rect);
-        if (!best || x < bestX) {
-            best = label;
-            bestX = x;
-        }
-    }
-
-    return best;
-}
-
-static void WCRSetLabelFrameInCell(UILabel *label,
-                                   UITableViewCell *cell,
-                                   CGRect frameInCell) {
-    if (!label || !cell || !label.superview) return;
-    CGRect local = [cell convertRect:frameInCell toView:label.superview];
-    CGRect current = label.frame;
-    if (fabs(current.origin.x - local.origin.x) < 0.25 &&
-        fabs(current.origin.y - local.origin.y) < 0.25 &&
-        fabs(current.size.width - local.size.width) < 0.25 &&
-        fabs(current.size.height - local.size.height) < 0.25) {
-        return;
-    }
-    label.frame = local;
-}
-
-static void WCRApplyOpenIMEnterpriseLabelLayout(UITableViewCell *cell) {
-    if (!cell) return;
-    if (!WCRCellIsOpenIMEnterpriseRow(cell)) return;
-
-    NSNumber *attempts =
-        objc_getAssociatedObject(cell, kWCRWeComLayoutAttemptCountKey);
-    objc_setAssociatedObject(cell, kWCRWeComLayoutAttemptCountKey,
-                             @(attempts.unsignedIntegerValue + 1),
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    UILabel *nameLabel = nil;
-    UILabel *companyLabel = nil;
-    if (!WCRFindOpenIMTitlePair(cell, &nameLabel, &companyLabel)) return;
-
-    CGRect nameRect = [nameLabel convertRect:nameLabel.bounds toView:cell];
-    CGRect companyRect = [companyLabel convertRect:companyLabel.bounds toView:cell];
-    CGFloat nameX = CGRectGetMinX(nameRect);
-
-    UILabel *timeLabel =
-        WCRFindTitleLineTimeLabel(cell, nameLabel, companyLabel);
-    CGFloat rightLimit = CGRectGetWidth(cell.bounds) - 12.0;
-    if (timeLabel) {
-        CGRect timeRect = [timeLabel convertRect:timeLabel.bounds toView:cell];
-        if (CGRectGetMinX(timeRect) > nameX + 80.0) {
-            rightLimit = MIN(rightLimit, CGRectGetMinX(timeRect) - 8.0);
-        }
-    }
-
-    CGFloat available = rightLimit - nameX;
-    if (available <= 40.0) return;
-
-    const CGFloat gap = 6.0;
-    CGFloat nameDesired = WCRMeasuredLabelWidth(nameLabel) + 2.0;
-    CGFloat companyDesired = WCRMeasuredLabelWidth(companyLabel) + 2.0;
-    if (nameDesired <= 0.0 || companyDesired <= 0.0) return;
-
-    // Only intervene when glyphs can actually collide, the company reaches the
-    // time area, or a previous pass collapsed the company label to zero width.
-    BOOL glyphCollision =
-        (nameX + nameDesired + gap) > CGRectGetMinX(companyRect);
-    BOOL companyHitsTime = CGRectGetMaxX(companyRect) > rightLimit;
-    BOOL needsReuseRepair = CGRectGetWidth(companyRect) < 1.0;
-    if (!glyphCollision && !companyHitsTime && !needsReuseRepair) return;
-
-    nameLabel.numberOfLines = 1;
-    nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    nameLabel.clipsToBounds = YES;
-    companyLabel.numberOfLines = 1;
-    companyLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    companyLabel.clipsToBounds = YES;
-
-    CGRect newNameRect = nameRect;
-    CGRect newCompanyRect = companyRect;
-
-    // Primary contact name always wins.  The orange enterprise name only uses
-    // space left after the full primary title; if that remainder is too small,
-    // collapse it to width zero (without hidden=YES, so reused cells self-heal).
-    CGFloat titleWidth = MIN(nameDesired, available);
-    CGFloat remainingAfterTitle =
-        rightLimit - (nameX + titleWidth + gap);
-    CGFloat minCompanyVisible = 42.0;
-
-    if (remainingAfterTitle >= minCompanyVisible) {
-        newNameRect.size.width = titleWidth;
-        newCompanyRect.origin.x = nameX + titleWidth + gap;
-        newCompanyRect.size.width =
-            MIN(companyDesired, MAX(0.0, remainingAfterTitle));
-    } else {
-        newNameRect.size.width = available;
-        newCompanyRect.origin.x = rightLimit;
-        newCompanyRect.size.width = 0.0;
-    }
-
-    WCRSetLabelFrameInCell(nameLabel, cell, newNameRect);
-    WCRSetLabelFrameInCell(companyLabel, cell, newCompanyRect);
-
-    NSNumber *applied =
-        objc_getAssociatedObject(cell, kWCRWeComLayoutAppliedCountKey);
-    objc_setAssociatedObject(cell, kWCRWeComLayoutAppliedCountKey,
-                             @(applied.unsignedIntegerValue + 1),
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    NSString *lastFrame =
-        [NSString stringWithFormat:
-            @"name=(%.1f,%.1f,%.1f,%.1f) company=(%.1f,%.1f,%.1f,%.1f) right=%.1f",
-            newNameRect.origin.x, newNameRect.origin.y,
-            newNameRect.size.width, newNameRect.size.height,
-            newCompanyRect.origin.x, newCompanyRect.origin.y,
-            newCompanyRect.size.width, newCompanyRect.size.height,
-            rightLimit];
-    objc_setAssociatedObject(cell, kWCRWeComLayoutLastFrameKey, lastFrame,
-                             OBJC_ASSOCIATION_COPY_NONATOMIC);
-}
-
-static void WCRScheduleOpenIMEnterpriseLabelLayout(UITableViewCell *cell) {
-    if (!cell || !WCRCellBelongsToOtherGrouping(cell)) return;
-
-    WCRApplyOpenIMEnterpriseLabelLayout(cell);
-
-    NSNumber *scheduled =
-        objc_getAssociatedObject(cell, kWCRWeComLayoutScheduledKey);
-    if (scheduled.boolValue) return;
-
-    objc_setAssociatedObject(cell, kWCRWeComLayoutScheduledKey, @YES,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    __weak UITableViewCell *weakCell = cell;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UITableViewCell *strongCell = weakCell;
-        if (!strongCell) return;
-        objc_setAssociatedObject(strongCell, kWCRWeComLayoutScheduledKey, nil,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        WCRApplyOpenIMEnterpriseLabelLayout(strongCell);
-    });
-}
-
-static UITableView *WCRGroupingControllerTableView(id controller) {
-    if (!WCRIsGroupingSessionListController(controller)) return nil;
-
-    if ([controller respondsToSelector:@selector(tableView)]) {
-        id value = [(WCRGroupingSessionListViewController *)controller tableView];
-        if ([value isKindOfClass:[UITableView class]]) return value;
-    }
-
-    id value = WCRObjectIvarNamed(controller, "_tableView");
-    if (![value isKindOfClass:[UITableView class]]) {
-        value = WCRObjectIvarNamed(controller, "tableView");
-    }
-    return [value isKindOfClass:[UITableView class]] ? value : nil;
-}
-
-static void WCRApplyVisibleOpenIMEnterpriseLayouts(id controller) {
-    if (!WCRIsGroupingSessionListController(controller)) return;
-    if (![[WCRGroupingControllerId(controller) lowercaseString]
-            isEqualToString:kWCROtherGroupingId]) {
-        return;
-    }
-
-    UITableView *tableView = WCRGroupingControllerTableView(controller);
-    if (!tableView) return;
-
-    for (UITableViewCell *cell in tableView.visibleCells) {
-        WCRScheduleOpenIMEnterpriseLabelLayout(cell);
-    }
-}
-
 #pragma mark - Controller
 
 
-static void WCRShowCanonicalRowDebug(UITableViewCell *cell) {
-    if (!cell) return;
 
-    UITableView *tableView = WCRTableForCell(cell);
-    NSIndexPath *indexPath =
-        tableView ? [tableView indexPathForCell:cell] : nil;
-    NewMainFrameViewController *host =
-        tableView ? WCRHomeControllerForTable(tableView) : nil;
-
-    id cachedSession =
-        objc_getAssociatedObject(cell, kWCRCanonicalSessionKey);
-    NSString *cachedUsername =
-        objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey);
-    NSNumber *cachedScope =
-        objc_getAssociatedObject(cell, kWCRCanonicalScopeKey);
-
-    id renderedCellData = WCRRenderedCellData(cell);
-    id renderedSession = nil;
-    NSString *renderedUsername = nil;
-    NSUInteger renderedScope = 0;
-    BOOL renderedOK =
-        WCRConversationFromCandidate(renderedCellData,
-                                     &renderedSession,
-                                     &renderedUsername,
-                                     &renderedScope);
-
-    id projectedSessionRaw = nil;
-    if (host && indexPath &&
-        [host respondsToSelector:
-            @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
-        projectedSessionRaw =
-            [host wcrGrouping_logicGetSessionAtIndexPath:indexPath];
-    }
-
-    id projectedSession = nil;
-    NSString *projectedUsername = nil;
-    NSUInteger projectedScope = 0;
-    BOOL projectedOK =
-        WCRConversationFromCandidate(projectedSessionRaw,
-                                     &projectedSession,
-                                     &projectedUsername,
-                                     &projectedScope);
-
-    id projectedCellData = nil;
-    if (host && indexPath &&
-        [host respondsToSelector:
-            @selector(wcrGrouping_logicGetCellDataAtIndexPath:)]) {
-        projectedCellData =
-            [host wcrGrouping_logicGetCellDataAtIndexPath:indexPath];
-    }
-
-    id projectedCellSession = nil;
-    NSString *projectedCellUsername = nil;
-    NSUInteger projectedCellScope = 0;
-    BOOL projectedCellOK =
-        WCRConversationFromCandidate(projectedCellData,
-                                     &projectedCellSession,
-                                     &projectedCellUsername,
-                                     &projectedCellScope);
-
-    NSString *selectedUsername = nil;
-    NSUInteger selectedScope = 0;
-    NSString *selectedSource = nil;
-    id selectedSession =
-        WCRResolveRenderedConversationForCell(cell,
-                                              host,
-                                              indexPath,
-                                              &selectedUsername,
-                                              &selectedScope,
-                                              &selectedSource);
-
-    BOOL grouped = selectedUsername.length > 0 &&
-                   WCRIsInCustomGroup(selectedUsername);
-    BOOL held = grouped && WCRIsHeld(selectedUsername);
-    BOOL surfaced = grouped && WCRIsSurfaced(selectedUsername);
-
-    NSString *message =
-        [NSString stringWithFormat:
-            @"index=%ld/%ld\n"
-             "cell=%@\n"
-             "table=%@\n"
-             "delegate=%@\n"
-             "host=%@\n\n"
-             "SELECTED source=%@\n"
-             "selectedSession=%@\n"
-             "selectedUser=%@\n"
-             "selectedScope=%lu\n"
-             "grouped=%d held=%d surfaced=%d\n\n"
-             "RENDERED cellData=%@ ok=%d\n"
-             "renderedSession=%@\n"
-             "renderedUser=%@ scope=%lu\n\n"
-             "INDEX sessionRaw=%@ ok=%d\n"
-             "indexSession=%@\n"
-             "indexUser=%@ scope=%lu\n\n"
-             "INDEX cellData=%@ ok=%d\n"
-             "indexCellSession=%@\n"
-             "indexCellUser=%@ scope=%lu\n\n"
-             "CACHE known=%d session=%@\n"
-             "cacheUser=%@ scope=%@",
-             (long)(indexPath ? indexPath.section : -1),
-             (long)(indexPath ? indexPath.row : -1),
-             WCRClassName(cell),
-             WCRClassName(tableView),
-             WCRClassName(tableView.delegate),
-             WCRClassName(host),
-             selectedSource ?: @"<none>",
-             WCRClassName(selectedSession),
-             selectedUsername ?: @"<nil>",
-             (unsigned long)selectedScope,
-             grouped, held, surfaced,
-             WCRClassName(renderedCellData), renderedOK,
-             WCRClassName(renderedSession),
-             renderedUsername ?: @"<nil>",
-             (unsigned long)renderedScope,
-             WCRClassName(projectedSessionRaw), projectedOK,
-             WCRClassName(projectedSession),
-             projectedUsername ?: @"<nil>",
-             (unsigned long)projectedScope,
-             WCRClassName(projectedCellData), projectedCellOK,
-             WCRClassName(projectedCellSession),
-             projectedCellUsername ?: @"<nil>",
-             (unsigned long)projectedCellScope,
-             WCRCanonicalRowKnown(cell),
-             WCRClassName(cachedSession),
-             cachedUsername ?: @"<nil>",
-             cachedScope ?: @0];
-
-    UIViewController *presenter = WCRTopVC();
-    if (!presenter) return;
-
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"ActiveFront Row Debug"
-                                            message:message
-                                     preferredStyle:UIAlertControllerStyleAlert];
-
-    [alert addAction:
-        [UIAlertAction actionWithTitle:@"复制"
-                                 style:UIAlertActionStyleDefault
-                               handler:^(__unused UIAlertAction *action) {
-            [UIPasteboard generalPasteboard].string = message;
-        }]];
-
-    [alert addAction:
-        [UIAlertAction actionWithTitle:@"关闭"
-                                 style:UIAlertActionStyleCancel
-                               handler:nil]];
-
-    [presenter presentViewController:alert animated:YES completion:nil];
-}
-
-@interface WCRRowDebugController : NSObject
-+ (instancetype)shared;
-- (void)handleDebugTap:(UITapGestureRecognizer *)gesture;
-@end
-
-@implementation WCRRowDebugController
-
-+ (instancetype)shared {
-    static WCRRowDebugController *controller = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        controller = [WCRRowDebugController new];
-    });
-    return controller;
-}
-
-- (void)handleDebugTap:(UITapGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateRecognized) return;
-    if (![gesture.view isKindOfClass:[UITableViewCell class]]) return;
-
-    WCRShowCanonicalRowDebug((UITableViewCell *)gesture.view);
-}
-
-@end
-
-static void WCRAttachDebugGesture(UITableViewCell *cell) {
-    if (!cell) return;
-
-    UITapGestureRecognizer *existing =
-        objc_getAssociatedObject(cell, kWCRDebugLongPressKey);
-    if (existing) return;
-
-    UITapGestureRecognizer *debug =
-        [[UITapGestureRecognizer alloc]
-            initWithTarget:[WCRRowDebugController shared]
-                    action:@selector(handleDebugTap:)];
-
-    // Diagnostic gesture: two-finger double tap.
-    // UITapGestureRecognizer supports required touch/tap counts directly,
-    // unlike UILongPressGestureRecognizer.
-    debug.numberOfTouchesRequired = 2;
-    debug.numberOfTapsRequired = 2;
-    debug.cancelsTouchesInView = NO;
-
-    [cell addGestureRecognizer:debug];
-
-    objc_setAssociatedObject(cell, kWCRDebugLongPressKey, debug,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
 
 @interface WCRRightSwipeController : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
@@ -2796,8 +1996,6 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     UITableView *tableView = WCRTableForCell(cell);
     if (!WCRIsActiveFrontHomeTable(tableView)) return;
 
-    WCRAttachDebugGesture(cell);
-
     NSString *currentUsername = WCRUsernameForCell(cell);
     NSString *boundUsername =
         objc_getAssociatedObject(cell, kWCRBoundUsernameKey);
@@ -2921,9 +2119,7 @@ static void (*orig_noteRead)(id, SEL, NSString *) = NULL;
 static void (*orig_activeViewDidAppear)(id, SEL, BOOL) = NULL;
 static void (*orig_groupingWillDisplay)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *) = NULL;
 static void (*orig_cellPrepareForReuse)(id, SEL) = NULL;
-static void (*orig_cellLayoutSubviews)(id, SEL) = NULL;
 static void (*orig_cellDidMoveToWindow)(id, SEL) = NULL;
-static void (*orig_otherGroupViewDidLayoutSubviews)(id, SEL) = NULL;
 
 static BOOL gWCRHookConfig = NO;
 static BOOL gWCRHookProvider = NO;
@@ -2932,9 +2128,7 @@ static BOOL gWCRHookRead = NO;
 static BOOL gWCRHookHome = NO;
 static BOOL gWCRHookWillDisplay = NO;
 static BOOL gWCRHookCellReuse = NO;
-static BOOL gWCRHookCellLayout = NO;
 static BOOL gWCRHookCellDidMove = NO;
-static BOOL gWCRHookOtherGroupLayout = NO;
 static BOOL gWCRBootstrapCloseScheduled = NO;
 
 static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
@@ -3093,29 +2287,8 @@ static void hook_cellPrepareForReuse(id self, SEL _cmd) {
     if (![self isKindOfClass:[UITableViewCell class]]) return;
 
     UITableViewCell *cell = (UITableViewCell *)self;
-    WCRRemoveWeComDebugGesture(cell);
-    objc_setAssociatedObject(cell, kWCRWeComLayoutScheduledKey, nil,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(cell, kWCRWeComLayoutAttemptCountKey, nil,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(cell, kWCRWeComLayoutAppliedCountKey, nil,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(cell, kWCRWeComLayoutLastFrameKey, nil,
-                             OBJC_ASSOCIATION_COPY_NONATOMIC);
     WCRHardResetCellVisual(cell, YES);
     WCRClearCanonicalRowBinding(cell);
-}
-
-static void hook_cellLayoutSubviews(id self, SEL _cmd) {
-    if (orig_cellLayoutSubviews) {
-        orig_cellLayoutSubviews(self, _cmd);
-    }
-
-    if (![self isKindOfClass:[UITableViewCell class]]) return;
-
-    UITableViewCell *cell = (UITableViewCell *)self;
-    WCRAttachWeComDebugGesture(cell);
-    WCRScheduleOpenIMEnterpriseLabelLayout(cell);
 }
 
 static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
@@ -3127,42 +2300,14 @@ static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
     UITableViewCell *cell = (UITableViewCell *)self;
     if (!cell.window) return;
 
-    // Keep the v1.9.5 ActiveFront attachment insurance unchanged.
+    // This is attachment-only insurance.  It does not decide 分组/保持/回组.
+    // A cell inserted after the startup scan can still receive the existing
+    // right-only recognizer; action identity is resolved at gesture time.
     __weak UITableViewCell *weakCell = cell;
     dispatch_async(dispatch_get_main_queue(), ^{
         UITableViewCell *strongCell = weakCell;
         if (!strongCell || !strongCell.window) return;
         WCRAttachToCell(strongCell);
-        WCRScheduleOpenIMEnterpriseLabelLayout(strongCell);
-    });
-
-    // The enterprise MMCPLabels can be rewritten by a nested item-view layout
-    // after NewMainFrameCell itself enters the window.  Reconcile again after
-    // that native pass without touching any ActiveFront state.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t)(0.08 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UITableViewCell *strongCell = weakCell;
-        if (!strongCell || !strongCell.window) return;
-        WCRScheduleOpenIMEnterpriseLabelLayout(strongCell);
-    });
-}
-
-static void hook_otherGroupViewDidLayoutSubviews(id self, SEL _cmd) {
-    if (orig_otherGroupViewDidLayoutSubviews) {
-        orig_otherGroupViewDidLayoutSubviews(self, _cmd);
-    }
-
-    // Controller-final-pass: by this point the table and its nested item views
-    // have completed the native layout pass. This is deliberately limited to
-    // WCRGroupingSessionListViewController + sys_other + @openim rows.
-    WCRApplyVisibleOpenIMEnterpriseLayouts(self);
-
-    __weak id weakSelf = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        id strongSelf = weakSelf;
-        if (!strongSelf) return;
-        WCRApplyVisibleOpenIMEnterpriseLayouts(strongSelf);
     });
 }
 
@@ -3239,8 +2384,6 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         NSClassFromString(@"NewMainFrameViewController");
     Class mainFrameCell =
         NSClassFromString(@"NewMainFrameCell");
-    Class groupingList =
-        NSClassFromString(@"WCRGroupingSessionListViewController");
 
     if (!gWCRHookConfig && config) {
         gWCRHookConfig =
@@ -3305,15 +2448,6 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                 (IMP *)&orig_cellPrepareForReuse);
     }
 
-    if (!gWCRHookCellLayout && mainFrameCell) {
-        gWCRHookCellLayout =
-            WCRInstallInstanceHook(
-                mainFrameCell,
-                @selector(layoutSubviews),
-                (IMP)hook_cellLayoutSubviews,
-                (IMP *)&orig_cellLayoutSubviews);
-    }
-
     if (!gWCRHookCellDidMove && mainFrameCell) {
         gWCRHookCellDidMove =
             WCRInstallInstanceHook(
@@ -3321,15 +2455,6 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                 @selector(didMoveToWindow),
                 (IMP)hook_cellDidMoveToWindow,
                 (IMP *)&orig_cellDidMoveToWindow);
-    }
-
-    if (!gWCRHookOtherGroupLayout && groupingList) {
-        gWCRHookOtherGroupLayout =
-            WCRInstallInstanceHook(
-                groupingList,
-                @selector(viewDidLayoutSubviews),
-                (IMP)hook_otherGroupViewDidLayoutSubviews,
-                (IMP *)&orig_otherGroupViewDidLayoutSubviews);
     }
 
     if (gWCRHookProvider) {
@@ -3344,19 +2469,17 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         gWCRHookHome &&
         gWCRHookWillDisplay &&
         gWCRHookCellReuse &&
-        gWCRHookCellLayout &&
-        gWCRHookCellDidMove &&
-        gWCRHookOtherGroupLayout;
+        gWCRHookCellDidMove;
 
     if (allInstalled) {
-        WCRAF_LOG(@"business hooks installed config=1 provider=1 incoming=1 read=1 home=1 willDisplay=1 reuse=1 layout=1 didMove=1 otherLayout=1");
+        WCRAF_LOG(@"business hooks installed config=1 provider=1 incoming=1 read=1 home=1 willDisplay=1 reuse=1 didMove=1");
         WCRPruneStaleActiveFrontState();
         WCRRefreshHomeGlobal(@"active_front_hooks_installed");
         return;
     }
 
     if (attemptsRemaining == 0) {
-        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d incoming=%d read=%d home=%d willDisplay=%d reuse=%d layout=%d didMove=%d",
+        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d incoming=%d read=%d home=%d willDisplay=%d reuse=%d didMove=%d",
                   gWCRHookConfig,
                   gWCRHookProvider,
                   gWCRHookIncoming,
@@ -3364,7 +2487,6 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                   gWCRHookHome,
                   gWCRHookWillDisplay,
                   gWCRHookCellReuse,
-                  gWCRHookCellLayout,
                   gWCRHookCellDidMove);
         return;
     }
@@ -3386,7 +2508,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_9_6 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_9_5 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -3409,9 +2531,9 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.9.7 candidate：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.9.5 stable：右滑 = 分组 / 保持 / 回组\n"
                  "可见 Cell.cellData 为权威身份；WCRefine_groupEntry_* 入口强制禁用右滑。\n"
-                 "sys_other 中仅 @openim 企业微信行启用最终布局防重叠；单指长按可查看命中/应用次数。\n"
+                 "不包含企业微信/OpenIM 布局实验或诊断手势。\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
                  WCRClassName(tableView),
@@ -3422,7 +2544,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_9_6 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_9_5 Ready", message);
         }
     });
 }
@@ -3441,7 +2563,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.9.7 OpenIM final-pass candidate");
+        WCRAF_LOG(@"dylib loaded; starting v1.9.5 diagnostic candidate");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
