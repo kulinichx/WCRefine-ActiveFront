@@ -1,10 +1,12 @@
-// ActiveFront.RIGHT_v1_9_6_OPENIM_LABEL_LAYOUT_FIX.m
-// WCRefine ActiveFront - v1.9.6 candidate built on the v1.9.2 state machine.
+// ActiveFront.RIGHT_v1_9_7_OPENIM_FINAL_PASS_FIX.m
+// WCRefine ActiveFront - v1.9.7 candidate built on the v1.9.2 state machine.
 // Identity path is unchanged from v1.9.5: rendered m_cellData stays authoritative,
 // while WCRefine_groupEntry_* synthetic rows are rejected and fail closed.
 // WeCom layout fix: only sys_other rows whose rendered username contains @openim
-// can have their same-line MMCPLabel title/company frames adjusted. Long-press
-// diagnostics remain available for verification.
+// can have their same-line MMCPLabel title/company frames adjusted. v1.9.7 adds
+// controller-final-pass and didMoveToWindow reconciliation so native nested layout
+// cannot silently win after NewMainFrameCell's own layoutSubviews hook. Long-press
+// diagnostics now report layout-attempt/applied counters for verification.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -44,10 +46,13 @@ static const void *kWCRDebugLongPressKey = &kWCRDebugLongPressKey;
 static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 static const void *kWCRWeComDebugGestureKey = &kWCRWeComDebugGestureKey;
 static const void *kWCRWeComLayoutScheduledKey = &kWCRWeComLayoutScheduledKey;
+static const void *kWCRWeComLayoutAttemptCountKey = &kWCRWeComLayoutAttemptCountKey;
+static const void *kWCRWeComLayoutAppliedCountKey = &kWCRWeComLayoutAppliedCountKey;
+static const void *kWCRWeComLayoutLastFrameKey = &kWCRWeComLayoutLastFrameKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.9.6";
+static NSString * const kWCRAFVersion = @"1.9.7";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -1848,6 +1853,12 @@ static void WCRShowWeComRowDebug(UITableViewCell *cell) {
     BOOL openIM = WCRIsWeComOpenIMUsername(username);
     BOOL enterpriseItem =
         WCRViewTreeContainsClassNamed(cell, @"EnterpriseSessionItemView");
+    NSNumber *layoutAttempts =
+        objc_getAssociatedObject(cell, kWCRWeComLayoutAttemptCountKey);
+    NSNumber *layoutApplied =
+        objc_getAssociatedObject(cell, kWCRWeComLayoutAppliedCountKey);
+    NSString *layoutLastFrame =
+        objc_getAssociatedObject(cell, kWCRWeComLayoutLastFrameKey);
 
     NSString *message =
         [NSString stringWithFormat:
@@ -1859,7 +1870,9 @@ static void WCRShowWeComRowDebug(UITableViewCell *cell) {
              "username=%@\n"
              "scope=%lu\n"
              "contains@openim=%d\n"
-             "EnterpriseSessionItemView=%d\n\n%@",
+             "EnterpriseSessionItemView=%d\n"
+             "layoutAttempts=%lu layoutApplied=%lu\n"
+             "layoutLast=%@\n\n%@",
              WCRGroupingControllerId(owner) ?: @"<nil>",
              (long)(indexPath ? indexPath.section : -1),
              (long)(indexPath ? indexPath.row : -1),
@@ -1873,6 +1886,9 @@ static void WCRShowWeComRowDebug(UITableViewCell *cell) {
              (unsigned long)scope,
              openIM,
              enterpriseItem,
+             (unsigned long)layoutAttempts.unsignedIntegerValue,
+             (unsigned long)layoutApplied.unsignedIntegerValue,
+             layoutLastFrame ?: @"<none>",
              WCRDescribeLabelsForDebug(cell)];
 
     UIViewController *presenter = WCRTopVC();
@@ -2145,8 +2161,14 @@ static void WCRSetLabelFrameInCell(UILabel *label,
 }
 
 static void WCRApplyOpenIMEnterpriseLabelLayout(UITableViewCell *cell) {
-    if (!cell || !cell.window) return;
+    if (!cell) return;
     if (!WCRCellIsOpenIMEnterpriseRow(cell)) return;
+
+    NSNumber *attempts =
+        objc_getAssociatedObject(cell, kWCRWeComLayoutAttemptCountKey);
+    objc_setAssociatedObject(cell, kWCRWeComLayoutAttemptCountKey,
+                             @(attempts.unsignedIntegerValue + 1),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     UILabel *nameLabel = nil;
     UILabel *companyLabel = nil;
@@ -2213,6 +2235,22 @@ static void WCRApplyOpenIMEnterpriseLabelLayout(UITableViewCell *cell) {
 
     WCRSetLabelFrameInCell(nameLabel, cell, newNameRect);
     WCRSetLabelFrameInCell(companyLabel, cell, newCompanyRect);
+
+    NSNumber *applied =
+        objc_getAssociatedObject(cell, kWCRWeComLayoutAppliedCountKey);
+    objc_setAssociatedObject(cell, kWCRWeComLayoutAppliedCountKey,
+                             @(applied.unsignedIntegerValue + 1),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSString *lastFrame =
+        [NSString stringWithFormat:
+            @"name=(%.1f,%.1f,%.1f,%.1f) company=(%.1f,%.1f,%.1f,%.1f) right=%.1f",
+            newNameRect.origin.x, newNameRect.origin.y,
+            newNameRect.size.width, newNameRect.size.height,
+            newCompanyRect.origin.x, newCompanyRect.origin.y,
+            newCompanyRect.size.width, newCompanyRect.size.height,
+            rightLimit];
+    objc_setAssociatedObject(cell, kWCRWeComLayoutLastFrameKey, lastFrame,
+                             OBJC_ASSOCIATION_COPY_NONATOMIC);
 }
 
 static void WCRScheduleOpenIMEnterpriseLabelLayout(UITableViewCell *cell) {
@@ -2235,6 +2273,36 @@ static void WCRScheduleOpenIMEnterpriseLabelLayout(UITableViewCell *cell) {
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         WCRApplyOpenIMEnterpriseLabelLayout(strongCell);
     });
+}
+
+static UITableView *WCRGroupingControllerTableView(id controller) {
+    if (!WCRIsGroupingSessionListController(controller)) return nil;
+
+    if ([controller respondsToSelector:@selector(tableView)]) {
+        id value = [(WCRGroupingSessionListViewController *)controller tableView];
+        if ([value isKindOfClass:[UITableView class]]) return value;
+    }
+
+    id value = WCRObjectIvarNamed(controller, "_tableView");
+    if (![value isKindOfClass:[UITableView class]]) {
+        value = WCRObjectIvarNamed(controller, "tableView");
+    }
+    return [value isKindOfClass:[UITableView class]] ? value : nil;
+}
+
+static void WCRApplyVisibleOpenIMEnterpriseLayouts(id controller) {
+    if (!WCRIsGroupingSessionListController(controller)) return;
+    if (![[WCRGroupingControllerId(controller) lowercaseString]
+            isEqualToString:kWCROtherGroupingId]) {
+        return;
+    }
+
+    UITableView *tableView = WCRGroupingControllerTableView(controller);
+    if (!tableView) return;
+
+    for (UITableViewCell *cell in tableView.visibleCells) {
+        WCRScheduleOpenIMEnterpriseLabelLayout(cell);
+    }
 }
 
 #pragma mark - Controller
@@ -2855,6 +2923,7 @@ static void (*orig_groupingWillDisplay)(id, SEL, UITableView *, UITableViewCell 
 static void (*orig_cellPrepareForReuse)(id, SEL) = NULL;
 static void (*orig_cellLayoutSubviews)(id, SEL) = NULL;
 static void (*orig_cellDidMoveToWindow)(id, SEL) = NULL;
+static void (*orig_otherGroupViewDidLayoutSubviews)(id, SEL) = NULL;
 
 static BOOL gWCRHookConfig = NO;
 static BOOL gWCRHookProvider = NO;
@@ -2865,6 +2934,7 @@ static BOOL gWCRHookWillDisplay = NO;
 static BOOL gWCRHookCellReuse = NO;
 static BOOL gWCRHookCellLayout = NO;
 static BOOL gWCRHookCellDidMove = NO;
+static BOOL gWCRHookOtherGroupLayout = NO;
 static BOOL gWCRBootstrapCloseScheduled = NO;
 
 static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
@@ -3026,6 +3096,12 @@ static void hook_cellPrepareForReuse(id self, SEL _cmd) {
     WCRRemoveWeComDebugGesture(cell);
     objc_setAssociatedObject(cell, kWCRWeComLayoutScheduledKey, nil,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, kWCRWeComLayoutAttemptCountKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, kWCRWeComLayoutAppliedCountKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, kWCRWeComLayoutLastFrameKey, nil,
+                             OBJC_ASSOCIATION_COPY_NONATOMIC);
     WCRHardResetCellVisual(cell, YES);
     WCRClearCanonicalRowBinding(cell);
 }
@@ -3051,14 +3127,42 @@ static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
     UITableViewCell *cell = (UITableViewCell *)self;
     if (!cell.window) return;
 
-    // This is attachment-only insurance.  It does not decide 分组/保持/回组.
-    // A cell inserted after the startup scan can still receive the existing
-    // right-only recognizer; action identity is resolved at gesture time.
+    // Keep the v1.9.5 ActiveFront attachment insurance unchanged.
     __weak UITableViewCell *weakCell = cell;
     dispatch_async(dispatch_get_main_queue(), ^{
         UITableViewCell *strongCell = weakCell;
         if (!strongCell || !strongCell.window) return;
         WCRAttachToCell(strongCell);
+        WCRScheduleOpenIMEnterpriseLabelLayout(strongCell);
+    });
+
+    // The enterprise MMCPLabels can be rewritten by a nested item-view layout
+    // after NewMainFrameCell itself enters the window.  Reconcile again after
+    // that native pass without touching any ActiveFront state.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(0.08 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UITableViewCell *strongCell = weakCell;
+        if (!strongCell || !strongCell.window) return;
+        WCRScheduleOpenIMEnterpriseLabelLayout(strongCell);
+    });
+}
+
+static void hook_otherGroupViewDidLayoutSubviews(id self, SEL _cmd) {
+    if (orig_otherGroupViewDidLayoutSubviews) {
+        orig_otherGroupViewDidLayoutSubviews(self, _cmd);
+    }
+
+    // Controller-final-pass: by this point the table and its nested item views
+    // have completed the native layout pass. This is deliberately limited to
+    // WCRGroupingSessionListViewController + sys_other + @openim rows.
+    WCRApplyVisibleOpenIMEnterpriseLayouts(self);
+
+    __weak id weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id strongSelf = weakSelf;
+        if (!strongSelf) return;
+        WCRApplyVisibleOpenIMEnterpriseLayouts(strongSelf);
     });
 }
 
@@ -3135,6 +3239,8 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         NSClassFromString(@"NewMainFrameViewController");
     Class mainFrameCell =
         NSClassFromString(@"NewMainFrameCell");
+    Class groupingList =
+        NSClassFromString(@"WCRGroupingSessionListViewController");
 
     if (!gWCRHookConfig && config) {
         gWCRHookConfig =
@@ -3217,6 +3323,15 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                 (IMP *)&orig_cellDidMoveToWindow);
     }
 
+    if (!gWCRHookOtherGroupLayout && groupingList) {
+        gWCRHookOtherGroupLayout =
+            WCRInstallInstanceHook(
+                groupingList,
+                @selector(viewDidLayoutSubviews),
+                (IMP)hook_otherGroupViewDidLayoutSubviews,
+                (IMP *)&orig_otherGroupViewDidLayoutSubviews);
+    }
+
     if (gWCRHookProvider) {
         WCRScheduleBootstrapUnreadFallbackClose();
     }
@@ -3230,10 +3345,11 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         gWCRHookWillDisplay &&
         gWCRHookCellReuse &&
         gWCRHookCellLayout &&
-        gWCRHookCellDidMove;
+        gWCRHookCellDidMove &&
+        gWCRHookOtherGroupLayout;
 
     if (allInstalled) {
-        WCRAF_LOG(@"business hooks installed config=1 provider=1 incoming=1 read=1 home=1 willDisplay=1 reuse=1 layout=1 didMove=1");
+        WCRAF_LOG(@"business hooks installed config=1 provider=1 incoming=1 read=1 home=1 willDisplay=1 reuse=1 layout=1 didMove=1 otherLayout=1");
         WCRPruneStaleActiveFrontState();
         WCRRefreshHomeGlobal(@"active_front_hooks_installed");
         return;
@@ -3293,9 +3409,9 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.9.6 candidate：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.9.7 candidate：右滑 = 分组 / 保持 / 回组\n"
                  "可见 Cell.cellData 为权威身份；WCRefine_groupEntry_* 入口强制禁用右滑。\n"
-                 "sys_other 中仅 @openim 企业微信行启用主标题优先防重叠；单指长按仍可诊断。\n"
+                 "sys_other 中仅 @openim 企业微信行启用最终布局防重叠；单指长按可查看命中/应用次数。\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
                  WCRClassName(tableView),
@@ -3325,7 +3441,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.9.6 OpenIM layout candidate");
+        WCRAF_LOG(@"dylib loaded; starting v1.9.7 OpenIM final-pass candidate");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
