@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_v1_8_6_HOME_GROUP_ROW_GUARD.m
-// WCRefine ActiveFront - v1.8.6: exclude WCRefine home group summary rows from right swipe.
+// ActiveFront.RIGHT_v1_8_7_GROUP_ROW_ONLY_GUARD.m
+// WCRefine ActiveFront - v1.8.7: disable only WCRefine synthetic home group rows.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -35,7 +35,7 @@ static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.8.6";
+static NSString * const kWCRAFVersion = @"1.8.7";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -90,6 +90,7 @@ static void WCRAFLog(NSString *format, ...) {
 @interface NewMainFrameViewController : UIViewController
 - (id)logicGetSessionAtIndexPath:(NSIndexPath *)indexPath;
 - (id)wcrGrouping_logicGetSessionAtIndexPath:(NSIndexPath *)indexPath;
+- (id)wcrGrouping_logicGetCellDataAtIndexPath:(NSIndexPath *)indexPath;
 - (void)wcrGrouping_scheduleRefreshForTrigger:(id)trigger;
 - (void)viewDidAppear:(BOOL)animated;
 @end
@@ -774,24 +775,121 @@ static void WCRPruneStaleActiveFrontState(void) {
 
 static id WCRHostForTable(UITableView *tableView) {
     id host = tableView.delegate;
+    if (!host) return nil;
 
-    // IMPORTANT:
-    // The home table contains both real native-session rows and WCRefine
-    // projected group-summary rows (e.g. 家人组 / 工作组).
-    //
-    // logicGetSessionAtIndexPath: is WeChat's native index mapping. Calling it
-    // with WCRefine's projected indexPath can accidentally resolve a totally
-    // different native session for a group-summary row, which is why those
-    // group rows incorrectly acquired our right-swipe menu.
-    //
-    // WCRefine's projection-aware resolver returns the actual native session
-    // only when this visible row really represents a session.
     if ([host respondsToSelector:
-            @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
+            @selector(wcrGrouping_logicGetCellDataAtIndexPath:)] ||
+        [host respondsToSelector:
+            @selector(wcrGrouping_logicGetSessionAtIndexPath:)] ||
+        [host respondsToSelector:
+            @selector(logicGetSessionAtIndexPath:)]) {
         return host;
     }
 
     return nil;
+}
+
+static BOOL WCRUsernameIsSyntheticGroupEntry(NSString *username) {
+    if (![username isKindOfClass:[NSString class]] ||
+        username.length == 0) {
+        return NO;
+    }
+
+    // WCRefine 2.1-2 uses this prefix for the projected rows that represent
+    // groups/categories on the HOME list, not actual conversations.
+    //
+    // This covers custom groups (家人组/工作组/...) and WCRefine's default /
+    // category group entries such as ungrouped friend/chatroom, official,
+    // service and "other" when they are projected as group rows.
+    return [username hasPrefix:@"wcrefine_groupentry_"];
+}
+
+static BOOL WCRObjectIsGroupingEntry(id obj) {
+    if (!obj) return NO;
+
+    Class entryClass = NSClassFromString(@"WCRGroupingEntry");
+    if (entryClass && [obj isKindOfClass:entryClass]) {
+        return YES;
+    }
+
+    return [WCRClassName(obj) isEqualToString:@"WCRGroupingEntry"];
+}
+
+static BOOL WCRCellClassLooksLikeSyntheticGroupingEntry(UITableViewCell *cell) {
+    if (!cell) return NO;
+
+    NSString *name = WCRClassName(cell);
+    if (name.length == 0) return NO;
+
+    // WCRefine 2.1-2 also contains dedicated projected-entry cell classes
+    // (e.g. WCRGroupingNativeFakeEntryCell / FinalEntryCell). Treat only
+    // explicit "Grouping"+"Entry" cells as group containers.
+    return ([name rangeOfString:@"Grouping"].location != NSNotFound &&
+            [name rangeOfString:@"Entry"].location != NSNotFound);
+}
+
+static id WCRProjectedCellDataForIndexPath(id host,
+                                           NSIndexPath *indexPath) {
+    if (!host || !indexPath) return nil;
+
+    if (![host respondsToSelector:
+            @selector(wcrGrouping_logicGetCellDataAtIndexPath:)]) {
+        return nil;
+    }
+
+    return [(NewMainFrameViewController *)host
+        wcrGrouping_logicGetCellDataAtIndexPath:indexPath];
+}
+
+static BOOL WCRProjectedObjectIsSyntheticGroupRow(id obj) {
+    if (!obj) return NO;
+
+    if (WCRObjectIsGroupingEntry(obj)) {
+        return YES;
+    }
+
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    NSString *username =
+        provider ? [provider usernameForNativeObject:obj] : nil;
+
+    if (WCRUsernameIsSyntheticGroupEntry(username)) {
+        return YES;
+    }
+
+    return NO;
+}
+
+static BOOL WCRIsSyntheticHomeGroupRow(UITableViewCell *cell,
+                                       id host,
+                                       NSIndexPath *indexPath,
+                                       id projectedCellData) {
+    if (!cell || !host || !indexPath) return NO;
+
+    if (WCRCellClassLooksLikeSyntheticGroupingEntry(cell)) {
+        return YES;
+    }
+
+    if (WCRProjectedObjectIsSyntheticGroupRow(projectedCellData)) {
+        return YES;
+    }
+
+    // Some WCRefine builds expose a projected "session" object for group
+    // entries instead of exposing the marker on cellData. Check that object
+    // only for the synthetic marker; do NOT require it to be non-nil for real
+    // conversations because surfaced unread native rows can legitimately take
+    // a different resolver path.
+    if ([host respondsToSelector:
+            @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
+        id projectedSession =
+            [(NewMainFrameViewController *)host
+                wcrGrouping_logicGetSessionAtIndexPath:indexPath];
+
+        if (WCRProjectedObjectIsSyntheticGroupRow(projectedSession)) {
+            return YES;
+        }
+    }
+
+    return NO;
 }
 
 static id WCRSessionForCell(UITableViewCell *cell,
@@ -807,14 +905,53 @@ static id WCRSessionForCell(UITableViewCell *cell,
     id host = WCRHostForTable(tableView);
     if (!host) return nil;
 
-    id session =
-        [(NewMainFrameViewController *)host
-            wcrGrouping_logicGetSessionAtIndexPath:indexPath];
+    id projectedCellData =
+        WCRProjectedCellDataForIndexPath(host, indexPath);
 
-    // A nil result here is intentional for WCRefine home group-summary rows.
-    // Those rows are navigation/group containers, not conversations, and must
-    // never receive 分组 / 保持 / 回组.
-    if (!session) return nil;
+    // IMPORTANT: this is the only new HOME-row exclusion.
+    // We exclude the GROUP CONTAINER ROW itself, not real friend/chatroom rows.
+    if (WCRIsSyntheticHomeGroupRow(cell,
+                                   host,
+                                   indexPath,
+                                   projectedCellData)) {
+        return nil;
+    }
+
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    id session = nil;
+
+    // 1) Prefer WCRefine's projection-aware resolver when it can resolve this
+    //    real conversation row.
+    if ([host respondsToSelector:
+            @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
+        session =
+            [(NewMainFrameViewController *)host
+                wcrGrouping_logicGetSessionAtIndexPath:indexPath];
+    }
+
+    // 2) Surface/native passthrough rows can have usable projected cellData
+    //    even when the projection session resolver returns nil.
+    if (!session && projectedCellData && provider) {
+        session = [provider nativeSessionFromObject:projectedCellData];
+    }
+
+    // 3) Final fallback: retain the native resolver that was proven on-device
+    //    in v1.8.5 for newly surfaced friend/chatroom messages.
+    //
+    //    This fallback is safe now because synthetic group rows were rejected
+    //    above before native index-path resolution is attempted.
+    if (!session &&
+        [host respondsToSelector:@selector(logicGetSessionAtIndexPath:)]) {
+        session =
+            [(NewMainFrameViewController *)host
+                logicGetSessionAtIndexPath:indexPath];
+    }
+
+    // Defensive marker check in case a future WCRefine build returns a
+    // synthetic object through one of the session resolvers.
+    if (WCRProjectedObjectIsSyntheticGroupRow(session)) {
+        return nil;
+    }
 
     if (hostOut) *hostOut = host;
     if (tableOut) *tableOut = tableView;
@@ -2051,7 +2188,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_8_6 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_8_7 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -2074,9 +2211,9 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.8.6：右滑 = 分组 / 保持 / 回组\n"
-                 "仅好友(scope=1)与群聊(scope=2)参与 ActiveFront。\n"
-                 "首页的 WCRefine 分组条目（如家人组/工作组）不允许右滑。\n"
+                 "v1.8.7：右滑 = 分组 / 保持 / 回组\n"
+                 "真实好友/群聊行保留 ActiveFront 右滑。\n"
+                 "首页 WCRefine 分组条目本身禁止右滑。\n"
                  "WCRefine 组内列表不挂独立右滑手势。\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
@@ -2088,7 +2225,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_8_6 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_8_7 Ready", message);
         }
     });
 }
@@ -2107,7 +2244,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.8.6");
+        WCRAF_LOG(@"dylib loaded; starting v1.8.7");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
