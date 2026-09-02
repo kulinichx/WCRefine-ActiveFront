@@ -1,25 +1,25 @@
-// ActiveFront.RIGHT_GROUP_UI_V1_7_OWN_RIGHT_PAN.m
-// WCRefineGroup - RIGHT swipe proof using an independent, right-only pan.
+// ActiveFront.RIGHT_GROUP_UI_V1_8_REAL_ACTIONS.m
+// WCRefine ActiveFront - stable independent RIGHT swipe + real WCRefine actions.
 //
-// Why this version exists:
-// WeChat's MainFrameTableView does not appear to enter UIKit's standard
-// leadingSwipeActionsConfiguration path. v1.6 therefore left LEFT swipe clean,
-// but RIGHT swipe still never opened.
+// v1.8 keeps the v1.7 gesture path that already works on-device:
+// - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
+// - LEFT swipe remains WeChat/WCRefine's existing native path.
+// - The action area has no colored background.
 //
-// v1.7:
-// - does NOT hook UIKit leading/trailing swipe delegate methods
-// - does NOT attach another target to WeChat's own swipe recognizer
-// - adds a separate UIPanGestureRecognizer only to NewMainFrameCell
-// - that recognizer is allowed to begin only for horizontal RIGHT movement
-// - LEFT movement immediately fails and remains WeChat's original path
-// - "分组" background stays hidden unless OUR right pan is active/open
+// Real actions:
+// - ungrouped -> 分组 (pick an existing WCRefine custom group)
+// - grouped + Surfaced -> 保持
+// - grouped + Held -> 回组
 //
-// This is still a UI proof. Tapping "分组" does not change real group data.
+// ActiveFront never replaces WCRefine's group database. It only uses WCRefine's
+// existing group manager/provider APIs and maintains independent Surfaced/Held
+// projection state.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <math.h>
+#import <stdarg.h>
 
 static const CGFloat kWCRActionWidth = 82.0;
 
@@ -31,6 +31,72 @@ static const void *kWCRTrackingKey     = &kWCRTrackingKey;
 static const void *kWCRStartOffsetKey  = &kWCRStartOffsetKey;
 
 static BOOL gWCRReadyShown = NO;
+
+static NSString * const kWCRAFVersion = @"1.8";
+static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
+static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
+static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
+
+static BOOL gWCRBootstrapUnreadFallbackOpen = YES;
+static const NSTimeInterval kWCRBootstrapUnreadFallbackSeconds = 12.0;
+
+static void WCRAFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void WCRAFLog(NSString *format, ...) {
+    if (format.length == 0) return;
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSLog(@"[WCRefineGroup %@] %@", kWCRAFVersion, message);
+}
+#define WCRAF_LOG(...) WCRAFLog(__VA_ARGS__)
+
+@interface WCRefineConfig : NSObject
++ (instancetype)shared;
+@property(nonatomic, assign) BOOL homeGroupingExcludeUnreadEnabled;
+@end
+
+@interface WCRefineGroup : NSObject
+@property(nonatomic, copy) NSString *groupId;
+@property(nonatomic, copy) NSString *name;
+@property(nonatomic, assign) NSUInteger scope;
+@property(nonatomic, assign) BOOL disabled;
+@end
+
+@interface WCRefineGroupManager : NSObject
++ (instancetype)shared;
+- (NSArray<WCRefineGroup *> *)customGroups;
+- (NSArray<NSString *> *)groupIdsContainingMember:(NSString *)member;
+- (BOOL)addMember:(NSString *)member toGroup:(NSString *)groupId;
+- (BOOL)removeMember:(NSString *)member fromGroup:(NSString *)groupId;
+@end
+
+@interface WCRefineGroupDataProvider : NSObject
++ (instancetype)shared;
+- (id)nativeSessionFromObject:(id)obj;
+- (NSString *)usernameForNativeObject:(id)obj;
+- (NSUInteger)groupScopeForNativeSession:(id)session;
+- (BOOL)shouldExcludeNativeSessionFromGroupingForUnreadPolicy:(id)session;
+@end
+
+@interface WCRQuickChatRuntime : NSObject
+- (void)noteIncomingMessageForUsername:(NSString *)username;
+- (void)noteReadForUsername:(NSString *)username;
+@end
+
+@interface NewMainFrameViewController : UIViewController
+- (id)logicGetSessionAtIndexPath:(NSIndexPath *)indexPath;
+- (id)wcrGrouping_logicGetSessionAtIndexPath:(NSIndexPath *)indexPath;
+- (void)wcrGrouping_scheduleRefreshForTrigger:(id)trigger;
+- (void)viewDidAppear:(BOOL)animated;
+@end
+
+typedef NS_ENUM(NSInteger, WCRRightActionKind) {
+    WCRRightActionNone = 0,
+    WCRRightActionGroup,
+    WCRRightActionKeep,
+    WCRRightActionReturn
+};
 
 #pragma mark - Helpers
 
@@ -296,12 +362,552 @@ static void WCRCloseOtherCells(UITableViewCell *exceptCell) {
     }
 }
 
+
+#pragma mark - WCRefine business helpers
+
+static WCRefineGroupManager *WCRGroupManager(void) {
+    Class cls = NSClassFromString(@"WCRefineGroupManager");
+    if (!cls || ![cls respondsToSelector:@selector(shared)]) return nil;
+    return [cls shared];
+}
+
+static WCRefineGroupDataProvider *WCRDataProvider(void) {
+    Class cls = NSClassFromString(@"WCRefineGroupDataProvider");
+    if (!cls || ![cls respondsToSelector:@selector(shared)]) return nil;
+    return [cls shared];
+}
+
+static NSObject *WCRAFStateLock(void) {
+    static NSObject *lock = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        lock = [NSObject new];
+    });
+    return lock;
+}
+
+static NSSet<NSString *> *WCRStringSetForDefaultsKey(NSString *key) {
+    if (key.length == 0) return [NSSet set];
+
+    @synchronized (WCRAFStateLock()) {
+        id stored = [[NSUserDefaults standardUserDefaults] objectForKey:key];
+        if (![stored isKindOfClass:[NSArray class]]) return [NSSet set];
+
+        NSMutableSet<NSString *> *result = [NSMutableSet set];
+        for (id obj in (NSArray *)stored) {
+            if ([obj isKindOfClass:[NSString class]] &&
+                [(NSString *)obj length] > 0) {
+                [result addObject:obj];
+            }
+        }
+        return [result copy];
+    }
+}
+
+static BOOL WCRPersistSetMembership(NSString *key,
+                                    NSString *username,
+                                    BOOL enabled) {
+    if (key.length == 0 || username.length == 0) return NO;
+
+    @synchronized (WCRAFStateLock()) {
+        id stored = [[NSUserDefaults standardUserDefaults] objectForKey:key];
+        NSMutableSet<NSString *> *set = [NSMutableSet set];
+
+        if ([stored isKindOfClass:[NSArray class]]) {
+            for (id obj in (NSArray *)stored) {
+                if ([obj isKindOfClass:[NSString class]] &&
+                    [(NSString *)obj length] > 0) {
+                    [set addObject:obj];
+                }
+            }
+        }
+
+        BOOL previous = [set containsObject:username];
+        if (enabled) {
+            [set addObject:username];
+        } else {
+            [set removeObject:username];
+        }
+
+        if (previous == enabled) return NO;
+
+        NSArray<NSString *> *stable =
+            [[set allObjects] sortedArrayUsingSelector:@selector(compare:)];
+
+        [[NSUserDefaults standardUserDefaults] setObject:stable forKey:key];
+        return YES;
+    }
+}
+
+static BOOL WCRIsHeld(NSString *username) {
+    return username.length > 0 &&
+           [WCRStringSetForDefaultsKey(kWCRAFHeldUsernamesDefaultsKey)
+               containsObject:username];
+}
+
+static BOOL WCRPersistHeld(NSString *username, BOOL held) {
+    return WCRPersistSetMembership(kWCRAFHeldUsernamesDefaultsKey,
+                                   username,
+                                   held);
+}
+
+static BOOL WCRIsSurfaced(NSString *username) {
+    return username.length > 0 &&
+           [WCRStringSetForDefaultsKey(kWCRAFSurfacedUsernamesDefaultsKey)
+               containsObject:username];
+}
+
+static BOOL WCRPersistSurfaced(NSString *username, BOOL surfaced) {
+    return WCRPersistSetMembership(kWCRAFSurfacedUsernamesDefaultsKey,
+                                   username,
+                                   surfaced);
+}
+
+static BOOL WCRHasAnyActiveFrontProjection(void) {
+    return WCRStringSetForDefaultsKey(kWCRAFHeldUsernamesDefaultsKey).count > 0 ||
+           WCRStringSetForDefaultsKey(kWCRAFSurfacedUsernamesDefaultsKey).count > 0;
+}
+
+static NSSet<NSString *> *WCRCustomGroupIdSet(void) {
+    WCRefineGroupManager *mgr = WCRGroupManager();
+    NSMutableSet<NSString *> *ids = [NSMutableSet set];
+
+    for (WCRefineGroup *group in mgr.customGroups ?: @[]) {
+        if (group.groupId.length > 0) {
+            [ids addObject:group.groupId];
+        }
+    }
+    return ids;
+}
+
+static BOOL WCRIsInCustomGroup(NSString *username) {
+    if (username.length == 0) return NO;
+
+    WCRefineGroupManager *mgr = WCRGroupManager();
+    if (!mgr) return NO;
+
+    NSArray<NSString *> *memberGroupIds =
+        [mgr groupIdsContainingMember:username] ?: @[];
+
+    if (memberGroupIds.count == 0) return NO;
+
+    NSSet<NSString *> *customIds = WCRCustomGroupIdSet();
+    for (NSString *groupId in memberGroupIds) {
+        if ([customIds containsObject:groupId]) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static NSArray<WCRefineGroup *> *WCRAvailableGroupsForScope(NSUInteger scope) {
+    WCRefineGroupManager *mgr = WCRGroupManager();
+    NSMutableArray<WCRefineGroup *> *groups = [NSMutableArray array];
+
+    for (WCRefineGroup *group in mgr.customGroups ?: @[]) {
+        if (group.disabled) continue;
+        if (group.scope != scope) continue;
+        if (group.groupId.length == 0) continue;
+        [groups addObject:group];
+    }
+
+    return groups;
+}
+
+static BOOL WCRSessionUnreadState(id session, BOOL *knownOut) {
+    if (knownOut) *knownOut = NO;
+    if (!session) return NO;
+
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    id native = provider ? [provider nativeSessionFromObject:session] : nil;
+    if (!native) native = session;
+
+    NSArray<NSString *> *keys =
+        @[@"m_uUnReadCount", @"m_unReadCount", @"unReadCount"];
+
+    for (NSString *key in keys) {
+        @try {
+            id value = [native valueForKey:key];
+            if ([value respondsToSelector:@selector(unsignedIntegerValue)]) {
+                if (knownOut) *knownOut = YES;
+                return [value unsignedIntegerValue] > 0;
+            }
+        } @catch (__unused NSException *exception) {
+        }
+    }
+
+    return NO;
+}
+
+static void WCRRefreshHome(id host, NSString *reason) {
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:kWCRHomeGroupsDidChangeNotification
+                      object:nil];
+
+    if ([host respondsToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)]) {
+        [(NewMainFrameViewController *)host
+            wcrGrouping_scheduleRefreshForTrigger:(reason ?: @"active_front")];
+    }
+}
+
+static void WCRRefreshHomeDeferred(id host, NSString *reason) {
+    __weak id weakHost = host;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        WCRRefreshHome(weakHost, reason);
+    });
+}
+
+static void WCRRefreshHomeGlobal(__unused NSString *reason) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:kWCRHomeGroupsDidChangeNotification
+                          object:nil];
+    });
+}
+
+static void WCRSetHeld(NSString *username, BOOL held, id host) {
+    if (username.length == 0) return;
+
+    BOOL changed = WCRPersistHeld(username, held);
+
+    if (!held) {
+        changed = WCRPersistSurfaced(username, NO) || changed;
+    }
+
+    WCRAF_LOG(@"%@ %@",
+              held ? @"keep" : @"return-to-group",
+              username);
+
+    NSString *reason = nil;
+    if (held) {
+        reason = changed ?
+            @"active_front_keep" :
+            @"active_front_keep_refresh";
+    } else {
+        reason = changed ?
+            @"active_front_return" :
+            @"active_front_return_refresh";
+    }
+
+    WCRRefreshHomeDeferred(host, reason);
+}
+
+static void WCRPruneStateKeyToGroupedMembers(NSString *key) {
+    NSSet<NSString *> *stored = WCRStringSetForDefaultsKey(key);
+    if (stored.count == 0) return;
+
+    NSMutableSet<NSString *> *clean =
+        [NSMutableSet setWithCapacity:stored.count];
+
+    for (NSString *username in stored) {
+        if (WCRIsInCustomGroup(username)) {
+            [clean addObject:username];
+        }
+    }
+
+    if ([clean isEqualToSet:stored]) return;
+
+    @synchronized (WCRAFStateLock()) {
+        NSArray<NSString *> *stable =
+            [[clean allObjects] sortedArrayUsingSelector:@selector(compare:)];
+        [[NSUserDefaults standardUserDefaults] setObject:stable forKey:key];
+    }
+}
+
+static void WCRPruneStaleActiveFrontState(void) {
+    WCRPruneStateKeyToGroupedMembers(kWCRAFHeldUsernamesDefaultsKey);
+    WCRPruneStateKeyToGroupedMembers(kWCRAFSurfacedUsernamesDefaultsKey);
+}
+
+static id WCRHostForTable(UITableView *tableView) {
+    id host = tableView.delegate;
+    if ([host respondsToSelector:@selector(logicGetSessionAtIndexPath:)]) {
+        return host;
+    }
+    return nil;
+}
+
+static id WCRSessionForCell(UITableViewCell *cell,
+                            id *hostOut,
+                            UITableView **tableOut,
+                            NSIndexPath **indexPathOut) {
+    UITableView *tableView = WCRTableForCell(cell);
+    if (!WCRIsMainFrameTable(tableView)) return nil;
+
+    NSIndexPath *indexPath = [tableView indexPathForCell:cell];
+    if (!indexPath) return nil;
+
+    id host = WCRHostForTable(tableView);
+    if (!host) return nil;
+
+    id session =
+        [(NewMainFrameViewController *)host
+            logicGetSessionAtIndexPath:indexPath];
+
+    if (hostOut) *hostOut = host;
+    if (tableOut) *tableOut = tableView;
+    if (indexPathOut) *indexPathOut = indexPath;
+
+    return session;
+}
+
+static BOOL WCRResolveSessionState(id session,
+                                   NSString **usernameOut,
+                                   BOOL *groupedOut,
+                                   BOOL *heldOut,
+                                   BOOL *surfacedOut) {
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    if (!provider || !session) return NO;
+
+    NSString *username = [provider usernameForNativeObject:session];
+    if (![username isKindOfClass:[NSString class]] ||
+        username.length == 0) {
+        return NO;
+    }
+
+    BOOL grouped = WCRIsInCustomGroup(username);
+    BOOL held = grouped && WCRIsHeld(username);
+    BOOL surfaced = grouped && WCRIsSurfaced(username);
+
+    if (usernameOut) *usernameOut = username;
+    if (groupedOut) *groupedOut = grouped;
+    if (heldOut) *heldOut = held;
+    if (surfacedOut) *surfacedOut = surfaced;
+
+    return YES;
+}
+
+static WCRRightActionKind WCRActionKindForCell(UITableViewCell *cell,
+                                                id *hostOut,
+                                                UITableView **tableOut,
+                                                NSIndexPath **indexPathOut,
+                                                id *sessionOut,
+                                                NSString **usernameOut) {
+    id host = nil;
+    UITableView *tableView = nil;
+    NSIndexPath *indexPath = nil;
+
+    id session =
+        WCRSessionForCell(cell, &host, &tableView, &indexPath);
+
+    if (!session) return WCRRightActionNone;
+
+    NSString *username = nil;
+    BOOL grouped = NO;
+    BOOL held = NO;
+    BOOL surfaced = NO;
+
+    if (!WCRResolveSessionState(session,
+                                &username,
+                                &grouped,
+                                &held,
+                                &surfaced)) {
+        return WCRRightActionNone;
+    }
+
+    WCRRightActionKind kind = WCRRightActionNone;
+
+    if (!grouped) {
+        NSUInteger scope =
+            [WCRDataProvider() groupScopeForNativeSession:session];
+
+        NSArray<WCRefineGroup *> *available =
+            WCRAvailableGroupsForScope(scope);
+
+        if (available.count > 0) {
+            kind = WCRRightActionGroup;
+        }
+    } else if (held) {
+        kind = WCRRightActionReturn;
+    } else if (surfaced) {
+        kind = WCRRightActionKeep;
+    }
+
+    if (hostOut) *hostOut = host;
+    if (tableOut) *tableOut = tableView;
+    if (indexPathOut) *indexPathOut = indexPath;
+    if (sessionOut) *sessionOut = session;
+    if (usernameOut) *usernameOut = username;
+
+    return kind;
+}
+
+static NSString *WCRTitleForActionKind(WCRRightActionKind kind) {
+    switch (kind) {
+        case WCRRightActionGroup:
+            return @"分组";
+        case WCRRightActionKeep:
+            return @"保持";
+        case WCRRightActionReturn:
+            return @"回组";
+        case WCRRightActionNone:
+        default:
+            return nil;
+    }
+}
+
+static BOOL WCRPrepareActionForCell(UITableViewCell *cell) {
+    if (!cell) return NO;
+
+    UIButton *button = objc_getAssociatedObject(cell, kWCRButtonKey);
+    if (!button) return NO;
+
+    WCRRightActionKind kind =
+        WCRActionKindForCell(cell, NULL, NULL, NULL, NULL, NULL);
+
+    NSString *title = WCRTitleForActionKind(kind);
+    if (title.length == 0) {
+        if (WCRBool(cell, kWCROpenKey) ||
+            WCRBool(cell, kWCRTrackingKey)) {
+            WCRCloseCell(cell, NO);
+        }
+        return NO;
+    }
+
+    [button setTitle:title forState:UIControlStateNormal];
+    return YES;
+}
+
+static UIViewController *WCRPresenterForHost(id host) {
+    UIViewController *vc = nil;
+
+    if ([host isKindOfClass:[UIViewController class]]) {
+        vc = (UIViewController *)host;
+    }
+
+    if (!vc) {
+        vc = WCRTopVC();
+    }
+
+    while (vc.presentedViewController &&
+           !vc.presentedViewController.isBeingDismissed) {
+        vc = vc.presentedViewController;
+    }
+
+    return vc;
+}
+
+static void WCRShowNoGroupsAlert(id host) {
+    UIViewController *presenter = WCRPresenterForHost(host);
+    if (!presenter) return;
+
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"分组"
+                                            message:@"当前没有适用于这个会话的分组。"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+
+    [alert addAction:
+        [UIAlertAction actionWithTitle:@"好"
+                                 style:UIAlertActionStyleCancel
+                               handler:nil]];
+
+    [presenter presentViewController:alert
+                            animated:YES
+                          completion:nil];
+}
+
+static void WCRPresentGroupPicker(id host,
+                                  NSString *username,
+                                  id session,
+                                  UITableView *tableView,
+                                  NSIndexPath *indexPath) {
+    if (username.length == 0 || !session) return;
+
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    WCRefineGroupManager *mgr = WCRGroupManager();
+    if (!provider || !mgr) return;
+
+    NSUInteger scope = [provider groupScopeForNativeSession:session];
+    NSArray<WCRefineGroup *> *groups = WCRAvailableGroupsForScope(scope);
+
+    if (groups.count == 0) {
+        WCRShowNoGroupsAlert(host);
+        return;
+    }
+
+    UIViewController *presenter = WCRPresenterForHost(host);
+    if (!presenter) return;
+
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"分配到分组"
+                                            message:nil
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    for (WCRefineGroup *group in groups) {
+        NSString *title =
+            group.name.length > 0 ? group.name : @"未命名分组";
+        NSString *groupId = [group.groupId copy];
+
+        [sheet addAction:
+            [UIAlertAction actionWithTitle:title
+                                     style:UIAlertActionStyleDefault
+                                   handler:^(__unused UIAlertAction *action) {
+            // Add destination first. Only after success do we remove any other
+            // custom-group membership, avoiding a transient "belongs nowhere"
+            // state.
+            BOOL ok = [mgr addMember:username toGroup:groupId];
+            if (!ok) {
+                WCRAF_LOG(@"assign failed %@ -> %@", username, groupId);
+                return;
+            }
+
+            NSArray<NSString *> *existing =
+                [mgr groupIdsContainingMember:username] ?: @[];
+
+            NSSet<NSString *> *customIds = WCRCustomGroupIdSet();
+
+            for (NSString *existingGroupId in existing) {
+                if ([customIds containsObject:existingGroupId] &&
+                    ![existingGroupId isEqualToString:groupId]) {
+                    [mgr removeMember:username
+                             fromGroup:existingGroupId];
+                }
+            }
+
+            WCRPersistHeld(username, NO);
+
+            BOOL unreadKnown = NO;
+            BOOL hasUnread =
+                WCRSessionUnreadState(session, &unreadKnown);
+
+            WCRPersistSurfaced(username,
+                               unreadKnown && hasUnread);
+
+            WCRAF_LOG(@"assigned %@ -> %@", username, groupId);
+            WCRRefreshHomeDeferred(host,
+                                   @"active_front_assign_group");
+        }]];
+    }
+
+    [sheet addAction:
+        [UIAlertAction actionWithTitle:@"取消"
+                                 style:UIAlertActionStyleCancel
+                               handler:nil]];
+
+    UIPopoverPresentationController *popover =
+        sheet.popoverPresentationController;
+
+    if (popover) {
+        UITableViewCell *cell =
+            [tableView cellForRowAtIndexPath:indexPath];
+
+        popover.sourceView = cell ?: presenter.view;
+        popover.sourceRect =
+            cell ? cell.bounds : presenter.view.bounds;
+    }
+
+    [presenter presentViewController:sheet
+                            animated:YES
+                          completion:nil];
+}
+
 #pragma mark - Controller
 
 @interface WCRRightSwipeController : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
 - (void)handlePan:(UIPanGestureRecognizer *)pan;
-- (void)groupTapped:(UIButton *)sender;
+- (void)actionTapped:(UIButton *)sender;
 @end
 
 @implementation WCRRightSwipeController
@@ -338,6 +944,10 @@ static void WCRCloseOtherCells(UITableViewCell *exceptCell) {
     if (WCRBool(cell, kWCROpenKey)) {
         return fabs(velocity.x) > fabs(velocity.y) * 1.05;
     }
+
+    // Only rows with a real ActiveFront action may claim RIGHT swipe.
+    // This also refreshes 分组 / 保持 / 回组 immediately before the gesture.
+    if (!WCRPrepareActionForCell(cell)) return NO;
 
     // Critical rule: unopened cells are claimed ONLY for horizontal RIGHT pan.
     // A LEFT pan fails here and remains WeChat's original gesture path.
@@ -381,6 +991,11 @@ static void WCRCloseOtherCells(UITableViewCell *exceptCell) {
 
     switch (pan.state) {
         case UIGestureRecognizerStateBegan: {
+            if (!WCRPrepareActionForCell(cell)) {
+                WCRCloseCell(cell, NO);
+                break;
+            }
+
             WCRCloseOtherCells(cell);
             WCRLayoutAction(cell);
 
@@ -445,7 +1060,7 @@ static void WCRCloseOtherCells(UITableViewCell *exceptCell) {
     }
 }
 
-- (void)groupTapped:(UIButton *)sender {
+- (void)actionTapped:(UIButton *)sender {
     UIView *v = sender;
     UITableViewCell *cell = nil;
 
@@ -459,25 +1074,53 @@ static void WCRCloseOtherCells(UITableViewCell *exceptCell) {
 
     if (!cell) return;
 
-    UITableView *tableView = WCRTableForCell(cell);
-    NSIndexPath *indexPath =
-        tableView ? [tableView indexPathForCell:cell] : nil;
+    id host = nil;
+    UITableView *tableView = nil;
+    NSIndexPath *indexPath = nil;
+    id session = nil;
+    NSString *username = nil;
+
+    WCRRightActionKind kind =
+        WCRActionKindForCell(cell,
+                             &host,
+                             &tableView,
+                             &indexPath,
+                             &session,
+                             &username);
+
+    if (kind == WCRRightActionNone) {
+        WCRCloseCell(cell, YES);
+        return;
+    }
 
     WCRCloseCell(cell, YES);
 
-    NSString *message = [NSString stringWithFormat:
-        @"独立右滑手势已经触发「分组」。\n\n"
-         "Table: %@\n"
-         "Cell: %@\n"
-         "Row: %@\n\n"
-         "本版本只验证右滑 UI。\n"
-         "尚未修改任何 WCRefine 分组数据。",
-         WCRClassName(tableView),
-         WCRClassName(cell),
-         indexPath ? [NSString stringWithFormat:@"%ld",
-                      (long)indexPath.row] : @"<nil>"];
+    switch (kind) {
+        case WCRRightActionGroup: {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(0.18 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                WCRPresentGroupPicker(host,
+                                      username,
+                                      session,
+                                      tableView,
+                                      indexPath);
+            });
+            break;
+        }
 
-    WCRShow(@"RIGHT_GROUP_UI_V1_7", message);
+        case WCRRightActionKeep:
+            WCRSetHeld(username, YES, host);
+            break;
+
+        case WCRRightActionReturn:
+            WCRSetHeld(username, NO, host);
+            break;
+
+        case WCRRightActionNone:
+        default:
+            break;
+    }
 }
 
 @end
@@ -513,17 +1156,14 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     if (!pan) {
         UIView *actionView =
             [[UIView alloc] initWithFrame:CGRectZero];
-        actionView.backgroundColor =
-            [UIColor colorWithRed:56.0/255.0
-                            green:119.0/255.0
-                             blue:198.0/255.0
-                            alpha:1.0];
+        // User-tested v1.7 visual: keep the revealed action area transparent.
+        actionView.backgroundColor = [UIColor clearColor];
         actionView.hidden = YES;
         actionView.clipsToBounds = YES;
 
         UIButton *button =
             [UIButton buttonWithType:UIButtonTypeSystem];
-        [button setTitle:@"分组" forState:UIControlStateNormal];
+        [button setTitle:@"" forState:UIControlStateNormal];
         [button setTitleColor:[UIColor whiteColor]
                      forState:UIControlStateNormal];
         button.titleLabel.font =
@@ -531,7 +1171,7 @@ static void WCRAttachToCell(UITableViewCell *cell) {
         button.backgroundColor = [UIColor clearColor];
 
         [button addTarget:[WCRRightSwipeController shared]
-                   action:@selector(groupTapped:)
+                   action:@selector(actionTapped:)
          forControlEvents:UIControlEventTouchUpInside];
 
         [actionView addSubview:button];
@@ -573,10 +1213,300 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     }
 
     WCRLayoutAction(cell);
+    WCRPrepareActionForCell(cell);
 
     // Re-run this because WeChat may add/recreate its cell recognizers later.
     WCRWirePanPriority(cell, pan);
     WCRWirePanPriority(cell.contentView, pan);
+}
+
+
+#pragma mark - ActiveFront projection runtime hooks
+
+static BOOL (*orig_configExcludeUnread)(id, SEL) = NULL;
+static BOOL (*orig_shouldExclude)(id, SEL, id) = NULL;
+static void (*orig_noteIncoming)(id, SEL, NSString *) = NULL;
+static void (*orig_noteRead)(id, SEL, NSString *) = NULL;
+static void (*orig_activeViewDidAppear)(id, SEL, BOOL) = NULL;
+
+static BOOL gWCRHookConfig = NO;
+static BOOL gWCRHookProvider = NO;
+static BOOL gWCRHookIncoming = NO;
+static BOOL gWCRHookRead = NO;
+static BOOL gWCRHookHome = NO;
+static BOOL gWCRBootstrapCloseScheduled = NO;
+
+static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
+    BOOL original =
+        orig_configExcludeUnread ?
+            orig_configExcludeUnread(self, _cmd) :
+            NO;
+
+    return original ||
+           gWCRBootstrapUnreadFallbackOpen ||
+           WCRHasAnyActiveFrontProjection();
+}
+
+static BOOL hook_shouldExclude(id self, SEL _cmd, id session) {
+    BOOL originalDecision =
+        orig_shouldExclude ?
+            orig_shouldExclude(self, _cmd, session) :
+            NO;
+
+    NSString *username =
+        [(WCRefineGroupDataProvider *)self
+            usernameForNativeObject:session];
+
+    if (username.length == 0) {
+        return originalDecision;
+    }
+
+    if (WCRIsHeld(username) &&
+        WCRIsInCustomGroup(username)) {
+        return YES;
+    }
+
+    if (WCRIsSurfaced(username) &&
+        WCRIsInCustomGroup(username)) {
+        BOOL unreadKnown = NO;
+        BOOL hasUnread =
+            WCRSessionUnreadState(session, &unreadKnown);
+
+        if (!unreadKnown || hasUnread) {
+            return YES;
+        }
+
+        WCRPersistSurfaced(username, NO);
+        return NO;
+    }
+
+    if (gWCRBootstrapUnreadFallbackOpen &&
+        WCRIsInCustomGroup(username)) {
+        BOOL unreadKnown = NO;
+        BOOL hasUnread =
+            WCRSessionUnreadState(session, &unreadKnown);
+
+        if ((unreadKnown && hasUnread) ||
+            (!unreadKnown && originalDecision)) {
+            WCRPersistSurfaced(username, YES);
+            return YES;
+        }
+    }
+
+    return originalDecision;
+}
+
+static void hook_noteIncoming(id self,
+                              SEL _cmd,
+                              NSString *username) {
+    BOOL valid =
+        [username isKindOfClass:[NSString class]] &&
+        username.length > 0;
+
+    BOOL grouped =
+        valid && WCRIsInCustomGroup(username);
+
+    if (grouped) {
+        WCRPersistSurfaced(username, YES);
+        WCRAF_LOG(@"incoming surfaced: %@", username);
+    }
+
+    if (orig_noteIncoming) {
+        orig_noteIncoming(self, _cmd, username);
+    }
+
+    if (grouped) {
+        WCRRefreshHomeGlobal(@"active_front_incoming");
+    }
+}
+
+static void hook_noteRead(id self,
+                          SEL _cmd,
+                          NSString *username) {
+    BOOL valid =
+        [username isKindOfClass:[NSString class]] &&
+        username.length > 0;
+
+    BOOL wasSurfaced =
+        valid && WCRIsSurfaced(username);
+
+    if (wasSurfaced) {
+        WCRPersistSurfaced(username, NO);
+        WCRAF_LOG(@"read consumed surfaced: %@", username);
+    }
+
+    if (orig_noteRead) {
+        orig_noteRead(self, _cmd, username);
+    }
+
+    if (wasSurfaced) {
+        WCRRefreshHomeGlobal(@"active_front_read");
+    }
+}
+
+static void hook_activeViewDidAppear(id self,
+                                     SEL _cmd,
+                                     BOOL animated) {
+    if (orig_activeViewDidAppear) {
+        orig_activeViewDidAppear(self, _cmd, animated);
+    }
+
+    WCRPruneStaleActiveFrontState();
+    WCRRefreshHomeDeferred(self,
+                           @"active_front_home_appear");
+}
+
+static BOOL WCRInstallInstanceHook(Class cls,
+                                   SEL sel,
+                                   IMP replacement,
+                                   IMP *originalOut) {
+    if (!cls || !sel || !replacement) return NO;
+
+    Method resolved = class_getInstanceMethod(cls, sel);
+    if (!resolved) return NO;
+
+    IMP current = method_getImplementation(resolved);
+    if (current == replacement) {
+        return YES;
+    }
+
+    const char *types = method_getTypeEncoding(resolved);
+
+    // If the method is inherited, add an override to this exact class rather
+    // than mutating the superclass implementation globally.
+    BOOL added =
+        class_addMethod(cls, sel, replacement, types);
+
+    if (added) {
+        if (originalOut && !*originalOut) {
+            *originalOut = current;
+        }
+        return YES;
+    }
+
+    IMP previous =
+        class_replaceMethod(cls,
+                            sel,
+                            replacement,
+                            types);
+
+    if (originalOut && !*originalOut) {
+        *originalOut = previous ? previous : current;
+    }
+
+    return YES;
+}
+
+static void WCRScheduleBootstrapUnreadFallbackClose(void) {
+    if (gWCRBootstrapCloseScheduled) return;
+    gWCRBootstrapCloseScheduled = YES;
+
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW,
+                      (int64_t)(kWCRBootstrapUnreadFallbackSeconds *
+                                NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+            if (!gWCRBootstrapUnreadFallbackOpen) return;
+
+            gWCRBootstrapUnreadFallbackOpen = NO;
+
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:kWCRHomeGroupsDidChangeNotification
+                              object:nil];
+
+            WCRAF_LOG(@"bootstrap unread fallback closed");
+        });
+}
+
+static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
+    Class config =
+        NSClassFromString(@"WCRefineConfig");
+    Class provider =
+        NSClassFromString(@"WCRefineGroupDataProvider");
+    Class quickRuntime =
+        NSClassFromString(@"WCRQuickChatRuntime");
+    Class mainFrame =
+        NSClassFromString(@"NewMainFrameViewController");
+
+    if (!gWCRHookConfig && config) {
+        gWCRHookConfig =
+            WCRInstallInstanceHook(
+                config,
+                @selector(homeGroupingExcludeUnreadEnabled),
+                (IMP)hook_configExcludeUnread,
+                (IMP *)&orig_configExcludeUnread);
+    }
+
+    if (!gWCRHookProvider && provider) {
+        gWCRHookProvider =
+            WCRInstallInstanceHook(
+                provider,
+                @selector(shouldExcludeNativeSessionFromGroupingForUnreadPolicy:),
+                (IMP)hook_shouldExclude,
+                (IMP *)&orig_shouldExclude);
+    }
+
+    if (!gWCRHookIncoming && quickRuntime) {
+        gWCRHookIncoming =
+            WCRInstallInstanceHook(
+                quickRuntime,
+                @selector(noteIncomingMessageForUsername:),
+                (IMP)hook_noteIncoming,
+                (IMP *)&orig_noteIncoming);
+    }
+
+    if (!gWCRHookRead && quickRuntime) {
+        gWCRHookRead =
+            WCRInstallInstanceHook(
+                quickRuntime,
+                @selector(noteReadForUsername:),
+                (IMP)hook_noteRead,
+                (IMP *)&orig_noteRead);
+    }
+
+    if (!gWCRHookHome && mainFrame) {
+        gWCRHookHome =
+            WCRInstallInstanceHook(
+                mainFrame,
+                @selector(viewDidAppear:),
+                (IMP)hook_activeViewDidAppear,
+                (IMP *)&orig_activeViewDidAppear);
+    }
+
+    if (gWCRHookProvider) {
+        WCRScheduleBootstrapUnreadFallbackClose();
+    }
+
+    BOOL allInstalled =
+        gWCRHookConfig &&
+        gWCRHookProvider &&
+        gWCRHookIncoming &&
+        gWCRHookRead &&
+        gWCRHookHome;
+
+    if (allInstalled) {
+        WCRAF_LOG(@"business hooks installed config=1 provider=1 incoming=1 read=1 home=1");
+        WCRPruneStaleActiveFrontState();
+        WCRRefreshHomeGlobal(@"active_front_hooks_installed");
+        return;
+    }
+
+    if (attemptsRemaining == 0) {
+        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d incoming=%d read=%d home=%d",
+                  gWCRHookConfig,
+                  gWCRHookProvider,
+                  gWCRHookIncoming,
+                  gWCRHookRead,
+                  gWCRHookHome);
+        return;
+    }
+
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW,
+                      (int64_t)(0.25 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+            WCRTryInstallBusinessHooks(attemptsRemaining - 1);
+        });
 }
 
 #pragma mark - Scan
@@ -588,7 +1518,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_7 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_8 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -609,16 +1539,20 @@ static void WCRScan(BOOL showReady) {
 
             NSString *message = [NSString stringWithFormat:
                 @"Table: %@\n"
-                 "Visible attached cells: %lu\n\n"
-                 "v1.7 结构：\n"
-                 "右滑 = WCRefine 独立 right-only pan\n"
-                 "左滑 = 微信原手势\n\n"
-                 "分组底板默认 hidden，只有 WCRefine 右滑开始后才显示。\n"
-                 "点击「分组」仍只弹测试框。",
+                 "Visible attached cells: %lu\n"
+                 "Hooks: C%d P%d I%d R%d H%d\n\n"
+                 "v1.8：右滑 = 分组 / 保持 / 回组\n"
+                 "左滑继续使用微信原生菜单。\n"
+                 "右滑区域保持透明底色。",
                  WCRClassName(tableView),
-                 (unsigned long)attached];
+                 (unsigned long)attached,
+                 gWCRHookConfig,
+                 gWCRHookProvider,
+                 gWCRHookIncoming,
+                 gWCRHookRead,
+                 gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_7 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_8 Ready", message);
         }
     });
 }
@@ -637,11 +1571,28 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(3.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            WCRScan(YES);
-            WCRRepeat(180);
-        });
+        WCRAF_LOG(@"dylib loaded; starting v1.8");
+
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW,
+                          (int64_t)(3.0 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+                WCRScan(NO);
+                WCRRepeat(180);
+            });
+
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW,
+                          (int64_t)(4.0 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+                WCRTryInstallBusinessHooks(80);
+            });
+
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW,
+                          (int64_t)(5.5 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+                WCRScan(YES);
+            });
     }
 }
