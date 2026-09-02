@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_GROUP_UI_V1_8_REAL_ACTIONS.m
-// WCRefine ActiveFront - stable independent RIGHT swipe + real WCRefine actions.
+// ActiveFront.RIGHT_GROUP_UI_V1_8_1_REFRESH_FIX.m
+// WCRefine ActiveFront - v1.8 real actions + right-swipe reset/refresh fix.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -29,10 +29,11 @@ static const void *kWCRButtonKey       = &kWCRButtonKey;
 static const void *kWCROpenKey         = &kWCROpenKey;
 static const void *kWCRTrackingKey     = &kWCRTrackingKey;
 static const void *kWCRStartOffsetKey  = &kWCRStartOffsetKey;
+static const void *kWCRBaseTransformKey = &kWCRBaseTransformKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.8";
+static NSString * const kWCRAFVersion = @"1.8.1";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -271,9 +272,42 @@ static void WCRSetFloat(id obj, const void *key, CGFloat value) {
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static BOOL WCRHasBaseTransform(UITableViewCell *cell) {
+    return cell && objc_getAssociatedObject(cell, kWCRBaseTransformKey) != nil;
+}
+
+static void WCRCaptureBaseTransform(UITableViewCell *cell) {
+    if (!cell) return;
+
+    NSValue *value =
+        [NSValue valueWithCGAffineTransform:cell.contentView.transform];
+
+    objc_setAssociatedObject(cell,
+                             kWCRBaseTransformKey,
+                             value,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static CGAffineTransform WCRBaseTransform(UITableViewCell *cell) {
+    NSValue *value =
+        cell ? objc_getAssociatedObject(cell, kWCRBaseTransformKey) : nil;
+
+    if (value) {
+        return [value CGAffineTransformValue];
+    }
+
+    return cell ? cell.contentView.transform : CGAffineTransformIdentity;
+}
+
 static void WCRSetContentOffset(UITableViewCell *cell, CGFloat x) {
     if (!cell) return;
-    cell.contentView.transform = CGAffineTransformMakeTranslation(x, 0.0);
+
+    // Preserve WeChat's own baseline transform. v1.8 used an absolute
+    // CGAffineTransformMakeTranslation(), which could erase WeChat's layout
+    // transform and leave a row shifted left until the table refreshed.
+    CGAffineTransform transform = WCRBaseTransform(cell);
+    transform.tx += x;
+    cell.contentView.transform = transform;
 }
 
 static void WCRLayoutAction(UITableViewCell *cell) {
@@ -295,9 +329,17 @@ static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
     if (!cell) return;
 
     UIView *actionView = objc_getAssociatedObject(cell, kWCRActionViewKey);
+    UIButton *button = objc_getAssociatedObject(cell, kWCRButtonKey);
+
     WCRSetBool(cell, kWCROpenKey, NO);
     WCRSetBool(cell, kWCRTrackingKey, NO);
     WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
+
+    // Hide the action immediately instead of waiting for the spring
+    // completion. The old completion could be interrupted by a new gesture /
+    // table refresh, leaving stale “保持/回组/分组” text visible.
+    actionView.hidden = YES;
+    [button setTitle:@"" forState:UIControlStateNormal];
 
     void (^changes)(void) = ^{
         WCRSetContentOffset(cell, 0.0);
@@ -305,9 +347,15 @@ static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
 
     void (^finish)(BOOL) = ^(BOOL finished) {
         (void)finished;
+
         if (!WCRBool(cell, kWCROpenKey) &&
             !WCRBool(cell, kWCRTrackingKey)) {
             actionView.hidden = YES;
+            [button setTitle:@"" forState:UIControlStateNormal];
+
+            // Re-apply the exact WeChat baseline after the spring finishes.
+            cell.contentView.transform = WCRBaseTransform(cell);
+            [cell setNeedsLayout];
         }
     };
 
@@ -750,6 +798,7 @@ static NSString *WCRTitleForActionKind(WCRRightActionKind kind) {
 static BOOL WCRPrepareActionForCell(UITableViewCell *cell) {
     if (!cell) return NO;
 
+    UIView *actionView = objc_getAssociatedObject(cell, kWCRActionViewKey);
     UIButton *button = objc_getAssociatedObject(cell, kWCRButtonKey);
     if (!button) return NO;
 
@@ -758,6 +807,11 @@ static BOOL WCRPrepareActionForCell(UITableViewCell *cell) {
 
     NSString *title = WCRTitleForActionKind(kind);
     if (title.length == 0) {
+        // Always clear stale UI even when the bookkeeping flags already say
+        // “closed”. This makes cell reuse / interrupted animation self-heal.
+        actionView.hidden = YES;
+        [button setTitle:@"" forState:UIControlStateNormal];
+
         if (WCRBool(cell, kWCROpenKey) ||
             WCRBool(cell, kWCRTrackingKey)) {
             WCRCloseCell(cell, NO);
@@ -1000,6 +1054,13 @@ static void WCRPresentGroupPicker(id host,
             WCRLayoutAction(cell);
 
             BOOL wasOpen = WCRBool(cell, kWCROpenKey);
+
+            // Capture WeChat's actual closed-state transform immediately
+            // before our first right-swipe. Never assume identity.
+            if (!wasOpen) {
+                WCRCaptureBaseTransform(cell);
+            }
+
             CGFloat startOffset = wasOpen ? kWCRActionWidth : 0.0;
 
             WCRSetFloat(cell, kWCRStartOffsetKey, startOffset);
@@ -1210,6 +1271,16 @@ static void WCRAttachToCell(UITableViewCell *cell) {
         WCRSetBool(cell, kWCROpenKey, NO);
         WCRSetBool(cell, kWCRTrackingKey, NO);
         WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
+    }
+
+    // Seed the baseline only when the cell is clearly not in WeChat's
+    // left-swipe state. It will be refreshed again at every new WCRefine
+    // right-swipe begin.
+    if (!WCRHasBaseTransform(cell) &&
+        !WCRBool(cell, kWCROpenKey) &&
+        !WCRBool(cell, kWCRTrackingKey) &&
+        cell.contentView.transform.tx >= -1.0) {
+        WCRCaptureBaseTransform(cell);
     }
 
     WCRLayoutAction(cell);
@@ -1518,7 +1589,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_8 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_8_1 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -1541,7 +1612,7 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.8：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.8.1：右滑 = 分组 / 保持 / 回组\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
                  WCRClassName(tableView),
@@ -1552,7 +1623,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_8 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_8_1 Ready", message);
         }
     });
 }
@@ -1571,7 +1642,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.8");
+        WCRAF_LOG(@"dylib loaded; starting v1.8.1");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
