@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_GROUP_UI_V1_8_2_REUSE_RESET_FIX.m
-// WCRefine ActiveFront - v1.8.2 cell-reuse / auto-return UI reset fix.
+// ActiveFront.RIGHT_v1_8_3_LEFT_MENU_GUARD.m
+// WCRefine ActiveFront - v1.8.3: protect WeChat left-swipe close gesture.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -34,7 +34,7 @@ static const void *kWCRBoundUsernameKey = &kWCRBoundUsernameKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.8.2";
+static NSString * const kWCRAFVersion = @"1.8.3";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -1034,6 +1034,99 @@ static void WCRPresentGroupPicker(id host,
                           completion:nil];
 }
 
+
+#pragma mark - WeChat left-swipe menu guard
+
+static BOOL WCRSwipeActionViewVisibleRecursive(UIView *view,
+                                               UIView *ourActionView) {
+    if (!view) return NO;
+
+    // Never identify WCRefine's own left-side action view as a WeChat menu.
+    if (view == ourActionView) return NO;
+
+    if (!view.hidden &&
+        view.alpha > 0.01 &&
+        CGRectGetWidth(view.bounds) > 1.0 &&
+        CGRectGetHeight(view.bounds) > 1.0) {
+
+        NSString *className =
+            [NSStringFromClass([view class]) lowercaseString];
+
+        // Covers the UIKit swipe-action containers used across iOS versions.
+        // Examples include:
+        // _UISwipeActionPullView
+        // UISwipeActionStandardButton
+        // UITableViewCellSwipeContainerView
+        // UITableViewCellDeleteConfirmationView
+        if ([className containsString:@"swipeaction"] ||
+            [className containsString:@"swipecontainer"] ||
+            [className containsString:@"deleteconfirmation"]) {
+            return YES;
+        }
+    }
+
+    for (UIView *subview in view.subviews) {
+        if (WCRSwipeActionViewVisibleRecursive(subview, ourActionView)) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL WCRWeChatLeftSwipeMenuVisible(UITableViewCell *cell) {
+    if (!cell) return NO;
+
+    UIView *ourActionView =
+        objc_getAssociatedObject(cell, kWCRActionViewKey);
+
+    // Older / simpler implementations move contentView itself.
+    CGAffineTransform t = cell.contentView.transform;
+    if (t.tx < -1.0) {
+        return YES;
+    }
+
+    if (CGRectGetMinX(cell.contentView.frame) < -1.0) {
+        return YES;
+    }
+
+    // During an animation the model-layer transform may already be reset while
+    // the presentation layer is still visibly shifted.
+    CALayer *presentation = cell.contentView.layer.presentationLayer;
+    if (presentation) {
+        CATransform3D pt = presentation.transform;
+        if (pt.m41 < -1.0) {
+            return YES;
+        }
+    }
+
+    // Modern UITableView swipe actions usually live in private sibling
+    // containers, so contentView itself can remain at tx == 0.
+    if (WCRSwipeActionViewVisibleRecursive(cell, ourActionView)) {
+        return YES;
+    }
+
+    return NO;
+}
+
+static void WCRSuppressOurActionForLeftMenu(UITableViewCell *cell) {
+    if (!cell) return;
+
+    UIView *actionView =
+        objc_getAssociatedObject(cell, kWCRActionViewKey);
+    UIButton *button =
+        objc_getAssociatedObject(cell, kWCRButtonKey);
+
+    actionView.hidden = YES;
+    [button setTitle:@"" forState:UIControlStateNormal];
+
+    // Do not touch WeChat's transform here. The whole point is to let
+    // WeChat's own rightward close gesture finish normally.
+    WCRSetBool(cell, kWCROpenKey, NO);
+    WCRSetBool(cell, kWCRTrackingKey, NO);
+    WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
+}
+
 #pragma mark - Controller
 
 @interface WCRRightSwipeController : NSObject <UIGestureRecognizerDelegate>
@@ -1071,6 +1164,17 @@ static void WCRPresentGroupPicker(id host,
 
     CGPoint velocity = [pan velocityInView:cell];
 
+    // Highest-priority guard:
+    // if WeChat's native LEFT-swipe menu is already visible, a rightward pan
+    // means "close WeChat's menu", not "open WCRefine's right-swipe menu".
+    //
+    // Our recognizer must fail before it claims the gesture, allowing the
+    // original WeChat recognizer (which waits for ours to fail) to proceed.
+    if (WCRWeChatLeftSwipeMenuVisible(cell)) {
+        WCRSuppressOurActionForLeftMenu(cell);
+        return NO;
+    }
+
     // If our action is already open, allow a horizontal drag in either
     // direction so the user can drag left to close it.
     if (WCRBool(cell, kWCROpenKey)) {
@@ -1086,9 +1190,10 @@ static void WCRPresentGroupPicker(id host,
     if (velocity.x <= 30.0) return NO;
     if (fabs(velocity.x) <= fabs(velocity.y) * 1.12) return NO;
 
-    // If WeChat currently has the content shifted left, do not steal the
-    // rightward gesture that the user may be using to close WeChat's own menu.
-    if (cell.contentView.transform.tx < -1.0) {
+    // Secondary safeguard for versions where the native menu starts
+    // shifting after shouldBegin was queried.
+    if (WCRWeChatLeftSwipeMenuVisible(cell)) {
+        WCRSuppressOurActionForLeftMenu(cell);
         return NO;
     }
 
@@ -1704,7 +1809,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_8_2 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_8_3 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -1727,7 +1832,7 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.8.2：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.8.3：右滑 = 分组 / 保持 / 回组\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
                  WCRClassName(tableView),
@@ -1738,7 +1843,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_8_2 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_8_3 Ready", message);
         }
     });
 }
@@ -1757,7 +1862,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.8.2");
+        WCRAF_LOG(@"dylib loaded; starting v1.8.3");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
