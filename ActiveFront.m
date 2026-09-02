@@ -1,7 +1,9 @@
-// ActiveFront.RIGHT_v1_9_3_RELIABILITY_AND_OTHER_LAYOUT_FIX.m
-// WCRefine ActiveFront - v1.9.3 reliability fix built on the v1.9.2 stable state machine.
-// Fixes: late/reused home-row pan attachment, live-session fallback, and final-pass "其它" nickname layout.
-// ActiveFront 分组/保持/回组 state semantics remain unchanged from v1.9.2.
+// ActiveFront.RIGHT_v1_9_4_DIRECT_CELLDATA_AND_OTHER_LABEL_FIX.m
+// WCRefine ActiveFront - v1.9.4 candidate built on the v1.9.2 stable state machine.
+// Reliability change: the visible NewMainFrameCell's confirmed m_cellData is the
+// primary row identity; WCRefine's indexPath resolver is fallback only.
+// Layout change: only sys_other group-detail cells get final-pass collision
+// handling for the real visible @nickname UILabel discovered from the view tree.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -39,10 +41,11 @@ static const void *kWCRCanonicalUsernameKey = &kWCRCanonicalUsernameKey;
 static const void *kWCRCanonicalScopeKey = &kWCRCanonicalScopeKey;
 static const void *kWCRDebugLongPressKey = &kWCRDebugLongPressKey;
 static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
+static const void *kWCROtherNicknamePatchScheduledKey = &kWCROtherNicknamePatchScheduledKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.9.3";
+static NSString * const kWCRAFVersion = @"1.9.4";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -105,11 +108,15 @@ static void WCRAFLog(NSString *format, ...) {
 - (void)viewDidAppear:(BOOL)animated;
 @end
 
-// WCRefine's own group-detail list controller.  Only the special groupId
-// "sys_other" is touched by the nickname overlap guard below.
 @interface WCRGroupingSessionListViewController : UIViewController
 @property(nonatomic, copy) NSString *groupId;
 @property(nonatomic, strong) UITableView *tableView;
+@end
+
+// Confirmed private accessor used by WCRefine/WeChat cell code.  The runtime
+// check below keeps this declaration harmless on builds where it is absent.
+@interface UITableViewCell (WCRRenderedCellDataPrivate)
+- (id)cellData;
 @end
 
 typedef NS_ENUM(NSInteger, WCRRightActionKind) {
@@ -119,14 +126,50 @@ typedef NS_ENUM(NSInteger, WCRRightActionKind) {
     WCRRightActionReturn
 };
 
-// Forward declaration: refresh hooks schedule short post-refresh reconciliations
-// so rows inserted/reused after the startup scan window still receive ActiveFront.
-static void WCRScan(BOOL showReady);
-
 #pragma mark - Helpers
 
 static NSString *WCRClassName(id obj) {
     return obj ? NSStringFromClass([obj class]) : @"<nil>";
+}
+
+// WCRefine's own runtime hook code reads `m_cellData` from the rendered
+// NewMainFrameCell.  Reading that confirmed object ivar is more exact than
+// projecting the current indexPath back through a snapshot that may be in the
+// middle of a reorder.
+static id WCRObjectIvarNamed(id object, const char *ivarName) {
+    if (!object || !ivarName || ivarName[0] == '\0') return nil;
+
+    Class cls = [object class];
+    while (cls) {
+        Ivar ivar = class_getInstanceVariable(cls, ivarName);
+        if (ivar) {
+            const char *type = ivar_getTypeEncoding(ivar);
+            if (type && type[0] == '@') {
+                return object_getIvar(object, ivar);
+            }
+            return nil;
+        }
+        cls = class_getSuperclass(cls);
+    }
+    return nil;
+}
+
+static id WCRRenderedCellData(UITableViewCell *cell) {
+    if (!cell) return nil;
+
+    // Prefer the real accessor when this build exposes it.  WCRefine's own
+    // group-detail code calls `cellData` on NewMainFrameCell.
+    if ([cell respondsToSelector:@selector(cellData)]) {
+        id accessorValue = [cell cellData];
+        if (accessorValue) return accessorValue;
+    }
+
+    // Fall back to the confirmed backing ivar used by the runtime hook.
+    id cellData = WCRObjectIvarNamed(cell, "m_cellData");
+    if (!cellData) {
+        cellData = WCRObjectIvarNamed(cell, "_m_cellData");
+    }
+    return cellData;
 }
 
 static BOOL WCRIsMainFrameTable(UITableView *tableView) {
@@ -162,17 +205,6 @@ static UITableView *WCRTableForCell(UITableViewCell *cell) {
     return nil;
 }
 
-static UITableViewCell *WCRCellForDescendantView(UIView *view) {
-    UIView *v = view;
-    while (v) {
-        if ([v isKindOfClass:[UITableViewCell class]]) {
-            return (UITableViewCell *)v;
-        }
-        v = v.superview;
-    }
-    return nil;
-}
-
 
 static UIViewController *WCRViewControllerForView(UIView *view) {
     UIResponder *responder = view;
@@ -197,251 +229,6 @@ static BOOL WCRIsGroupingSessionListController(id controller) {
 
     return [WCRClassName(controller)
         isEqualToString:@"WCRGroupingSessionListViewController"];
-}
-
-
-#pragma mark - "其它" group nickname overlap guard (layout only)
-
-static NSString * const kWCROtherGroupingId = @"sys_other";
-static const void *kWCROtherNickCollapsedKey = &kWCROtherNickCollapsedKey;
-
-static id WCRSafeValueForKey(id object, NSString *key) {
-    if (!object || key.length == 0) return nil;
-
-    @try {
-        return [object valueForKey:key];
-    } @catch (__unused NSException *exception) {
-        return nil;
-    }
-}
-
-static UIView *WCRFindSubviewByClassNames(UIView *root,
-                                          NSSet<NSString *> *names) {
-    if (!root || names.count == 0) return nil;
-
-    for (UIView *subview in root.subviews) {
-        if ([names containsObject:NSStringFromClass([subview class])]) {
-            return subview;
-        }
-
-        UIView *nested = WCRFindSubviewByClassNames(subview, names);
-        if (nested) return nested;
-    }
-
-    return nil;
-}
-
-static UIView *WCROtherItemViewForCell(UITableViewCell *cell) {
-    if (!cell) return nil;
-
-    id direct = WCRSafeValueForKey(cell, @"m_itemView");
-    if ([direct isKindOfClass:[UIView class]]) {
-        return (UIView *)direct;
-    }
-
-    // Mirror the fallback used by WCRefine itself when m_itemView is not
-    // directly readable. This stays local to the group-detail cell.
-    NSSet<NSString *> *classNames =
-        [NSSet setWithObjects:@"MainFrameItemView", @"FakeMainFrameItemView", nil];
-
-    UIView *root = cell.contentView ?: (UIView *)cell;
-    return WCRFindSubviewByClassNames(root, classNames);
-}
-
-static UILabel *WCROtherLabelForKey(UIView *itemView, NSString *key) {
-    id value = WCRSafeValueForKey(itemView, key);
-    if ([value isKindOfClass:[UILabel class]]) {
-        return (UILabel *)value;
-    }
-    return nil;
-}
-
-static BOOL WCRLabelHasText(UILabel *label) {
-    return label.text.length > 0 || label.attributedText.length > 0;
-}
-
-static CGFloat WCRSingleLineNaturalLabelWidth(UILabel *label) {
-    if (!label) return 0.0;
-
-    CGFloat width = 0.0;
-    NSAttributedString *attributed = label.attributedText;
-
-    if (attributed.length > 0) {
-        CGRect rect =
-            [attributed boundingRectWithSize:CGSizeMake(CGFLOAT_MAX,
-                                                         MAX(ceil(label.bounds.size.height), 64.0))
-                                  options:(NSStringDrawingUsesLineFragmentOrigin |
-                                           NSStringDrawingUsesFontLeading)
-                                  context:nil];
-        width = ceil(rect.size.width);
-    } else if (label.text.length > 0) {
-        UIFont *font = label.font ?: [UIFont systemFontOfSize:17.0];
-        width = ceil([label.text sizeWithAttributes:@{NSFontAttributeName: font}].width);
-    }
-
-    if (!isfinite(width) || width < 0.0) return 0.0;
-    return width + 1.0; // avoid a one-pixel glyph clip at fractional scales
-}
-
-static BOOL WCRIsOtherGroupingController(id controller) {
-    if (!WCRIsGroupingSessionListController(controller)) return NO;
-
-    NSString *groupId = nil;
-    if ([controller respondsToSelector:@selector(groupId)]) {
-        groupId = [(WCRGroupingSessionListViewController *)controller groupId];
-    }
-    if (![groupId isKindOfClass:[NSString class]]) {
-        groupId = WCRSafeValueForKey(controller, @"groupId");
-    }
-
-    return [groupId isKindOfClass:[NSString class]] &&
-           [groupId isEqualToString:kWCROtherGroupingId];
-}
-
-static BOOL WCRCellBelongsToOtherGrouping(UITableViewCell *cell) {
-    if (!cell) return NO;
-
-    UITableView *tableView = WCRTableForCell(cell);
-    if (!tableView) return NO;
-
-    UIViewController *owner = WCRViewControllerForView(tableView);
-    if (WCRIsOtherGroupingController(owner)) return YES;
-
-    return WCRIsOtherGroupingController(tableView.delegate);
-}
-
-static void WCRAdjustOtherGroupingNicknameCell(UITableViewCell *cell) {
-    if (!cell) return;
-
-    UIView *itemView = WCROtherItemViewForCell(cell);
-    if (!itemView) return;
-
-    UILabel *nameLabel = WCROtherLabelForKey(itemView, @"m_nameLabel");
-    UILabel *nickLabel = WCROtherLabelForKey(itemView, @"m_nickNameLabel");
-    UILabel *timeLabel = WCROtherLabelForKey(itemView, @"m_timeLabel");
-
-    // Respect WCRefine's own display-mode / visibility decisions. This guard
-    // only resolves a horizontal collision; it never turns a nickname on.
-    if (!nameLabel || !nickLabel ||
-        nameLabel.hidden || nickLabel.hidden ||
-        nameLabel.alpha <= 0.01 || nickLabel.alpha <= 0.01 ||
-        !WCRLabelHasText(nameLabel) || !WCRLabelHasText(nickLabel)) {
-        return;
-    }
-
-    CGRect nameFrame = nameLabel.frame;
-    CGRect nickFrame = nickLabel.frame;
-
-    if (CGRectIsNull(nameFrame) || CGRectIsInfinite(nameFrame) ||
-        CGRectIsNull(nickFrame) || CGRectIsInfinite(nickFrame) ||
-        nameFrame.size.height <= 0.0 || nickFrame.size.height <= 0.0) {
-        return;
-    }
-
-    // Only touch the same-line nickname mode that can overlap the primary
-    // title. Vertical / below-title nickname modes are left exactly native.
-    CGFloat rowDelta = fabs(CGRectGetMidY(nameFrame) - CGRectGetMidY(nickFrame));
-    CGFloat sameLineTolerance = MAX(8.0,
-                                    MIN(nameFrame.size.height, nickFrame.size.height) * 0.55);
-    if (rowDelta > sameLineTolerance) return;
-
-    CGFloat nameNaturalWidth = WCRSingleLineNaturalLabelWidth(nameLabel);
-    CGFloat nickNaturalWidth = WCRSingleLineNaturalLabelWidth(nickLabel);
-    if (nameNaturalWidth <= 0.0 || nickNaturalWidth <= 0.0) return;
-
-    CGFloat startX = CGRectGetMinX(nameFrame);
-    CGFloat rightBoundary = CGRectGetWidth(itemView.bounds) - 12.0;
-
-    if (timeLabel && !timeLabel.hidden && timeLabel.alpha > 0.01) {
-        CGRect timeFrame = timeLabel.frame;
-        if (!CGRectIsNull(timeFrame) && !CGRectIsInfinite(timeFrame) &&
-            timeFrame.size.width > 1.0 &&
-            CGRectGetMinX(timeFrame) > startX + 24.0) {
-            // The date/time label has higher priority: never move or resize it.
-            rightBoundary = MIN(rightBoundary, CGRectGetMinX(timeFrame) - 6.0);
-        }
-    }
-
-    CGFloat availableWidth = floor(rightBoundary - startX);
-    if (!isfinite(availableWidth) || availableWidth <= 24.0) return;
-
-    BOOL wasCollapsed =
-        [objc_getAssociatedObject(nickLabel, kWCROtherNickCollapsedKey) boolValue];
-
-    // Preserve spacing from a normal native row whenever the frame still
-    // contains a sane gap. If this row is already colliding/collapsed, use a
-    // conservative four-point gap rather than deriving a negative/huge gap.
-    CGFloat currentGap = CGRectGetMinX(nickFrame) - (startX + nameNaturalWidth);
-    CGFloat spacing = (currentGap >= 2.0 && currentGap <= 16.0) ? currentGap : 4.0;
-
-    // Pixel-for-pixel no-op for ordinary short rows. `wasCollapsed` bypasses
-    // this return once after reuse so a cell previously collapsed for a very
-    // long username can self-heal for a shorter row.
-    if (!wasCollapsed &&
-        startX + nameNaturalWidth + spacing <= CGRectGetMinX(nickFrame)) {
-        return;
-    }
-
-    nameLabel.numberOfLines = 1;
-    nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    nickLabel.numberOfLines = 1;
-    nickLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-
-    CGFloat nickFontSize = nickLabel.font ? nickLabel.font.pointSize : 14.0;
-    CGFloat minimumUsefulNickWidth =
-        MAX(34.0, MIN(nickNaturalWidth, nickFontSize * 2.5));
-
-    if (nameNaturalWidth + spacing + nickNaturalWidth <= availableWidth) {
-        // Both fit: keep the primary title intact and place nickname after it.
-        nameFrame.size.width = nameNaturalWidth;
-        nickFrame.origin.x = startX + nameNaturalWidth + spacing;
-        nickFrame.size.width = nickNaturalWidth;
-        objc_setAssociatedObject(nickLabel,
-                                 kWCROtherNickCollapsedKey,
-                                 nil,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    } else if (nameNaturalWidth + spacing + minimumUsefulNickWidth <= availableWidth) {
-        // Mild shortage: primary title wins; orange nickname gets only the
-        // remainder and truncates at its tail.
-        nameFrame.size.width = nameNaturalWidth;
-        nickFrame.origin.x = startX + nameNaturalWidth + spacing;
-        nickFrame.size.width = MAX(0.0, rightBoundary - nickFrame.origin.x);
-        objc_setAssociatedObject(nickLabel,
-                                 kWCROtherNickCollapsedKey,
-                                 nil,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    } else {
-        // Very long primary title: give it the whole safe title area and
-        // collapse only the auxiliary nickname. Zero width is used instead of
-        // changing `hidden`, avoiding a sticky hidden flag across cell reuse.
-        nameFrame.size.width = availableWidth;
-        nickFrame.origin.x = rightBoundary;
-        nickFrame.size.width = 0.0;
-        objc_setAssociatedObject(nickLabel,
-                                 kWCROtherNickCollapsedKey,
-                                 @YES,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-
-    nameLabel.frame = CGRectIntegral(nameFrame);
-    nickLabel.frame = CGRectIntegral(nickFrame);
-}
-
-static void WCRAdjustVisibleOtherGroupingNicknameCells(id controller) {
-    if (!WCRIsOtherGroupingController(controller)) return;
-
-    UITableView *tableView = nil;
-    if ([controller respondsToSelector:@selector(tableView)]) {
-        tableView = [(WCRGroupingSessionListViewController *)controller tableView];
-    }
-    if (![tableView isKindOfClass:[UITableView class]]) {
-        tableView = WCRSafeValueForKey(controller, @"tableView");
-    }
-    if (![tableView isKindOfClass:[UITableView class]]) return;
-
-    for (UITableViewCell *cell in tableView.visibleCells) {
-        WCRAdjustOtherGroupingNicknameCell(cell);
-    }
 }
 
 static BOOL WCRIsActiveFrontHomeTable(UITableView *tableView) {
@@ -970,19 +757,6 @@ static BOOL WCRSessionUnreadState(id session, BOOL *knownOut) {
     return NO;
 }
 
-static void WCRScheduleVisibleHomeReconcile(void) {
-    // WCRefine rebuilds its snapshot asynchronously. Reconcile a few times
-    // around that mutation instead of relying on the finite startup scan.
-    const NSTimeInterval delays[] = {0.05, 0.25, 0.70};
-    for (NSUInteger i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(delays[i] * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            WCRScan(NO);
-        });
-    }
-}
-
 static void WCRRefreshHome(id host, NSString *reason) {
     [[NSNotificationCenter defaultCenter]
         postNotificationName:kWCRHomeGroupsDidChangeNotification
@@ -992,8 +766,6 @@ static void WCRRefreshHome(id host, NSString *reason) {
         [(NewMainFrameViewController *)host
             wcrGrouping_scheduleRefreshForTrigger:(reason ?: @"active_front")];
     }
-
-    WCRScheduleVisibleHomeReconcile();
 }
 
 static void WCRRefreshHomeDeferred(id host, NSString *reason) {
@@ -1008,7 +780,6 @@ static void WCRRefreshHomeGlobal(__unused NSString *reason) {
         [[NSNotificationCenter defaultCenter]
             postNotificationName:kWCRHomeGroupsDidChangeNotification
                           object:nil];
-        WCRScheduleVisibleHomeReconcile();
     });
 }
 
@@ -1105,99 +876,133 @@ static void WCRClearCanonicalRowBinding(UITableViewCell *cell) {
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-static BOOL WCRCandidateIsEligibleConversation(id candidate,
-                                               WCRefineGroupDataProvider *provider,
-                                               id *sessionOut,
-                                               NSString **usernameOut,
-                                               NSUInteger *scopeOut) {
-    if (!candidate || !provider) return NO;
-
-    id native = [provider nativeSessionFromObject:candidate];
-    if (!native) native = candidate;
-
-    NSString *username = [provider usernameForNativeObject:native];
-    NSUInteger scope = [provider groupScopeForNativeSession:native];
-
-    BOOL eligible =
-        [username isKindOfClass:[NSString class]] &&
-        username.length > 0 &&
-        (scope == 1 || scope == 2);
-
-    if (!eligible) return NO;
-
-    if (sessionOut) *sessionOut = native;
-    if (usernameOut) *usernameOut = username;
-    if (scopeOut) *scopeOut = scope;
-    return YES;
-}
-
-static id WCRResolveCurrentHomeSession(NewMainFrameViewController *host,
-                                       NSIndexPath *indexPath,
-                                       NSString **usernameOut,
-                                       NSUInteger *scopeOut,
-                                       NSString **sourceOut) {
-    if (!host || !indexPath) return nil;
+static BOOL WCRConversationFromCandidate(id candidate,
+                                         id *sessionOut,
+                                         NSString **usernameOut,
+                                         NSUInteger *scopeOut) {
+    if (!candidate) return NO;
 
     WCRefineGroupDataProvider *provider = WCRDataProvider();
-    if (!provider) return nil;
+    if (!provider) return NO;
 
-    id primaryObject = nil;
-    if ([host respondsToSelector:@selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
-        primaryObject = [host wcrGrouping_logicGetSessionAtIndexPath:indexPath];
+    // First ask WCRefine to canonicalize the object.  Crucially, return the
+    // SAME object whose username/scope passed validation; do not combine a
+    // username from one wrapper with a scope from another and later hand the
+    // state machine an object that fails its own scope check.
+    id canonical = [provider nativeSessionFromObject:candidate];
+    if (!canonical) canonical = candidate;
+
+    NSString *canonicalUsername =
+        [provider usernameForNativeObject:canonical];
+    NSUInteger canonicalScope =
+        [provider groupScopeForNativeSession:canonical];
+
+    BOOL canonicalEligible =
+        [canonicalUsername isKindOfClass:[NSString class]] &&
+        canonicalUsername.length > 0 &&
+        (canonicalScope == 1 || canonicalScope == 2);
+
+    if (canonicalEligible) {
+        if (sessionOut) *sessionOut = canonical;
+        if (usernameOut) *usernameOut = canonicalUsername;
+        if (scopeOut) *scopeOut = canonicalScope;
+        return YES;
     }
 
-    id primarySession = nil;
-    NSString *primaryUsername = nil;
-    NSUInteger primaryScope = 0;
-    BOOL primaryOK = WCRCandidateIsEligibleConversation(primaryObject,
-                                                         provider,
-                                                         &primarySession,
-                                                         &primaryUsername,
-                                                         &primaryScope);
+    if (canonical != candidate) {
+        NSString *candidateUsername =
+            [provider usernameForNativeObject:candidate];
+        NSUInteger candidateScope =
+            [provider groupScopeForNativeSession:candidate];
 
-    // WCRefine exposes a second projection-aware accessor for the exact row's
-    // cell data. During snapshot rebuilds it can be current when the session
-    // accessor is temporarily nil/stale. Canonicalize it through WCRefine's
-    // own nativeSessionFromObject: instead of guessing by class/prefix.
-    id cellData = nil;
-    if ([host respondsToSelector:@selector(wcrGrouping_logicGetCellDataAtIndexPath:)]) {
-        cellData = [host wcrGrouping_logicGetCellDataAtIndexPath:indexPath];
-    }
+        BOOL candidateEligible =
+            [candidateUsername isKindOfClass:[NSString class]] &&
+            candidateUsername.length > 0 &&
+            (candidateScope == 1 || candidateScope == 2);
 
-    id secondarySession = nil;
-    NSString *secondaryUsername = nil;
-    NSUInteger secondaryScope = 0;
-    BOOL secondaryOK = WCRCandidateIsEligibleConversation(cellData,
-                                                           provider,
-                                                           &secondarySession,
-                                                           &secondaryUsername,
-                                                           &secondaryScope);
-
-    // If both are valid but disagree during a projection mutation, prefer the
-    // cell-data candidate because it is bound to the row being rendered now.
-    if (secondaryOK &&
-        (!primaryOK || ![secondaryUsername isEqualToString:primaryUsername])) {
-        if (primaryOK && ![secondaryUsername isEqualToString:primaryUsername]) {
-            WCRAF_LOG(@"live resolver mismatch index=%ld/%ld session=%@ cellData=%@; prefer cellData",
-                      (long)indexPath.section,
-                      (long)indexPath.row,
-                      primaryUsername,
-                      secondaryUsername);
+        if (candidateEligible) {
+            if (sessionOut) *sessionOut = candidate;
+            if (usernameOut) *usernameOut = candidateUsername;
+            if (scopeOut) *scopeOut = candidateScope;
+            return YES;
         }
-        if (usernameOut) *usernameOut = secondaryUsername;
-        if (scopeOut) *scopeOut = secondaryScope;
-        if (sourceOut) *sourceOut = @"cellData";
-        return secondarySession;
     }
 
-    if (primaryOK) {
-        if (usernameOut) *usernameOut = primaryUsername;
-        if (scopeOut) *scopeOut = primaryScope;
-        if (sourceOut) *sourceOut = @"session";
-        return primarySession;
+    return NO;
+}
+
+static id WCRResolveRenderedConversationForCell(
+    UITableViewCell *cell,
+    NewMainFrameViewController *host,
+    NSIndexPath *indexPath,
+    NSString **usernameOut,
+    NSUInteger *scopeOut,
+    NSString **sourceOut) {
+
+    // PRIMARY: use the exact cellData currently rendered by this cell.
+    // WCRefine itself reads this same m_cellData ivar in its runtime cell hook.
+    id renderedCellData = WCRRenderedCellData(cell);
+    id renderedSession = nil;
+    NSString *renderedUsername = nil;
+    NSUInteger renderedScope = 0;
+
+    if (WCRConversationFromCandidate(renderedCellData,
+                                     &renderedSession,
+                                     &renderedUsername,
+                                     &renderedScope)) {
+        if (usernameOut) *usernameOut = renderedUsername;
+        if (scopeOut) *scopeOut = renderedScope;
+        if (sourceOut) *sourceOut = @"m_cellData";
+        return renderedSession;
     }
 
-    if (sourceOut) *sourceOut = @"none";
+    // FALLBACK: WCRefine's projection-aware indexPath resolver.  This remains
+    // necessary for unusual cells where m_cellData is absent, but it no longer
+    // overrides the object that is visibly bound to the cell.
+    id liveSession = nil;
+    if (host && indexPath &&
+        [host respondsToSelector:
+            @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
+        liveSession =
+            [host wcrGrouping_logicGetSessionAtIndexPath:indexPath];
+    }
+
+    id canonicalLiveSession = nil;
+    NSString *liveUsername = nil;
+    NSUInteger liveScope = 0;
+    if (WCRConversationFromCandidate(liveSession,
+                                     &canonicalLiveSession,
+                                     &liveUsername,
+                                     &liveScope)) {
+        if (usernameOut) *usernameOut = liveUsername;
+        if (scopeOut) *scopeOut = liveScope;
+        if (sourceOut) *sourceOut = @"indexPath-session";
+        return canonicalLiveSession;
+    }
+
+    // Last fallback: WCRefine can sometimes expose a cellData object through
+    // the projection even when the session getter is temporarily nil.
+    id projectedCellData = nil;
+    if (host && indexPath &&
+        [host respondsToSelector:
+            @selector(wcrGrouping_logicGetCellDataAtIndexPath:)]) {
+        projectedCellData =
+            [host wcrGrouping_logicGetCellDataAtIndexPath:indexPath];
+    }
+
+    id projectedSession = nil;
+    NSString *projectedUsername = nil;
+    NSUInteger projectedScope = 0;
+    if (WCRConversationFromCandidate(projectedCellData,
+                                     &projectedSession,
+                                     &projectedUsername,
+                                     &projectedScope)) {
+        if (usernameOut) *usernameOut = projectedUsername;
+        if (scopeOut) *scopeOut = projectedScope;
+        if (sourceOut) *sourceOut = @"indexPath-cellData";
+        return projectedSession;
+    }
+
     return nil;
 }
 
@@ -1207,18 +1012,16 @@ static void WCRBindCanonicalHomeRow(UITableViewCell *cell,
                                     NSIndexPath *indexPath) {
     if (!cell || !host || !tableView || !indexPath) return;
 
-    // Resolve from WCRefine's current projection. v1.9.3 keeps the v1.9.2
-    // friend/chatroom boundary, but adds WCRefine's exact cell-data resolver as
-    // a race-safe fallback while the home snapshot is mutating.
     NSString *username = nil;
     NSUInteger scope = 0;
-    NSString *resolverSource = nil;
+    NSString *source = nil;
     id resolvedSession =
-        WCRResolveCurrentHomeSession(host,
-                                     indexPath,
-                                     &username,
-                                     &scope,
-                                     &resolverSource);
+        WCRResolveRenderedConversationForCell(cell,
+                                              host,
+                                              indexPath,
+                                              &username,
+                                              &scope,
+                                              &source);
     BOOL eligibleConversation = resolvedSession != nil;
 
     NSString *oldCanonicalUsername =
@@ -1236,9 +1039,6 @@ static void WCRBindCanonicalHomeRow(UITableViewCell *cell,
         WCRHardResetCellVisual(cell, YES);
     }
 
-    // "known + nil session" means WCRefine classified this row as something
-    // other than an eligible friend/chat-room conversation. Such rows fail
-    // closed and can never open ActiveFront's right swipe.
     objc_setAssociatedObject(cell, kWCRCanonicalKnownKey, @YES,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(cell, kWCRCanonicalSessionKey,
@@ -1251,15 +1051,15 @@ static void WCRBindCanonicalHomeRow(UITableViewCell *cell,
                              @(eligibleConversation ? scope : 0),
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    WCRAF_LOG(@"canonical row %@ index=%ld/%ld session=%@ user=%@ scope=%lu eligible=%d source=%@",
+    WCRAF_LOG(@"canonical row %@ index=%ld/%ld source=%@ session=%@ user=%@ scope=%lu eligible=%d",
               WCRClassName(cell),
               (long)indexPath.section,
               (long)indexPath.row,
+              source ?: @"<none>",
               WCRClassName(resolvedSession),
               username ?: @"<nil>",
               (unsigned long)scope,
-              eligibleConversation,
-              resolverSource ?: @"<nil>");
+              eligibleConversation);
 }
 
 static id WCRSessionForCell(UITableViewCell *cell,
@@ -1276,27 +1076,18 @@ static id WCRSessionForCell(UITableViewCell *cell,
         WCRHomeControllerForTable(tableView);
     if (!host) return nil;
 
-    // IMPORTANT:
-    // A home refresh / incoming unread projection can reorder rows without a
-    // reliable willDisplay callback for every visible/reused cell. Resolve the
-    // CURRENT row again at gesture/action time. The primary source remains
-    // WCRefine's session resolver; v1.9.3 adds WCRefine's own cell-data path as
-    // a fallback for snapshot-transition races.
     NSString *username = nil;
     NSUInteger scope = 0;
-    NSString *resolverSource = nil;
+    NSString *source = nil;
     id session =
-        WCRResolveCurrentHomeSession(host,
-                                     indexPath,
-                                     &username,
-                                     &scope,
-                                     &resolverSource);
-    BOOL eligibleConversation = session != nil;
+        WCRResolveRenderedConversationForCell(cell,
+                                              host,
+                                              indexPath,
+                                              &username,
+                                              &scope,
+                                              &source);
 
-    if (!eligibleConversation) {
-        // This visible row is a WCRefine group/category/service/official/other
-        // row (or otherwise not an eligible friend/chatroom conversation).
-        // Clear stale cached identity/action UI and fail closed.
+    if (!session) {
         NSString *oldUsername =
             objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey);
 
@@ -1314,17 +1105,9 @@ static id WCRSessionForCell(UITableViewCell *cell,
                                  OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(cell, kWCRCanonicalScopeKey, @0,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-        WCRAF_LOG(@"action resolve failed index=%ld/%ld cell=%@ source=%@",
-                  (long)indexPath.section,
-                  (long)indexPath.row,
-                  WCRClassName(cell),
-                  resolverSource ?: @"none");
         return nil;
     }
 
-    // Refresh the cache so diagnostics and later reuse checks describe the row
-    // that WCRefine currently considers visible here.
     NSString *oldUsername =
         objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey);
 
@@ -1341,6 +1124,13 @@ static id WCRSessionForCell(UITableViewCell *cell,
                              OBJC_ASSOCIATION_COPY_NONATOMIC);
     objc_setAssociatedObject(cell, kWCRCanonicalScopeKey, @(scope),
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    WCRAF_LOG(@"action row index=%ld/%ld source=%@ user=%@ scope=%lu",
+              (long)indexPath.section,
+              (long)indexPath.row,
+              source ?: @"<none>",
+              username ?: @"<nil>",
+              (unsigned long)scope);
 
     if (hostOut) *hostOut = host;
     if (tableOut) *tableOut = tableView;
@@ -1883,6 +1673,282 @@ static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) 
     return value.boolValue;
 }
 
+#pragma mark - sys_other nickname collision guard
+
+static NSString * const kWCROtherGroupingId = @"sys_other";
+
+static NSString *WCRGroupingControllerId(id controller) {
+    if (!WCRIsGroupingSessionListController(controller)) return nil;
+
+    if ([controller respondsToSelector:@selector(groupId)]) {
+        id value = [(WCRGroupingSessionListViewController *)controller groupId];
+        if ([value isKindOfClass:[NSString class]]) return value;
+    }
+
+    id value = WCRObjectIvarNamed(controller, "_groupId");
+    if (![value isKindOfClass:[NSString class]]) {
+        value = WCRObjectIvarNamed(controller, "groupId");
+    }
+    return [value isKindOfClass:[NSString class]] ? value : nil;
+}
+
+static BOOL WCRCellBelongsToOtherGrouping(UITableViewCell *cell) {
+    if (!cell) return NO;
+
+    UITableView *tableView = WCRTableForCell(cell);
+    if (!tableView) return NO;
+
+    id owner = WCRViewControllerForView(tableView);
+    if (!WCRIsGroupingSessionListController(owner)) {
+        owner = tableView.delegate;
+    }
+    if (!WCRIsGroupingSessionListController(owner)) return NO;
+
+    return [[WCRGroupingControllerId(owner) lowercaseString]
+        isEqualToString:kWCROtherGroupingId];
+}
+
+static id WCRFindObjectIvarInViewTree(UIView *root,
+                                      const char *ivarName) {
+    if (!root || !ivarName) return nil;
+
+    id value = WCRObjectIvarNamed(root, ivarName);
+    if (value) return value;
+
+    for (UIView *subview in root.subviews) {
+        value = WCRFindObjectIvarInViewTree(subview, ivarName);
+        if (value) return value;
+    }
+    return nil;
+}
+
+static void WCRCollectLabelsInViewTree(UIView *root,
+                                       NSMutableArray<UILabel *> *labels) {
+    if (!root || !labels) return;
+
+    if ([root isKindOfClass:[UILabel class]]) {
+        [labels addObject:(UILabel *)root];
+    }
+
+    for (UIView *subview in root.subviews) {
+        WCRCollectLabelsInViewTree(subview, labels);
+    }
+}
+
+static NSString *WCRLabelDisplayString(UILabel *label) {
+    if (!label) return nil;
+
+    NSString *text = nil;
+    if (label.attributedText.length > 0) {
+        text = label.attributedText.string;
+    }
+    if (text.length == 0) text = label.text;
+    return [text isKindOfClass:[NSString class]] ? text : nil;
+}
+
+static CGFloat WCRMeasuredSingleLineLabelWidth(UILabel *label) {
+    if (!label) return 0.0;
+
+    NSAttributedString *attributed = label.attributedText;
+    if (attributed.length > 0) {
+        CGRect rect =
+            [attributed boundingRectWithSize:
+                            CGSizeMake(CGFLOAT_MAX,
+                                       MAX(ceil(label.bounds.size.height), 64.0))
+                                    options:(NSStringDrawingUsesLineFragmentOrigin |
+                                             NSStringDrawingUsesFontLeading)
+                                    context:nil];
+        return ceil(rect.size.width);
+    }
+
+    NSString *text = label.text;
+    if (text.length == 0) return 0.0;
+
+    UIFont *font = label.font ?: [UIFont systemFontOfSize:17.0];
+    CGRect rect =
+        [text boundingRectWithSize:CGSizeMake(CGFLOAT_MAX,
+                                              MAX(ceil(font.lineHeight), 64.0))
+                           options:(NSStringDrawingUsesLineFragmentOrigin |
+                                    NSStringDrawingUsesFontLeading)
+                        attributes:@{ NSFontAttributeName : font }
+                           context:nil];
+    return ceil(rect.size.width);
+}
+
+static UILabel *WCRFindAtNicknameLabel(UITableViewCell *cell,
+                                       UILabel *nameLabel) {
+    if (!cell || !nameLabel) return nil;
+
+    NSMutableArray<UILabel *> *labels = [NSMutableArray array];
+    WCRCollectLabelsInViewTree(cell, labels);
+
+    CGRect nameRect = [nameLabel convertRect:nameLabel.bounds toView:cell];
+    CGFloat nameCenterY = CGRectGetMidY(nameRect);
+    CGFloat baselineTolerance = MAX(6.0, CGRectGetHeight(nameRect) * 0.45);
+    CGFloat nameDesired = WCRMeasuredSingleLineLabelWidth(nameLabel);
+    CGFloat expectedX = CGRectGetMinX(nameRect) + nameDesired + 6.0;
+
+    UILabel *best = nil;
+    CGFloat bestScore = CGFLOAT_MAX;
+
+    for (UILabel *label in labels) {
+        if (label == nameLabel) continue;
+        if (label.alpha <= 0.01) continue;
+
+        NSString *text =
+            [[WCRLabelDisplayString(label)
+                stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]] copy];
+        if (text.length == 0 ||
+            (![text hasPrefix:@"@"] && ![text hasPrefix:@"＠"])) continue;
+
+        CGRect rect = [label convertRect:label.bounds toView:cell];
+        if (CGRectIsEmpty(rect) && label.bounds.size.height <= 0.0) continue;
+
+        CGFloat dy = fabs(CGRectGetMidY(rect) - nameCenterY);
+        if (dy > baselineTolerance) continue;
+
+        // The auxiliary nickname belongs on the same title line and should not
+        // start to the left of the title's leading edge.
+        if (CGRectGetMaxX(rect) < CGRectGetMinX(nameRect) + 8.0) continue;
+
+        CGFloat dx = fabs(CGRectGetMinX(rect) - expectedX);
+        CGFloat score = dy * 20.0 + dx;
+        if (!best || score < bestScore) {
+            best = label;
+            bestScore = score;
+        }
+    }
+
+    return best;
+}
+
+static void WCRSetLabelFrameInCellCoordinates(UILabel *label,
+                                               UITableViewCell *cell,
+                                               CGRect frameInCell) {
+    if (!label || !cell || !label.superview) return;
+    CGRect local = [cell convertRect:frameInCell toView:label.superview];
+    label.frame = CGRectIntegral(local);
+}
+
+static void WCRApplyOtherGroupNicknameLayout(UITableViewCell *cell) {
+    if (!cell || !cell.window) return;
+    if (!WCRCellBelongsToOtherGrouping(cell)) return;
+
+    id nameObject = WCRFindObjectIvarInViewTree(cell, "m_nameLabel");
+    if (![nameObject isKindOfClass:[UILabel class]]) {
+        nameObject = WCRFindObjectIvarInViewTree(cell, "_m_nameLabel");
+    }
+    if (![nameObject isKindOfClass:[UILabel class]]) return;
+
+    UILabel *nameLabel = (UILabel *)nameObject;
+    UILabel *auxLabel = WCRFindAtNicknameLabel(cell, nameLabel);
+    if (!auxLabel) return;
+
+    id timeObject = WCRFindObjectIvarInViewTree(cell, "m_timeLabel");
+    if (![timeObject isKindOfClass:[UILabel class]]) {
+        timeObject = WCRFindObjectIvarInViewTree(cell, "_m_timeLabel");
+    }
+    UILabel *timeLabel =
+        [timeObject isKindOfClass:[UILabel class]] ? timeObject : nil;
+
+    CGRect nameRect = [nameLabel convertRect:nameLabel.bounds toView:cell];
+    CGRect auxRect = [auxLabel convertRect:auxLabel.bounds toView:cell];
+
+    CGFloat nameX = CGRectGetMinX(nameRect);
+    CGFloat rightLimit = CGRectGetWidth(cell.bounds) - 12.0;
+
+    if (timeLabel && !timeLabel.hidden && timeLabel.alpha > 0.01) {
+        CGRect timeRect = [timeLabel convertRect:timeLabel.bounds toView:cell];
+        if (CGRectGetMinX(timeRect) > nameX + 48.0) {
+            rightLimit = MIN(rightLimit, CGRectGetMinX(timeRect) - 8.0);
+        }
+    }
+
+    CGFloat available = rightLimit - nameX;
+    if (available <= 48.0) return;
+
+    CGFloat gap = 6.0;
+    CGFloat nameDesired = WCRMeasuredSingleLineLabelWidth(nameLabel) + 2.0;
+    CGFloat auxDesired = WCRMeasuredSingleLineLabelWidth(auxLabel) + 2.0;
+    if (nameDesired <= 0.0 || auxDesired <= 0.0) return;
+
+    // Detect the actual glyph collision, not merely label-frame intersection:
+    // WeChat often leaves m_nameLabel's frame wider than its short text.
+    CGFloat currentAuxX = CGRectGetMinX(auxRect);
+    BOOL glyphCollision = (nameX + nameDesired + gap) > currentAuxX;
+
+    // A previous reuse may have inherited our hidden/zero-width auxiliary
+    // label. In that case recompute deterministically even if its current frame
+    // no longer represents the new row.
+    BOOL needsReuseRepair = auxLabel.hidden || CGRectGetWidth(auxRect) < 1.0;
+    if (!glyphCollision && !needsReuseRepair) return;
+
+    nameLabel.numberOfLines = 1;
+    nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    nameLabel.clipsToBounds = YES;
+
+    UIFont *auxFont = auxLabel.font ?: nameLabel.font;
+    if (!auxFont) auxFont = [UIFont systemFontOfSize:17.0];
+    CGFloat minAuxVisible =
+        MIN(auxDesired, MAX(38.0, auxFont.pointSize * 2.6));
+
+    CGRect newNameRect = nameRect;
+    CGRect newAuxRect = auxRect;
+
+    if (nameDesired + gap + auxDesired <= available) {
+        // Enough total room; repair only the bad placement.
+        CGFloat titleWidth = MIN(nameDesired, available);
+        newNameRect.size.width = titleWidth;
+        newAuxRect.origin.x = nameX + titleWidth + gap;
+        newAuxRect.size.width = MIN(auxDesired,
+                                   MAX(0.0,
+                                       rightLimit - newAuxRect.origin.x));
+        auxLabel.hidden = NO;
+    } else if (nameDesired + gap + minAuxVisible <= available) {
+        // Keep the whole primary title; auxiliary nickname gets the remainder
+        // and truncates its tail first.
+        CGFloat titleWidth = MIN(nameDesired, available);
+        newNameRect.size.width = titleWidth;
+        newAuxRect.origin.x = nameX + titleWidth + gap;
+        newAuxRect.size.width = MAX(0.0,
+                                   rightLimit - newAuxRect.origin.x);
+        auxLabel.hidden = newAuxRect.size.width < 24.0;
+    } else {
+        // The primary title itself consumes the line.  Hide the lower-priority
+        // @nickname and let the title use all space before the time label.
+        newNameRect.size.width = available;
+        newAuxRect.origin.x = rightLimit;
+        newAuxRect.size.width = 0.0;
+        auxLabel.hidden = YES;
+    }
+
+    auxLabel.numberOfLines = 1;
+    auxLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    auxLabel.clipsToBounds = YES;
+
+    WCRSetLabelFrameInCellCoordinates(nameLabel, cell, newNameRect);
+    WCRSetLabelFrameInCellCoordinates(auxLabel, cell, newAuxRect);
+}
+
+static void WCRScheduleOtherGroupNicknameLayout(UITableViewCell *cell) {
+    if (!cell || !WCRCellBelongsToOtherGrouping(cell)) return;
+
+    WCRApplyOtherGroupNicknameLayout(cell);
+
+    if (WCRBool(cell, kWCROtherNicknamePatchScheduledKey)) return;
+    WCRSetBool(cell, kWCROtherNicknamePatchScheduledKey, YES);
+
+    __weak UITableViewCell *weakCell = cell;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITableViewCell *strongCell = weakCell;
+        if (!strongCell) return;
+
+        WCRSetBool(strongCell, kWCROtherNicknamePatchScheduledKey, NO);
+        WCRApplyOtherGroupNicknameLayout(strongCell);
+    });
+}
+
 #pragma mark - Controller
 
 
@@ -1895,39 +1961,72 @@ static void WCRShowCanonicalRowDebug(UITableViewCell *cell) {
     NewMainFrameViewController *host =
         tableView ? WCRHomeControllerForTable(tableView) : nil;
 
-    id canonicalSession =
+    id cachedSession =
         objc_getAssociatedObject(cell, kWCRCanonicalSessionKey);
-    NSString *canonicalUsername =
+    NSString *cachedUsername =
         objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey);
-    NSNumber *canonicalScope =
+    NSNumber *cachedScope =
         objc_getAssociatedObject(cell, kWCRCanonicalScopeKey);
 
-    id directSession = nil;
-    id cellData = nil;
+    id renderedCellData = WCRRenderedCellData(cell);
+    id renderedSession = nil;
+    NSString *renderedUsername = nil;
+    NSUInteger renderedScope = 0;
+    BOOL renderedOK =
+        WCRConversationFromCandidate(renderedCellData,
+                                     &renderedSession,
+                                     &renderedUsername,
+                                     &renderedScope);
 
+    id projectedSessionRaw = nil;
     if (host && indexPath &&
         [host respondsToSelector:
             @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
-        directSession =
+        projectedSessionRaw =
             [host wcrGrouping_logicGetSessionAtIndexPath:indexPath];
     }
 
+    id projectedSession = nil;
+    NSString *projectedUsername = nil;
+    NSUInteger projectedScope = 0;
+    BOOL projectedOK =
+        WCRConversationFromCandidate(projectedSessionRaw,
+                                     &projectedSession,
+                                     &projectedUsername,
+                                     &projectedScope);
+
+    id projectedCellData = nil;
     if (host && indexPath &&
         [host respondsToSelector:
             @selector(wcrGrouping_logicGetCellDataAtIndexPath:)]) {
-        cellData =
+        projectedCellData =
             [host wcrGrouping_logicGetCellDataAtIndexPath:indexPath];
     }
 
-    WCRefineGroupDataProvider *provider = WCRDataProvider();
-    NSString *directUsername =
-        (provider && directSession)
-            ? [provider usernameForNativeObject:directSession]
-            : nil;
-    NSUInteger directScope =
-        (provider && directSession)
-            ? [provider groupScopeForNativeSession:directSession]
-            : 0;
+    id projectedCellSession = nil;
+    NSString *projectedCellUsername = nil;
+    NSUInteger projectedCellScope = 0;
+    BOOL projectedCellOK =
+        WCRConversationFromCandidate(projectedCellData,
+                                     &projectedCellSession,
+                                     &projectedCellUsername,
+                                     &projectedCellScope);
+
+    NSString *selectedUsername = nil;
+    NSUInteger selectedScope = 0;
+    NSString *selectedSource = nil;
+    id selectedSession =
+        WCRResolveRenderedConversationForCell(cell,
+                                              host,
+                                              indexPath,
+                                              &selectedUsername,
+                                              &selectedScope,
+                                              &selectedSource);
+
+    BOOL grouped = selectedUsername.length > 0 &&
+                   WCRIsInCustomGroup(selectedUsername);
+    BOOL held = grouped && WCRIsHeld(selectedUsername);
+    BOOL surfaced = grouped && WCRIsSurfaced(selectedUsername);
 
     NSString *message =
         [NSString stringWithFormat:
@@ -1936,35 +2035,49 @@ static void WCRShowCanonicalRowDebug(UITableViewCell *cell) {
              "table=%@\n"
              "delegate=%@\n"
              "host=%@\n\n"
-             "canonicalKnown=%d (cache only; action uses live WCRefineSession)\n"
-             "canonicalSession=%@\n"
-             "canonicalUser=%@\n"
-             "canonicalScope=%@\n\n"
-             "WCRefineSession=%@\n"
-             "WCRefineUser=%@\n"
-             "WCRefineScope=%lu\n"
-             "cellData=%@\n\n"
-             "grouped=%d held=%d surfaced=%d",
+             "SELECTED source=%@\n"
+             "selectedSession=%@\n"
+             "selectedUser=%@\n"
+             "selectedScope=%lu\n"
+             "grouped=%d held=%d surfaced=%d\n\n"
+             "RENDERED cellData=%@ ok=%d\n"
+             "renderedSession=%@\n"
+             "renderedUser=%@ scope=%lu\n\n"
+             "INDEX sessionRaw=%@ ok=%d\n"
+             "indexSession=%@\n"
+             "indexUser=%@ scope=%lu\n\n"
+             "INDEX cellData=%@ ok=%d\n"
+             "indexCellSession=%@\n"
+             "indexCellUser=%@ scope=%lu\n\n"
+             "CACHE known=%d session=%@\n"
+             "cacheUser=%@ scope=%@",
              (long)(indexPath ? indexPath.section : -1),
              (long)(indexPath ? indexPath.row : -1),
              WCRClassName(cell),
              WCRClassName(tableView),
              WCRClassName(tableView.delegate),
              WCRClassName(host),
+             selectedSource ?: @"<none>",
+             WCRClassName(selectedSession),
+             selectedUsername ?: @"<nil>",
+             (unsigned long)selectedScope,
+             grouped, held, surfaced,
+             WCRClassName(renderedCellData), renderedOK,
+             WCRClassName(renderedSession),
+             renderedUsername ?: @"<nil>",
+             (unsigned long)renderedScope,
+             WCRClassName(projectedSessionRaw), projectedOK,
+             WCRClassName(projectedSession),
+             projectedUsername ?: @"<nil>",
+             (unsigned long)projectedScope,
+             WCRClassName(projectedCellData), projectedCellOK,
+             WCRClassName(projectedCellSession),
+             projectedCellUsername ?: @"<nil>",
+             (unsigned long)projectedCellScope,
              WCRCanonicalRowKnown(cell),
-             WCRClassName(canonicalSession),
-             canonicalUsername ?: @"<nil>",
-             canonicalScope ?: @0,
-             WCRClassName(directSession),
-             directUsername ?: @"<nil>",
-             (unsigned long)directScope,
-             WCRClassName(cellData),
-             canonicalUsername.length > 0
-                ? WCRIsInCustomGroup(canonicalUsername) : 0,
-             canonicalUsername.length > 0
-                ? WCRIsHeld(canonicalUsername) : 0,
-             canonicalUsername.length > 0
-                ? WCRIsSurfaced(canonicalUsername) : 0];
+             WCRClassName(cachedSession),
+             cachedUsername ?: @"<nil>",
+             cachedScope ?: @0];
 
     UIViewController *presenter = WCRTopVC();
     if (!presenter) return;
@@ -2443,69 +2556,6 @@ static void WCRAttachToCell(UITableViewCell *cell) {
 }
 
 
-#pragma mark - "其它" group nickname layout hooks
-
-static UITableViewCell *(*orig_otherGroupCellForRow)(id, SEL, UITableView *, NSIndexPath *) = NULL;
-static void (*orig_otherGroupViewDidLayoutSubviews)(id, SEL) = NULL;
-static void (*orig_otherMainItemViewLayoutSubviews)(id, SEL) = NULL;
-static void (*orig_otherFakeItemViewLayoutSubviews)(id, SEL) = NULL;
-
-static BOOL gWCRHookOtherGroupCellForRow = NO;
-static BOOL gWCRHookOtherGroupLayout = NO;
-static BOOL gWCRHookOtherMainItemLayout = NO;
-static BOOL gWCRHookOtherFakeItemLayout = NO;
-
-static UITableViewCell *hook_otherGroupCellForRow(id self,
-                                                   SEL _cmd,
-                                                   UITableView *tableView,
-                                                   NSIndexPath *indexPath) {
-    UITableViewCell *cell =
-        orig_otherGroupCellForRow ?
-            orig_otherGroupCellForRow(self, _cmd, tableView, indexPath) :
-            nil;
-
-    if (cell && WCRIsOtherGroupingController(self)) {
-        WCRAdjustOtherGroupingNicknameCell(cell);
-    }
-
-    return cell;
-}
-
-static void hook_otherGroupViewDidLayoutSubviews(id self, SEL _cmd) {
-    if (orig_otherGroupViewDidLayoutSubviews) {
-        orig_otherGroupViewDidLayoutSubviews(self, _cmd);
-    }
-
-    // Native layout may rewrite label frames after cellForRow. Reconcile the
-    // visible sys_other rows only after that pass completes.
-    WCRAdjustVisibleOtherGroupingNicknameCells(self);
-}
-
-static void WCRAdjustOtherNicknameFromItemView(id itemView) {
-    if (![itemView isKindOfClass:[UIView class]]) return;
-
-    UITableViewCell *cell = WCRCellForDescendantView((UIView *)itemView);
-    if (!cell || !WCRCellBelongsToOtherGrouping(cell)) return;
-
-    // This runs after MainFrameItemView/FakeMainFrameItemView's own native
-    // layout pass, so WCRefine/WeChat cannot immediately overwrite our frames.
-    WCRAdjustOtherGroupingNicknameCell(cell);
-}
-
-static void hook_otherMainItemViewLayoutSubviews(id self, SEL _cmd) {
-    if (orig_otherMainItemViewLayoutSubviews) {
-        orig_otherMainItemViewLayoutSubviews(self, _cmd);
-    }
-    WCRAdjustOtherNicknameFromItemView(self);
-}
-
-static void hook_otherFakeItemViewLayoutSubviews(id self, SEL _cmd) {
-    if (orig_otherFakeItemViewLayoutSubviews) {
-        orig_otherFakeItemViewLayoutSubviews(self, _cmd);
-    }
-    WCRAdjustOtherNicknameFromItemView(self);
-}
-
 #pragma mark - ActiveFront projection runtime hooks
 
 static BOOL (*orig_configExcludeUnread)(id, SEL) = NULL;
@@ -2515,6 +2565,7 @@ static void (*orig_noteRead)(id, SEL, NSString *) = NULL;
 static void (*orig_activeViewDidAppear)(id, SEL, BOOL) = NULL;
 static void (*orig_groupingWillDisplay)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *) = NULL;
 static void (*orig_cellPrepareForReuse)(id, SEL) = NULL;
+static void (*orig_cellLayoutSubviews)(id, SEL) = NULL;
 static void (*orig_cellDidMoveToWindow)(id, SEL) = NULL;
 
 static BOOL gWCRHookConfig = NO;
@@ -2524,7 +2575,8 @@ static BOOL gWCRHookRead = NO;
 static BOOL gWCRHookHome = NO;
 static BOOL gWCRHookWillDisplay = NO;
 static BOOL gWCRHookCellReuse = NO;
-static BOOL gWCRHookCellDidMoveToWindow = NO;
+static BOOL gWCRHookCellLayout = NO;
+static BOOL gWCRHookCellDidMove = NO;
 static BOOL gWCRBootstrapCloseScheduled = NO;
 
 static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
@@ -2608,10 +2660,6 @@ static void hook_noteIncoming(id self,
 
     if (grouped) {
         WCRRefreshHomeGlobal(@"active_front_incoming");
-    } else if (valid) {
-        // Even an ungrouped incoming row can be newly inserted/reused. It does
-        // not need a projection refresh, but it still needs the ActiveFront pan.
-        WCRScheduleVisibleHomeReconcile();
     }
 }
 
@@ -2687,8 +2735,22 @@ static void hook_cellPrepareForReuse(id self, SEL _cmd) {
     if (![self isKindOfClass:[UITableViewCell class]]) return;
 
     UITableViewCell *cell = (UITableViewCell *)self;
+    WCRSetBool(cell, kWCROtherNicknamePatchScheduledKey, NO);
     WCRHardResetCellVisual(cell, YES);
     WCRClearCanonicalRowBinding(cell);
+}
+
+static void hook_cellLayoutSubviews(id self, SEL _cmd) {
+    if (orig_cellLayoutSubviews) {
+        orig_cellLayoutSubviews(self, _cmd);
+    }
+
+    if (![self isKindOfClass:[UITableViewCell class]]) return;
+
+    UITableViewCell *cell = (UITableViewCell *)self;
+    if (WCRCellBelongsToOtherGrouping(cell)) {
+        WCRScheduleOtherGroupNicknameLayout(cell);
+    }
 }
 
 static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
@@ -2697,24 +2759,17 @@ static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
     }
 
     if (![self isKindOfClass:[UITableViewCell class]]) return;
-
     UITableViewCell *cell = (UITableViewCell *)self;
     if (!cell.window) return;
 
-    // This is an independent row-lifecycle safety net. WCRefine can rebuild
-    // or reinsert a home row without the custom willDisplay hook being ready
-    // at that exact moment. Once the cell reaches a window, attach on the next
-    // run-loop turn, then once more after the snapshot/indexPath settles.
+    // This is attachment-only insurance.  It does not decide 分组/保持/回组.
+    // A cell inserted after the startup scan can still receive the existing
+    // right-only recognizer; action identity is resolved at gesture time.
     __weak UITableViewCell *weakCell = cell;
     dispatch_async(dispatch_get_main_queue(), ^{
         UITableViewCell *strongCell = weakCell;
-        if (strongCell.window) WCRAttachToCell(strongCell);
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t)(0.15 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UITableViewCell *strongCell = weakCell;
-        if (strongCell.window) WCRAttachToCell(strongCell);
+        if (!strongCell || !strongCell.window) return;
+        WCRAttachToCell(strongCell);
     });
 }
 
@@ -2757,77 +2812,6 @@ static BOOL WCRInstallInstanceHook(Class cls,
     }
 
     return YES;
-}
-
-static void WCRTryInstallOtherNicknameHooks(NSUInteger attemptsRemaining) {
-    Class groupList =
-        NSClassFromString(@"WCRGroupingSessionListViewController");
-
-    if (!gWCRHookOtherGroupCellForRow && groupList) {
-        gWCRHookOtherGroupCellForRow =
-            WCRInstallInstanceHook(
-                groupList,
-                @selector(tableView:cellForRowAtIndexPath:),
-                (IMP)hook_otherGroupCellForRow,
-                (IMP *)&orig_otherGroupCellForRow);
-    }
-
-    if (!gWCRHookOtherGroupLayout && groupList) {
-        gWCRHookOtherGroupLayout =
-            WCRInstallInstanceHook(
-                groupList,
-                @selector(viewDidLayoutSubviews),
-                (IMP)hook_otherGroupViewDidLayoutSubviews,
-                (IMP *)&orig_otherGroupViewDidLayoutSubviews);
-    }
-
-    Class mainItemView = NSClassFromString(@"MainFrameItemView");
-    if (!gWCRHookOtherMainItemLayout && mainItemView) {
-        gWCRHookOtherMainItemLayout =
-            WCRInstallInstanceHook(
-                mainItemView,
-                @selector(layoutSubviews),
-                (IMP)hook_otherMainItemViewLayoutSubviews,
-                (IMP *)&orig_otherMainItemViewLayoutSubviews);
-    }
-
-    Class fakeItemView = NSClassFromString(@"FakeMainFrameItemView");
-    if (!gWCRHookOtherFakeItemLayout && fakeItemView) {
-        gWCRHookOtherFakeItemLayout =
-            WCRInstallInstanceHook(
-                fakeItemView,
-                @selector(layoutSubviews),
-                (IMP)hook_otherFakeItemViewLayoutSubviews,
-                (IMP *)&orig_otherFakeItemViewLayoutSubviews);
-    }
-
-    BOOL hasFinalItemLayoutHook =
-        gWCRHookOtherMainItemLayout || gWCRHookOtherFakeItemLayout;
-
-    if (gWCRHookOtherGroupCellForRow &&
-        gWCRHookOtherGroupLayout &&
-        hasFinalItemLayoutHook) {
-        WCRAF_LOG(@"other nickname layout hooks installed cell=1 controllerLayout=1 item=%d fake=%d",
-                  gWCRHookOtherMainItemLayout,
-                  gWCRHookOtherFakeItemLayout);
-        return;
-    }
-
-    if (attemptsRemaining == 0) {
-        WCRAF_LOG(@"other nickname layout hooks incomplete cell=%d controllerLayout=%d item=%d fake=%d",
-                  gWCRHookOtherGroupCellForRow,
-                  gWCRHookOtherGroupLayout,
-                  gWCRHookOtherMainItemLayout,
-                  gWCRHookOtherFakeItemLayout);
-        return;
-    }
-
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW,
-                      (int64_t)(0.25 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{
-            WCRTryInstallOtherNicknameHooks(attemptsRemaining - 1);
-        });
 }
 
 static void WCRScheduleBootstrapUnreadFallbackClose(void) {
@@ -2926,8 +2910,17 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                 (IMP *)&orig_cellPrepareForReuse);
     }
 
-    if (!gWCRHookCellDidMoveToWindow && mainFrameCell) {
-        gWCRHookCellDidMoveToWindow =
+    if (!gWCRHookCellLayout && mainFrameCell) {
+        gWCRHookCellLayout =
+            WCRInstallInstanceHook(
+                mainFrameCell,
+                @selector(layoutSubviews),
+                (IMP)hook_cellLayoutSubviews,
+                (IMP *)&orig_cellLayoutSubviews);
+    }
+
+    if (!gWCRHookCellDidMove && mainFrameCell) {
+        gWCRHookCellDidMove =
             WCRInstallInstanceHook(
                 mainFrameCell,
                 @selector(didMoveToWindow),
@@ -2939,10 +2932,6 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         WCRScheduleBootstrapUnreadFallbackClose();
     }
 
-    // v1.9.2 accidentally stopped retrying once the five projection hooks
-    // were installed, even if willDisplay/prepareForReuse were still missing.
-    // That left newly inserted/reused rows without our pan after the finite
-    // startup scan ended. Treat row lifecycle hooks as mandatory too.
     BOOL allInstalled =
         gWCRHookConfig &&
         gWCRHookProvider &&
@@ -2951,17 +2940,18 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         gWCRHookHome &&
         gWCRHookWillDisplay &&
         gWCRHookCellReuse &&
-        gWCRHookCellDidMoveToWindow;
+        gWCRHookCellLayout &&
+        gWCRHookCellDidMove;
 
     if (allInstalled) {
-        WCRAF_LOG(@"business hooks installed config=1 provider=1 incoming=1 read=1 home=1 willDisplay=1 reuse=1 didMove=1");
+        WCRAF_LOG(@"business hooks installed config=1 provider=1 incoming=1 read=1 home=1 willDisplay=1 reuse=1 layout=1 didMove=1");
         WCRPruneStaleActiveFrontState();
         WCRRefreshHomeGlobal(@"active_front_hooks_installed");
         return;
     }
 
     if (attemptsRemaining == 0) {
-        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d incoming=%d read=%d home=%d willDisplay=%d reuse=%d didMove=%d",
+        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d incoming=%d read=%d home=%d willDisplay=%d reuse=%d layout=%d didMove=%d",
                   gWCRHookConfig,
                   gWCRHookProvider,
                   gWCRHookIncoming,
@@ -2969,7 +2959,8 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                   gWCRHookHome,
                   gWCRHookWillDisplay,
                   gWCRHookCellReuse,
-                  gWCRHookCellDidMoveToWindow);
+                  gWCRHookCellLayout,
+                  gWCRHookCellDidMove);
         return;
     }
 
@@ -2990,7 +2981,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_9_3 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_9_4 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -3012,9 +3003,9 @@ static void WCRScan(BOOL showReady) {
             NSString *message = [NSString stringWithFormat:
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
-                 "Hooks: C%d P%d I%d R%d H%d W%d U%d M%d\n\n"
-                 "v1.9.3：右滑 = 分组 / 保持 / 回组\n"
-                 "行身份直接绑定 WCRefine 自己的 session resolver。\n"
+                 "Hooks: C%d P%d I%d R%d H%d\n\n"
+                 "v1.9.4 candidate：右滑 = 分组 / 保持 / 回组\n"
+                 "行身份优先使用可见 Cell.cellData，indexPath resolver 仅兜底。\n"
                  "WCRefine 组内列表不挂独立右滑手势。\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
@@ -3024,12 +3015,9 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookProvider,
                  gWCRHookIncoming,
                  gWCRHookRead,
-                 gWCRHookHome,
-                 gWCRHookWillDisplay,
-                 gWCRHookCellReuse,
-                 gWCRHookCellDidMoveToWindow];
+                 gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_9_3 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_9_4 Ready", message);
         }
     });
 }
@@ -3048,7 +3036,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.9.3");
+        WCRAF_LOG(@"dylib loaded; starting v1.9.4 candidate");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
@@ -3063,13 +3051,6 @@ static void WCRRightGroupUIInit(void) {
                           (int64_t)(4.0 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{
                 WCRTryInstallBusinessHooks(80);
-            });
-
-        dispatch_after(
-            dispatch_time(DISPATCH_TIME_NOW,
-                          (int64_t)(4.2 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), ^{
-                WCRTryInstallOtherNicknameHooks(80);
             });
 
         dispatch_after(
