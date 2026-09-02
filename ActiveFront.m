@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_v1_8_7_GROUP_ROW_ONLY_GUARD.m
-// WCRefine ActiveFront - v1.8.7: disable only WCRefine synthetic home group rows.
+// ActiveFront.RIGHT_v1_8_9_EXACT_MARKER_REUSE_FIX.m
+// WCRefine ActiveFront - v1.8.9: exact WCRefine group-entry marker + nil-reuse cleanup.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -35,7 +35,7 @@ static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.8.7";
+static NSString * const kWCRAFVersion = @"1.8.9";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -795,13 +795,17 @@ static BOOL WCRUsernameIsSyntheticGroupEntry(NSString *username) {
         return NO;
     }
 
-    // WCRefine 2.1-2 uses this prefix for the projected rows that represent
-    // groups/categories on the HOME list, not actual conversations.
+    // WCRefine 2.1-2's actual synthetic HOME group/category marker is:
+    //     WCRefine_groupEntry_
     //
-    // This covers custom groups (家人组/工作组/...) and WCRefine's default /
-    // category group entries such as ungrouped friend/chatroom, official,
-    // service and "other" when they are projected as group rows.
-    return [username hasPrefix:@"wcrefine_groupentry_"];
+    // v1.8.7 used a lower-case spelling and therefore missed some category
+    // rows (notably 服务号 on the tested build).
+    //
+    // Compare case-insensitively and accept both the underscore form and the
+    // base marker to stay compatible with nearby WCRefine builds.
+    NSString *lower = username.lowercaseString;
+    return [lower hasPrefix:@"wcrefine_groupentry_"] ||
+           [lower isEqualToString:@"wcrefine_groupentry"];
 }
 
 static BOOL WCRObjectIsGroupingEntry(id obj) {
@@ -821,11 +825,14 @@ static BOOL WCRCellClassLooksLikeSyntheticGroupingEntry(UITableViewCell *cell) {
     NSString *name = WCRClassName(cell);
     if (name.length == 0) return NO;
 
-    // WCRefine 2.1-2 also contains dedicated projected-entry cell classes
-    // (e.g. WCRGroupingNativeFakeEntryCell / FinalEntryCell). Treat only
-    // explicit "Grouping"+"Entry" cells as group containers.
-    return ([name rangeOfString:@"Grouping"].location != NSNotFound &&
-            [name rangeOfString:@"Entry"].location != NSNotFound);
+    // Do NOT blacklist WCRGroupingNativeFakeEntryCell /
+    // WCRGroupingNativeFinalEntryCell by class alone. In WCRefine these
+    // projected/native row classes can also participate in real surfaced
+    // conversation rendering; class-only rejection caused grouped chat-room
+    // messages to lose ActiveFront right swipe.
+    //
+    // Only a truly explicit grouping-entry cell name is accepted here.
+    return ([name rangeOfString:@"WCRGroupingEntryCell"].location != NSNotFound);
 }
 
 static id WCRProjectedCellDataForIndexPath(id host,
@@ -1782,8 +1789,14 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     // session. Auto-return after reading is a common path that causes exactly
     // this reuse.
     if (boundUsername.length > 0 &&
-        currentUsername.length > 0 &&
-        ![boundUsername isEqualToString:currentUsername]) {
+        (currentUsername.length == 0 ||
+         ![boundUsername isEqualToString:currentUsername])) {
+        // Important nil-reuse case:
+        // a cell that previously displayed a surfaced real conversation can
+        // later be recycled into a WCRefine group/category row. That new row
+        // has no ActiveFront username, so the old code failed to notice the
+        // identity change and could leave "保持/分组/回组" visually sitting
+        // over the avatar.
         WCRHardResetCellVisual(cell, YES);
         boundUsername = nil;
     }
@@ -1869,7 +1882,28 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     }
 
     WCRLayoutAction(cell);
-    WCRPrepareActionForCell(cell);
+    BOOL hasAction = WCRPrepareActionForCell(cell);
+
+    if (!hasAction) {
+        // A group/category row must be inert, not merely title-less.
+        // This also protects service/official/default-group rows from claiming
+        // the independent right-pan recognizer.
+        if (WCRBool(cell, kWCROpenKey) ||
+            WCRBool(cell, kWCRTrackingKey) ||
+            objc_getAssociatedObject(cell, kWCRBoundUsernameKey)) {
+            WCRHardResetCellVisual(cell, YES);
+        } else {
+            UIView *actionView =
+                objc_getAssociatedObject(cell, kWCRActionViewKey);
+            UIButton *button =
+                objc_getAssociatedObject(cell, kWCRButtonKey);
+            actionView.hidden = YES;
+            [button setTitle:@"" forState:UIControlStateNormal];
+        }
+        pan.enabled = NO;
+    } else {
+        pan.enabled = YES;
+    }
 
     // Reconcile the visual state on every scan. A valid action title does not
     // mean its view should be visible: closed rows must always keep the action
@@ -2188,7 +2222,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_8_7 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_8_9 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -2211,7 +2245,7 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.8.7：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.8.9：右滑 = 分组 / 保持 / 回组\n"
                  "真实好友/群聊行保留 ActiveFront 右滑。\n"
                  "首页 WCRefine 分组条目本身禁止右滑。\n"
                  "WCRefine 组内列表不挂独立右滑手势。\n"
@@ -2225,7 +2259,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_8_7 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_8_9 Ready", message);
         }
     });
 }
@@ -2244,7 +2278,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.8.7");
+        WCRAF_LOG(@"dylib loaded; starting v1.8.9");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
