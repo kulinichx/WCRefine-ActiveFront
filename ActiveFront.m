@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_v1_8_5_SCOPE_GROUPPAGE_GUARD.m
-// WCRefine ActiveFront - v1.8.5: friend/chat scope + WCRefine group-page isolation.
+// ActiveFront.RIGHT_v1_8_6_HOME_GROUP_ROW_GUARD.m
+// WCRefine ActiveFront - v1.8.6: exclude WCRefine home group summary rows from right swipe.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -35,7 +35,7 @@ static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.8.5";
+static NSString * const kWCRAFVersion = @"1.8.6";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -774,9 +774,23 @@ static void WCRPruneStaleActiveFrontState(void) {
 
 static id WCRHostForTable(UITableView *tableView) {
     id host = tableView.delegate;
-    if ([host respondsToSelector:@selector(logicGetSessionAtIndexPath:)]) {
+
+    // IMPORTANT:
+    // The home table contains both real native-session rows and WCRefine
+    // projected group-summary rows (e.g. 家人组 / 工作组).
+    //
+    // logicGetSessionAtIndexPath: is WeChat's native index mapping. Calling it
+    // with WCRefine's projected indexPath can accidentally resolve a totally
+    // different native session for a group-summary row, which is why those
+    // group rows incorrectly acquired our right-swipe menu.
+    //
+    // WCRefine's projection-aware resolver returns the actual native session
+    // only when this visible row really represents a session.
+    if ([host respondsToSelector:
+            @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
         return host;
     }
+
     return nil;
 }
 
@@ -795,7 +809,12 @@ static id WCRSessionForCell(UITableViewCell *cell,
 
     id session =
         [(NewMainFrameViewController *)host
-            logicGetSessionAtIndexPath:indexPath];
+            wcrGrouping_logicGetSessionAtIndexPath:indexPath];
+
+    // A nil result here is intentional for WCRefine home group-summary rows.
+    // Those rows are navigation/group containers, not conversations, and must
+    // never receive 分组 / 保持 / 回组.
+    if (!session) return nil;
 
     if (hostOut) *hostOut = host;
     if (tableOut) *tableOut = tableView;
@@ -2032,7 +2051,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_8_5 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_8_6 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -2055,8 +2074,9 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.8.5：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.8.6：右滑 = 分组 / 保持 / 回组\n"
                  "仅好友(scope=1)与群聊(scope=2)参与 ActiveFront。\n"
+                 "首页的 WCRefine 分组条目（如家人组/工作组）不允许右滑。\n"
                  "WCRefine 组内列表不挂独立右滑手势。\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
@@ -2068,7 +2088,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_8_5 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_8_6 Ready", message);
         }
     });
 }
@@ -2087,7 +2107,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.8.5");
+        WCRAF_LOG(@"dylib loaded; starting v1.8.6");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
