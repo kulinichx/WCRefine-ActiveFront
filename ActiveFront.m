@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_v1_8_4_NATIVE_CLOSE_LATCH.m
-// WCRefine ActiveFront - v1.8.4: latch native-left-menu state from touch-down.
+// ActiveFront.RIGHT_v1_8_5_SCOPE_GROUPPAGE_GUARD.m
+// WCRefine ActiveFront - v1.8.5: friend/chat scope + WCRefine group-page isolation.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -35,7 +35,7 @@ static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.8.4";
+static NSString * const kWCRAFVersion = @"1.8.5";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -140,6 +140,64 @@ static UITableView *WCRTableForCell(UITableViewCell *cell) {
     return nil;
 }
 
+
+static UIViewController *WCRViewControllerForView(UIView *view) {
+    UIResponder *responder = view;
+
+    while (responder) {
+        if ([responder isKindOfClass:[UIViewController class]]) {
+            return (UIViewController *)responder;
+        }
+        responder = responder.nextResponder;
+    }
+
+    return nil;
+}
+
+static BOOL WCRIsGroupingSessionListController(id controller) {
+    if (!controller) return NO;
+
+    Class cls = NSClassFromString(@"WCRGroupingSessionListViewController");
+    if (cls && [controller isKindOfClass:cls]) {
+        return YES;
+    }
+
+    return [WCRClassName(controller)
+        isEqualToString:@"WCRGroupingSessionListViewController"];
+}
+
+static BOOL WCRIsActiveFrontHomeTable(UITableView *tableView) {
+    if (!WCRIsMainFrameTable(tableView)) return NO;
+
+    UIViewController *owner = WCRViewControllerForView(tableView);
+
+    // WCRefine group-detail pages (custom friend groups, custom chat-room
+    // groups, and "其它"/other source lists) use their own
+    // WCRGroupingSessionListViewController and their own swipe/layout state.
+    // Never attach ActiveFront's independent pan there.
+    if (WCRIsGroupingSessionListController(owner) ||
+        WCRIsGroupingSessionListController(tableView.delegate)) {
+        return NO;
+    }
+
+    Class homeClass = NSClassFromString(@"NewMainFrameViewController");
+
+    if (homeClass && owner && [owner isKindOfClass:homeClass]) {
+        return YES;
+    }
+
+    if (homeClass &&
+        tableView.delegate &&
+        [tableView.delegate isKindOfClass:homeClass]) {
+        return YES;
+    }
+
+    // Conservative fallback: ActiveFront should not claim an unknown
+    // MainFrameTableView. This prevents WCRefine's internal lists from being
+    // modified if their implementation changes.
+    return NO;
+}
+
 static UIViewController *WCRTopVC(void) {
     UIWindow *window = nil;
 
@@ -242,7 +300,7 @@ static UITableView *WCRMainTable(void) {
     }
 
     for (UITableView *tableView in tables) {
-        if (WCRIsMainFrameTable(tableView)) {
+        if (WCRIsActiveFrontHomeTable(tableView)) {
             return tableView;
         }
     }
@@ -444,7 +502,7 @@ static void WCROpenCell(UITableViewCell *cell) {
 
 static void WCRCloseOtherCells(UITableViewCell *exceptCell) {
     UITableView *tableView = WCRTableForCell(exceptCell);
-    if (!WCRIsMainFrameTable(tableView)) return;
+    if (!WCRIsActiveFrontHomeTable(tableView)) return;
 
     for (UITableViewCell *cell in tableView.visibleCells) {
         if (cell == exceptCell) continue;
@@ -727,7 +785,7 @@ static id WCRSessionForCell(UITableViewCell *cell,
                             UITableView **tableOut,
                             NSIndexPath **indexPathOut) {
     UITableView *tableView = WCRTableForCell(cell);
-    if (!WCRIsMainFrameTable(tableView)) return nil;
+    if (!WCRIsActiveFrontHomeTable(tableView)) return nil;
 
     NSIndexPath *indexPath = [tableView indexPathForCell:cell];
     if (!indexPath) return nil;
@@ -757,6 +815,15 @@ static BOOL WCRResolveSessionState(id session,
     NSString *username = [provider usernameForNativeObject:session];
     if (![username isKindOfClass:[NSString class]] ||
         username.length == 0) {
+        return NO;
+    }
+
+    // Match the original ActiveFront business boundary recovered in Tweak.xm:
+    // 1 = friend, 2 = chat room. Official accounts / service accounts /
+    // other WCRefine scopes are outside this feature and must never receive
+    // our right-swipe recognizer/action.
+    NSUInteger scope = [provider groupScopeForNativeSession:session];
+    if (scope != 1 && scope != 2) {
         return NO;
     }
 
@@ -1293,7 +1360,7 @@ static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) 
     if (!WCRIsMainFrameCell(cell)) return NO;
 
     UITableView *tableView = WCRTableForCell(cell);
-    if (!WCRIsMainFrameTable(tableView)) return NO;
+    if (!WCRIsActiveFrontHomeTable(tableView)) return NO;
 
     CGPoint velocity = [pan velocityInView:cell];
 
@@ -1548,7 +1615,7 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     if (!WCRIsMainFrameCell(cell)) return;
 
     UITableView *tableView = WCRTableForCell(cell);
-    if (!WCRIsMainFrameTable(tableView)) return;
+    if (!WCRIsActiveFrontHomeTable(tableView)) return;
 
     NSString *currentUsername = WCRUsernameForCell(cell);
     NSString *boundUsername =
@@ -1965,7 +2032,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_8_4 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_8_5 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -1988,7 +2055,9 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.8.4：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.8.5：右滑 = 分组 / 保持 / 回组\n"
+                 "仅好友(scope=1)与群聊(scope=2)参与 ActiveFront。\n"
+                 "WCRefine 组内列表不挂独立右滑手势。\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
                  WCRClassName(tableView),
@@ -1999,7 +2068,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_8_4 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_8_5 Ready", message);
         }
     });
 }
@@ -2018,7 +2087,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.8.4");
+        WCRAF_LOG(@"dylib loaded; starting v1.8.5");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
