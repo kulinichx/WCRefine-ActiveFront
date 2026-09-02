@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_v1_8_9_EXACT_MARKER_REUSE_FIX.m
-// WCRefine ActiveFront - v1.8.9: exact WCRefine group-entry marker + nil-reuse cleanup.
+// ActiveFront.RIGHT_v1_9_0_SNAPSHOT_ROW_RESOLVER.m
+// WCRefine ActiveFront - v1.9.0: projection-aware home-row resolver from WCRefine snapshot semantics.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -35,7 +35,7 @@ static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.8.9";
+static NSString * const kWCRAFVersion = @"1.9.0";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -87,10 +87,26 @@ static void WCRAFLog(NSString *format, ...) {
 - (void)noteReadForUsername:(NSString *)username;
 @end
 
+@interface WCRGroupingEntry : NSObject
+@property(nonatomic, assign) BOOL nativePassthrough;
+@property(nonatomic, strong) NSIndexPath *nativeOriginalIndexPath;
+@property(nonatomic, strong) id cachedNativeCellData;
+@property(nonatomic, strong) id cachedFakeCellData;
+@end
+
+@interface WCRGroupingSnapshot : NSObject
+@property(nonatomic, assign) NSInteger targetSection;
+@property(nonatomic, copy) NSArray *preservedOriginalRows;
+@property(nonatomic, copy) NSArray *trailingOriginalRows;
+@property(nonatomic, copy) NSArray<WCRGroupingEntry *> *entries;
+@property(nonatomic, assign) BOOL builtForInlineMode;
+@end
+
 @interface NewMainFrameViewController : UIViewController
 - (id)logicGetSessionAtIndexPath:(NSIndexPath *)indexPath;
 - (id)wcrGrouping_logicGetSessionAtIndexPath:(NSIndexPath *)indexPath;
 - (id)wcrGrouping_logicGetCellDataAtIndexPath:(NSIndexPath *)indexPath;
+- (WCRGroupingSnapshot *)wcrGrouping_snapshotForTableView:(UITableView *)tableView;
 - (void)wcrGrouping_scheduleRefreshForTrigger:(id)trigger;
 - (void)viewDidAppear:(BOOL)animated;
 @end
@@ -778,8 +794,6 @@ static id WCRHostForTable(UITableView *tableView) {
     if (!host) return nil;
 
     if ([host respondsToSelector:
-            @selector(wcrGrouping_logicGetCellDataAtIndexPath:)] ||
-        [host respondsToSelector:
             @selector(wcrGrouping_logicGetSessionAtIndexPath:)] ||
         [host respondsToSelector:
             @selector(logicGetSessionAtIndexPath:)]) {
@@ -789,114 +803,166 @@ static id WCRHostForTable(UITableView *tableView) {
     return nil;
 }
 
-static BOOL WCRUsernameIsSyntheticGroupEntry(NSString *username) {
-    if (![username isKindOfClass:[NSString class]] ||
-        username.length == 0) {
-        return NO;
-    }
-
-    // WCRefine 2.1-2's actual synthetic HOME group/category marker is:
-    //     WCRefine_groupEntry_
-    //
-    // v1.8.7 used a lower-case spelling and therefore missed some category
-    // rows (notably 服务号 on the tested build).
-    //
-    // Compare case-insensitively and accept both the underscore form and the
-    // base marker to stay compatible with nearby WCRefine builds.
-    NSString *lower = username.lowercaseString;
-    return [lower hasPrefix:@"wcrefine_groupentry_"] ||
-           [lower isEqualToString:@"wcrefine_groupentry"];
-}
-
-static BOOL WCRObjectIsGroupingEntry(id obj) {
+static BOOL WCRIsGroupingEntryObject(id obj) {
     if (!obj) return NO;
 
-    Class entryClass = NSClassFromString(@"WCRGroupingEntry");
-    if (entryClass && [obj isKindOfClass:entryClass]) {
+    Class cls = NSClassFromString(@"WCRGroupingEntry");
+    if (cls && [obj isKindOfClass:cls]) {
         return YES;
     }
 
     return [WCRClassName(obj) isEqualToString:@"WCRGroupingEntry"];
 }
 
-static BOOL WCRCellClassLooksLikeSyntheticGroupingEntry(UITableViewCell *cell) {
-    if (!cell) return NO;
+static BOOL WCRCellDataMatches(id lhs, id rhs) {
+    if (!lhs || !rhs) return NO;
+    if (lhs == rhs) return YES;
 
-    NSString *name = WCRClassName(cell);
-    if (name.length == 0) return NO;
+    // Keep equality as a secondary check because some WCRefine builds can
+    // recreate equivalent cell-data wrappers while retaining them on the
+    // WCRGroupingEntry cache.
+    if ([lhs respondsToSelector:@selector(isEqual:)]) {
+        return [lhs isEqual:rhs];
+    }
 
-    // Do NOT blacklist WCRGroupingNativeFakeEntryCell /
-    // WCRGroupingNativeFinalEntryCell by class alone. In WCRefine these
-    // projected/native row classes can also participate in real surfaced
-    // conversation rendering; class-only rejection caused grouped chat-room
-    // messages to lose ActiveFront right swipe.
-    //
-    // Only a truly explicit grouping-entry cell name is accepted here.
-    return ([name rangeOfString:@"WCRGroupingEntryCell"].location != NSNotFound);
+    return NO;
 }
 
-static id WCRProjectedCellDataForIndexPath(id host,
-                                           NSIndexPath *indexPath) {
-    if (!host || !indexPath) return nil;
+static NSIndexPath *WCROriginalIndexPathFromRecord(id record,
+                                                   NSInteger fallbackSection) {
+    if (!record) return nil;
 
-    if (![host respondsToSelector:
-            @selector(wcrGrouping_logicGetCellDataAtIndexPath:)]) {
+    if ([record isKindOfClass:[NSIndexPath class]]) {
+        return (NSIndexPath *)record;
+    }
+
+    if ([record respondsToSelector:@selector(integerValue)]) {
+        NSInteger row = [record integerValue];
+        if (row < 0) return nil;
+
+        return [NSIndexPath indexPathForRow:row
+                                 inSection:fallbackSection];
+    }
+
+    return nil;
+}
+
+static id WCRNativeSessionAtOriginalIndexPath(id host,
+                                               NSIndexPath *originalIndexPath) {
+    if (!host || !originalIndexPath) return nil;
+    if (![host respondsToSelector:@selector(logicGetSessionAtIndexPath:)]) {
         return nil;
     }
 
     return [(NewMainFrameViewController *)host
-        wcrGrouping_logicGetCellDataAtIndexPath:indexPath];
+        logicGetSessionAtIndexPath:originalIndexPath];
 }
 
-static BOOL WCRProjectedObjectIsSyntheticGroupRow(id obj) {
-    if (!obj) return NO;
+static WCRGroupingEntry *WCREntryMatchingProjectedCellData(
+    WCRGroupingSnapshot *snapshot,
+    id projectedCellData) {
 
-    if (WCRObjectIsGroupingEntry(obj)) {
-        return YES;
-    }
+    if (!snapshot || !projectedCellData) return nil;
 
-    WCRefineGroupDataProvider *provider = WCRDataProvider();
-    NSString *username =
-        provider ? [provider usernameForNativeObject:obj] : nil;
+    for (id candidate in snapshot.entries) {
+        if (!WCRIsGroupingEntryObject(candidate)) continue;
 
-    if (WCRUsernameIsSyntheticGroupEntry(username)) {
-        return YES;
-    }
+        WCRGroupingEntry *entry = (WCRGroupingEntry *)candidate;
 
-    return NO;
-}
-
-static BOOL WCRIsSyntheticHomeGroupRow(UITableViewCell *cell,
-                                       id host,
-                                       NSIndexPath *indexPath,
-                                       id projectedCellData) {
-    if (!cell || !host || !indexPath) return NO;
-
-    if (WCRCellClassLooksLikeSyntheticGroupingEntry(cell)) {
-        return YES;
-    }
-
-    if (WCRProjectedObjectIsSyntheticGroupRow(projectedCellData)) {
-        return YES;
-    }
-
-    // Some WCRefine builds expose a projected "session" object for group
-    // entries instead of exposing the marker on cellData. Check that object
-    // only for the synthetic marker; do NOT require it to be non-nil for real
-    // conversations because surfaced unread native rows can legitimately take
-    // a different resolver path.
-    if ([host respondsToSelector:
-            @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
-        id projectedSession =
-            [(NewMainFrameViewController *)host
-                wcrGrouping_logicGetSessionAtIndexPath:indexPath];
-
-        if (WCRProjectedObjectIsSyntheticGroupRow(projectedSession)) {
-            return YES;
+        if (WCRCellDataMatches(projectedCellData,
+                               entry.cachedFakeCellData) ||
+            WCRCellDataMatches(projectedCellData,
+                               entry.cachedNativeCellData)) {
+            return entry;
         }
     }
 
-    return NO;
+    return nil;
+}
+
+static id WCRResolveEntrySession(id host,
+                                 WCRGroupingEntry *entry) {
+    if (!entry || !WCRIsGroupingEntryObject(entry)) return nil;
+
+    // This is the semantic distinction used by WCRefine itself:
+    //
+    // nativePassthrough == NO
+    //     -> this row IS the group/category container
+    //        (家人组/工作组/未分类好友/未分类群/公众号/服务号/其它...)
+    //        It must have NO ActiveFront right swipe.
+    //
+    // nativePassthrough == YES
+    //     -> this projected entry actually represents a real native
+    //        conversation. Resolve it through its ORIGINAL native indexPath.
+    if (!entry.nativePassthrough) {
+        return nil;
+    }
+
+    return WCRNativeSessionAtOriginalIndexPath(
+        host,
+        entry.nativeOriginalIndexPath);
+}
+
+static id WCRSessionForStandardSnapshotRow(id host,
+                                           WCRGroupingSnapshot *snapshot,
+                                           NSIndexPath *visibleIndexPath) {
+    if (!host || !snapshot || !visibleIndexPath) return nil;
+
+    if (visibleIndexPath.section != snapshot.targetSection) {
+        // WCRefine did not project this section, so visible/native coordinates
+        // are still the same.
+        return WCRNativeSessionAtOriginalIndexPath(host,
+                                                   visibleIndexPath);
+    }
+
+    NSArray *preserved = snapshot.preservedOriginalRows ?: @[];
+    NSArray *entries = snapshot.entries ?: @[];
+    NSArray *trailing = snapshot.trailingOriginalRows ?: @[];
+
+    NSInteger row = visibleIndexPath.row;
+    if (row < 0) return nil;
+
+    NSUInteger urow = (NSUInteger)row;
+    NSUInteger preservedCount = preserved.count;
+    NSUInteger entryCount = entries.count;
+
+    // 1) Native rows kept before WCRefine's projected group entries.
+    if (urow < preservedCount) {
+        NSIndexPath *original =
+            WCROriginalIndexPathFromRecord(preserved[urow],
+                                           snapshot.targetSection);
+        return WCRNativeSessionAtOriginalIndexPath(host, original);
+    }
+
+    // 2) WCRefine projected entries.
+    NSUInteger entryStart = preservedCount;
+    NSUInteger entryEnd = entryStart + entryCount;
+
+    if (urow >= entryStart && urow < entryEnd) {
+        id candidate = entries[urow - entryStart];
+
+        if (!WCRIsGroupingEntryObject(candidate)) {
+            return nil;
+        }
+
+        return WCRResolveEntrySession(host,
+                                      (WCRGroupingEntry *)candidate);
+    }
+
+    // 3) Native rows kept after projected entries.
+    if (urow >= entryEnd) {
+        NSUInteger trailingOffset = urow - entryEnd;
+        if (trailingOffset < trailing.count) {
+            NSIndexPath *original =
+                WCROriginalIndexPathFromRecord(
+                    trailing[trailingOffset],
+                    snapshot.targetSection);
+            return WCRNativeSessionAtOriginalIndexPath(host, original);
+        }
+    }
+
+    // Never pass a projected visible indexPath to WeChat's native resolver.
+    return nil;
 }
 
 static id WCRSessionForCell(UITableViewCell *cell,
@@ -912,59 +978,98 @@ static id WCRSessionForCell(UITableViewCell *cell,
     id host = WCRHostForTable(tableView);
     if (!host) return nil;
 
-    id projectedCellData =
-        WCRProjectedCellDataForIndexPath(host, indexPath);
-
-    // IMPORTANT: this is the only new HOME-row exclusion.
-    // We exclude the GROUP CONTAINER ROW itself, not real friend/chatroom rows.
-    if (WCRIsSyntheticHomeGroupRow(cell,
-                                   host,
-                                   indexPath,
-                                   projectedCellData)) {
-        return nil;
+    WCRGroupingSnapshot *snapshot = nil;
+    if ([host respondsToSelector:
+            @selector(wcrGrouping_snapshotForTableView:)]) {
+        snapshot =
+            [(NewMainFrameViewController *)host
+                wcrGrouping_snapshotForTableView:tableView];
     }
 
-    WCRefineGroupDataProvider *provider = WCRDataProvider();
-    id session = nil;
+    id projectedCellData = nil;
+    if ([host respondsToSelector:
+            @selector(wcrGrouping_logicGetCellDataAtIndexPath:)]) {
+        projectedCellData =
+            [(NewMainFrameViewController *)host
+                wcrGrouping_logicGetCellDataAtIndexPath:indexPath];
+    }
 
-    // 1) Prefer WCRefine's projection-aware resolver when it can resolve this
-    //    real conversation row.
+    // First classify the visible row against WCRefine's own entry cache.
+    // This also works in inline-mode layouts where a simple row-range formula
+    // is not sufficient.
+    WCRGroupingEntry *matchedEntry =
+        WCREntryMatchingProjectedCellData(snapshot,
+                                          projectedCellData);
+
+    if (matchedEntry) {
+        id matchedSession =
+            WCRResolveEntrySession(host, matchedEntry);
+
+        if (!matchedSession) {
+            // Confirmed group/category container row.
+            return nil;
+        }
+
+        if (hostOut) *hostOut = host;
+        if (tableOut) *tableOut = tableView;
+        if (indexPathOut) *indexPathOut = indexPath;
+        return matchedSession;
+    }
+
+    // Ask WCRefine's own projection-aware resolver next. Real inline member
+    // rows and many real surfaced conversation rows are resolved here.
+    id projectedSession = nil;
     if ([host respondsToSelector:
             @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
-        session =
+        projectedSession =
             [(NewMainFrameViewController *)host
                 wcrGrouping_logicGetSessionAtIndexPath:indexPath];
     }
 
-    // 2) Surface/native passthrough rows can have usable projected cellData
-    //    even when the projection session resolver returns nil.
-    if (!session && projectedCellData && provider) {
-        session = [provider nativeSessionFromObject:projectedCellData];
+    if (projectedSession &&
+        !WCRIsGroupingEntryObject(projectedSession)) {
+        if (hostOut) *hostOut = host;
+        if (tableOut) *tableOut = tableView;
+        if (indexPathOut) *indexPathOut = indexPath;
+        return projectedSession;
     }
 
-    // 3) Final fallback: retain the native resolver that was proven on-device
-    //    in v1.8.5 for newly surfaced friend/chatroom messages.
-    //
-    //    This fallback is safe now because synthetic group rows were rejected
-    //    above before native index-path resolution is attempted.
-    if (!session &&
-        [host respondsToSelector:@selector(logicGetSessionAtIndexPath:)]) {
-        session =
-            [(NewMainFrameViewController *)host
-                logicGetSessionAtIndexPath:indexPath];
-    }
+    if (snapshot) {
+        if (!snapshot.builtForInlineMode) {
+            // Standard WCRefine home layout has an exact mapping:
+            // preserved native rows -> entries -> trailing native rows.
+            id mappedSession =
+                WCRSessionForStandardSnapshotRow(host,
+                                                 snapshot,
+                                                 indexPath);
+            if (mappedSession) {
+                if (hostOut) *hostOut = host;
+                if (tableOut) *tableOut = tableView;
+                if (indexPathOut) *indexPathOut = indexPath;
+                return mappedSession;
+            }
 
-    // Defensive marker check in case a future WCRefine build returns a
-    // synthetic object through one of the session resolvers.
-    if (WCRProjectedObjectIsSyntheticGroupRow(session)) {
+            return nil;
+        }
+
+        // Inline mode: if WCRefine's own resolver did not resolve the row and
+        // no entry cache matched above, do NOT guess by feeding the projected
+        // visible indexPath into WeChat's native resolver.
         return nil;
     }
 
-    if (hostOut) *hostOut = host;
-    if (tableOut) *tableOut = tableView;
-    if (indexPathOut) *indexPathOut = indexPath;
+    // Compatibility fallback only when WCRefine has no grouping snapshot at
+    // all. In that case the table is effectively unprojected.
+    id nativeSession =
+        WCRNativeSessionAtOriginalIndexPath(host, indexPath);
 
-    return session;
+    if (nativeSession) {
+        if (hostOut) *hostOut = host;
+        if (tableOut) *tableOut = tableView;
+        if (indexPathOut) *indexPathOut = indexPath;
+    }
+
+    return nativeSession;
 }
 
 static BOOL WCRResolveSessionState(id session,
@@ -1791,12 +1896,10 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     if (boundUsername.length > 0 &&
         (currentUsername.length == 0 ||
          ![boundUsername isEqualToString:currentUsername])) {
-        // Important nil-reuse case:
-        // a cell that previously displayed a surfaced real conversation can
-        // later be recycled into a WCRefine group/category row. That new row
-        // has no ActiveFront username, so the old code failed to notice the
-        // identity change and could leave "保持/分组/回组" visually sitting
-        // over the avatar.
+        // A reusable NewMainFrameCell may move from a real surfaced chat to a
+        // WCRefine group-entry row. The latter intentionally has no
+        // ActiveFront username. Treat nil as an identity change too, otherwise
+        // old “保持/分组/回组” text can survive over the new avatar/title.
         WCRHardResetCellVisual(cell, YES);
         boundUsername = nil;
     }
@@ -1882,28 +1985,7 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     }
 
     WCRLayoutAction(cell);
-    BOOL hasAction = WCRPrepareActionForCell(cell);
-
-    if (!hasAction) {
-        // A group/category row must be inert, not merely title-less.
-        // This also protects service/official/default-group rows from claiming
-        // the independent right-pan recognizer.
-        if (WCRBool(cell, kWCROpenKey) ||
-            WCRBool(cell, kWCRTrackingKey) ||
-            objc_getAssociatedObject(cell, kWCRBoundUsernameKey)) {
-            WCRHardResetCellVisual(cell, YES);
-        } else {
-            UIView *actionView =
-                objc_getAssociatedObject(cell, kWCRActionViewKey);
-            UIButton *button =
-                objc_getAssociatedObject(cell, kWCRButtonKey);
-            actionView.hidden = YES;
-            [button setTitle:@"" forState:UIControlStateNormal];
-        }
-        pan.enabled = NO;
-    } else {
-        pan.enabled = YES;
-    }
+    WCRPrepareActionForCell(cell);
 
     // Reconcile the visual state on every scan. A valid action title does not
     // mean its view should be visible: closed rows must always keep the action
@@ -1934,6 +2016,9 @@ static BOOL gWCRHookProvider = NO;
 static BOOL gWCRHookIncoming = NO;
 static BOOL gWCRHookRead = NO;
 static BOOL gWCRHookHome = NO;
+static BOOL gWCRHookCellReuse = NO;
+
+static void (*orig_cellPrepareForReuse)(id, SEL) = NULL;
 static BOOL gWCRBootstrapCloseScheduled = NO;
 
 static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
@@ -2060,6 +2145,17 @@ static void hook_activeViewDidAppear(id self,
                            @"active_front_home_appear");
 }
 
+static void hook_cellPrepareForReuse(id self,
+                                     SEL _cmd) {
+    if (orig_cellPrepareForReuse) {
+        orig_cellPrepareForReuse(self, _cmd);
+    }
+
+    if ([self isKindOfClass:[UITableViewCell class]]) {
+        WCRHardResetCellVisual((UITableViewCell *)self, YES);
+    }
+}
+
 static BOOL WCRInstallInstanceHook(Class cls,
                                    SEL sel,
                                    IMP replacement,
@@ -2131,6 +2227,8 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         NSClassFromString(@"WCRQuickChatRuntime");
     Class mainFrame =
         NSClassFromString(@"NewMainFrameViewController");
+    Class mainFrameCell =
+        NSClassFromString(@"NewMainFrameCell");
 
     if (!gWCRHookConfig && config) {
         gWCRHookConfig =
@@ -2175,6 +2273,15 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                 @selector(viewDidAppear:),
                 (IMP)hook_activeViewDidAppear,
                 (IMP *)&orig_activeViewDidAppear);
+    }
+
+    if (!gWCRHookCellReuse && mainFrameCell) {
+        gWCRHookCellReuse =
+            WCRInstallInstanceHook(
+                mainFrameCell,
+                @selector(prepareForReuse),
+                (IMP)hook_cellPrepareForReuse,
+                (IMP *)&orig_cellPrepareForReuse);
     }
 
     if (gWCRHookProvider) {
@@ -2222,7 +2329,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_8_9 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_9_0 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -2245,9 +2352,8 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.8.9：右滑 = 分组 / 保持 / 回组\n"
-                 "真实好友/群聊行保留 ActiveFront 右滑。\n"
-                 "首页 WCRefine 分组条目本身禁止右滑。\n"
+                 "v1.9.0：右滑 = 分组 / 保持 / 回组\n"
+                 "按 WCRefine snapshot/nativePassthrough 区分组入口与真实会话。\n"
                  "WCRefine 组内列表不挂独立右滑手势。\n"
                  "左滑继续使用微信原生菜单。\n"
                  "右滑区域保持透明底色。",
@@ -2259,7 +2365,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_8_9 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_9_0 Ready", message);
         }
     });
 }
@@ -2278,7 +2384,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.8.9");
+        WCRAF_LOG(@"dylib loaded; starting v1.9.0");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
