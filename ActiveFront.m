@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_v1_9_1_1_COMPILE_FIX.m
-// WCRefine ActiveFront - v1.9.1.1: compile fix for row-debug gesture.
+// ActiveFront.RIGHT_v1_9_2_LIVE_SESSION_STATE_FIX.m
+// WCRefine ActiveFront - v1.9.2: live row session + grouped-visible action semantics.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -40,7 +40,7 @@ static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.9.1.1";
+static NSString * const kWCRAFVersion = @"1.9.2";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -905,12 +905,77 @@ static id WCRSessionForCell(UITableViewCell *cell,
         WCRHomeControllerForTable(tableView);
     if (!host) return nil;
 
-    // Do not guess a projected row identity from WeChat's native index map.
-    // Wait until WCRefine's own willDisplay callback has classified this row.
-    if (!WCRCanonicalRowKnown(cell)) return nil;
+    // IMPORTANT:
+    // A home refresh / keep / return can reorder rows without producing a new
+    // willDisplay callback for every still-visible cell.  The diagnostic data
+    // proved that a cell could therefore keep canonicalUser=A while WCRefine's
+    // current resolver for the same visible indexPath already returned user=B.
+    //
+    // Resolve the CURRENT row again at gesture/action time.  This is
+    // WCRefine's own projection-aware resolver, not WeChat's native index map.
+    id session = nil;
+    if ([host respondsToSelector:
+            @selector(wcrGrouping_logicGetSessionAtIndexPath:)]) {
+        session =
+            [host wcrGrouping_logicGetSessionAtIndexPath:indexPath];
+    }
 
-    id session =
-        objc_getAssociatedObject(cell, kWCRCanonicalSessionKey);
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    NSString *username = nil;
+    NSUInteger scope = 0;
+    BOOL eligibleConversation = NO;
+
+    if (provider && session) {
+        username = [provider usernameForNativeObject:session];
+        scope = [provider groupScopeForNativeSession:session];
+        eligibleConversation =
+            username.length > 0 &&
+            (scope == 1 || scope == 2);
+    }
+
+    if (!eligibleConversation) {
+        // This visible row is a WCRefine group/category/service/official/other
+        // row (or otherwise not an eligible friend/chatroom conversation).
+        // Clear stale cached identity/action UI and fail closed.
+        NSString *oldUsername =
+            objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey);
+
+        if (oldUsername.length > 0 ||
+            WCRBool(cell, kWCROpenKey) ||
+            WCRBool(cell, kWCRTrackingKey)) {
+            WCRHardResetCellVisual(cell, YES);
+        }
+
+        objc_setAssociatedObject(cell, kWCRCanonicalKnownKey, @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(cell, kWCRCanonicalSessionKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(cell, kWCRCanonicalUsernameKey, nil,
+                                 OBJC_ASSOCIATION_COPY_NONATOMIC);
+        objc_setAssociatedObject(cell, kWCRCanonicalScopeKey, @0,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        return nil;
+    }
+
+    // Refresh the cache so diagnostics and later reuse checks describe the row
+    // that WCRefine currently considers visible here.
+    NSString *oldUsername =
+        objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey);
+
+    if (oldUsername.length > 0 &&
+        ![oldUsername isEqualToString:username]) {
+        WCRHardResetCellVisual(cell, YES);
+    }
+
+    objc_setAssociatedObject(cell, kWCRCanonicalKnownKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, kWCRCanonicalSessionKey, session,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, kWCRCanonicalUsernameKey, username,
+                             OBJC_ASSOCIATION_COPY_NONATOMIC);
+    objc_setAssociatedObject(cell, kWCRCanonicalScopeKey, @(scope),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     if (hostOut) *hostOut = host;
     if (tableOut) *tableOut = tableView;
@@ -982,6 +1047,10 @@ static WCRRightActionKind WCRActionKindForCell(UITableViewCell *cell,
         return WCRRightActionNone;
     }
 
+    // Surfaced is intentionally not required for action selection in v1.9.2.
+    // Keep it resolved for diagnostics and the existing projection hooks.
+    (void)surfaced;
+
     WCRRightActionKind kind = WCRRightActionNone;
 
     if (!grouped) {
@@ -996,7 +1065,14 @@ static WCRRightActionKind WCRActionKindForCell(UITableViewCell *cell,
         }
     } else if (held) {
         kind = WCRRightActionReturn;
-    } else if (surfaced) {
+    } else {
+        // If a grouped friend/chatroom is currently a REAL visible row on the
+        // home list, the correct action is always "保持".
+        //
+        // Do not gate this on our Surfaced flag. WCRefine's own unread
+        // exclusion is what makes an unread grouped conversation appear on
+        // home. The Surfaced flag is supplemental state and can legitimately
+        // be 0 after keep -> return or on later incoming messages.
         kind = WCRRightActionKeep;
     }
 
@@ -1495,7 +1571,7 @@ static void WCRShowCanonicalRowDebug(UITableViewCell *cell) {
              "table=%@\n"
              "delegate=%@\n"
              "host=%@\n\n"
-             "canonicalKnown=%d\n"
+             "canonicalKnown=%d (cache only; action uses live WCRefineSession)\n"
              "canonicalSession=%@\n"
              "canonicalUser=%@\n"
              "canonicalScope=%@\n\n"
@@ -2363,7 +2439,7 @@ static void WCRScan(BOOL showReady) {
         if (!tableView) {
             if (showReady && !gWCRReadyShown) {
                 gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_9_1_1 Ready",
+                WCRShow(@"RIGHT_GROUP_UI_V1_9_2 Ready",
                         @"MainFrameTableView not found.");
             }
             return;
@@ -2386,7 +2462,7 @@ static void WCRScan(BOOL showReady) {
                 @"Table: %@\n"
                  "Visible attached cells: %lu\n"
                  "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.9.1.1：右滑 = 分组 / 保持 / 回组\n"
+                 "v1.9.2：右滑 = 分组 / 保持 / 回组\n"
                  "行身份直接绑定 WCRefine 自己的 session resolver。\n"
                  "WCRefine 组内列表不挂独立右滑手势。\n"
                  "左滑继续使用微信原生菜单。\n"
@@ -2399,7 +2475,7 @@ static void WCRScan(BOOL showReady) {
                  gWCRHookRead,
                  gWCRHookHome];
 
-            WCRShow(@"RIGHT_GROUP_UI_V1_9_1_1 Ready", message);
+            WCRShow(@"RIGHT_GROUP_UI_V1_9_2 Ready", message);
         }
     });
 }
@@ -2418,7 +2494,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.9.1.1");
+        WCRAF_LOG(@"dylib loaded; starting v1.9.2");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
