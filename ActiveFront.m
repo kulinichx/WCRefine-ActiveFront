@@ -1,9 +1,9 @@
-// ActiveFront.RIGHT_v1_9_5_REJECT_GROUP_ENTRIES_AND_WECOM_DIAGNOSTIC.m
-// WCRefine ActiveFront - v1.9.5 diagnostic candidate built on the v1.9.2 state machine.
-// Identity fix: rendered m_cellData stays authoritative, but WCRefine synthetic
+// ActiveFront.RIGHT_v1_9_5_RC1.m
+// WCRefine ActiveFront - v1.9.5 RC1 built on the validated v1.9.2 state machine.
+// Identity fix: rendered m_cellData stays authoritative, while WCRefine synthetic
 // WCRefine_groupEntry_* rows are rejected and never fall through to indexPath.
-// WeCom step: no nickname layout is changed yet; sys_other rows only gain a
-// single-finger long-press diagnostic for OpenIM/enterprise identity + UILabel frames.
+// Release scope: ActiveFront right-swipe only. No OpenIM layout experiment,
+// no diagnostic gesture, and no startup readiness alert.
 //
 // v1.8 keeps the v1.7 gesture path that already works on-device:
 // - WCRefine owns a separate right-only UIPanGestureRecognizer on NewMainFrameCell.
@@ -41,9 +41,8 @@ static const void *kWCRCanonicalUsernameKey = &kWCRCanonicalUsernameKey;
 static const void *kWCRCanonicalScopeKey = &kWCRCanonicalScopeKey;
 static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
-static BOOL gWCRReadyShown = NO;
 
-static NSString * const kWCRAFVersion = @"1.9.5";
+static NSString * const kWCRAFVersion = @"1.9.5-RC1"; // daily-use RC1: no startup/debug alert
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
@@ -312,34 +311,6 @@ static UIViewController *WCRTopVC(void) {
     }
 
     return vc;
-}
-
-static void WCRShow(NSString *title, NSString *message) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = WCRTopVC();
-        if (!vc) return;
-
-        if ([vc isKindOfClass:[UIAlertController class]] ||
-            [vc.presentedViewController isKindOfClass:[UIAlertController class]]) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t)(0.30 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                WCRShow(title, message);
-            });
-            return;
-        }
-
-        UIAlertController *alert =
-            [UIAlertController alertControllerWithTitle:title
-                                                message:message ?: @""
-                                         preferredStyle:UIAlertControllerStyleAlert];
-
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                                 style:UIAlertActionStyleDefault
-                                               handler:nil]];
-
-        [vc presentViewController:alert animated:YES completion:nil];
-    });
 }
 
 static void WCRCollectTableViews(UIView *view, NSMutableArray *tables) {
@@ -855,12 +826,6 @@ static NewMainFrameViewController *WCRHomeControllerForTable(
     return nil;
 }
 
-static BOOL WCRCanonicalRowKnown(UITableViewCell *cell) {
-    NSNumber *known =
-        cell ? objc_getAssociatedObject(cell, kWCRCanonicalKnownKey) : nil;
-    return known.boolValue;
-}
-
 static void WCRClearCanonicalRowBinding(UITableViewCell *cell) {
     if (!cell) return;
 
@@ -1364,25 +1329,6 @@ static UIViewController *WCRPresenterForHost(id host) {
     return vc;
 }
 
-static void WCRShowNoGroupsAlert(id host) {
-    UIViewController *presenter = WCRPresenterForHost(host);
-    if (!presenter) return;
-
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"分组"
-                                            message:@"当前没有适用于这个会话的分组。"
-                                     preferredStyle:UIAlertControllerStyleAlert];
-
-    [alert addAction:
-        [UIAlertAction actionWithTitle:@"好"
-                                 style:UIAlertActionStyleCancel
-                               handler:nil]];
-
-    [presenter presentViewController:alert
-                            animated:YES
-                          completion:nil];
-}
-
 static void WCRPresentGroupPicker(id host,
                                   NSString *username,
                                   id session,
@@ -1398,7 +1344,10 @@ static void WCRPresentGroupPicker(id host,
     NSArray<WCRefineGroup *> *groups = WCRAvailableGroupsForScope(scope);
 
     if (groups.count == 0) {
-        WCRShowNoGroupsAlert(host);
+        // RC1: fail silently when there is no compatible custom group.
+        // This avoids a modal “点好/OK” prompt in normal daily use.
+        WCRAF_LOG(@"no compatible groups for %@ scope=%lu",
+                  username, (unsigned long)scope);
         return;
     }
 
@@ -2501,50 +2450,14 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
 
 #pragma mark - Scan
 
-static void WCRScan(BOOL showReady) {
+static void WCRScan(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UITableView *tableView = WCRMainTable();
-
-        if (!tableView) {
-            if (showReady && !gWCRReadyShown) {
-                gWCRReadyShown = YES;
-                WCRShow(@"RIGHT_GROUP_UI_V1_9_5 Ready",
-                        @"MainFrameTableView not found.");
-            }
-            return;
-        }
-
-        NSUInteger attached = 0;
+        if (!tableView) return;
 
         for (UITableViewCell *cell in tableView.visibleCells) {
             if (!WCRIsMainFrameCell(cell)) continue;
             WCRAttachToCell(cell);
-            if (objc_getAssociatedObject(cell, kWCRPanKey)) {
-                attached++;
-            }
-        }
-
-        if (showReady && !gWCRReadyShown) {
-            gWCRReadyShown = YES;
-
-            NSString *message = [NSString stringWithFormat:
-                @"Table: %@\n"
-                 "Visible attached cells: %lu\n"
-                 "Hooks: C%d P%d I%d R%d H%d\n\n"
-                 "v1.9.5 stable：右滑 = 分组 / 保持 / 回组\n"
-                 "可见 Cell.cellData 为权威身份；WCRefine_groupEntry_* 入口强制禁用右滑。\n"
-                 "不包含企业微信/OpenIM 布局实验或诊断手势。\n"
-                 "左滑继续使用微信原生菜单。\n"
-                 "右滑区域保持透明底色。",
-                 WCRClassName(tableView),
-                 (unsigned long)attached,
-                 gWCRHookConfig,
-                 gWCRHookProvider,
-                 gWCRHookIncoming,
-                 gWCRHookRead,
-                 gWCRHookHome];
-
-            WCRShow(@"RIGHT_GROUP_UI_V1_9_5 Ready", message);
         }
     });
 }
@@ -2555,7 +2468,7 @@ static void WCRRepeat(NSUInteger remaining) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                  (int64_t)(0.45 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        WCRScan(NO);
+        WCRScan();
         WCRRepeat(remaining - 1);
     });
 }
@@ -2563,13 +2476,13 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.9.5 diagnostic candidate");
+        WCRAF_LOG(@"dylib loaded; starting v1.9.5 release");
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
                           (int64_t)(3.0 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{
-                WCRScan(NO);
+                WCRScan();
                 WCRRepeat(180);
             });
 
@@ -2580,11 +2493,5 @@ static void WCRRightGroupUIInit(void) {
                 WCRTryInstallBusinessHooks(80);
             });
 
-        dispatch_after(
-            dispatch_time(DISPATCH_TIME_NOW,
-                          (int64_t)(5.5 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), ^{
-                WCRScan(YES);
-            });
     }
 }
