@@ -1,5 +1,11 @@
-// ActiveFront.RIGHT_v1_9_6.m
-// WCRefine ActiveFront - v1.9.6 (WCRefine 2.1-8 compatibility, plan B).
+// ActiveFront.RIGHT_v1_9_7.m
+// WCRefine ActiveFront - v1.9.7 (hold auto-expiry).
+// v1.9.7: Held sessions return to their group automatically after N days
+// without a new message (N = never/3/7/14/30, default 7). Choose N by
+// long-pressing the right-swipe 保持/回组 button. No timers: expiry is
+// evaluated lazily inside WCRefine's own home refresh pass.
+//
+// v1.9.6 (WCRefine 2.1-8 compatibility, plan B):
 // v1.9.6: WCRefine's own "不收纳非免打扰未读" switch is now the single source of
 // truth for unread sessions. ActiveFront only projects its own Held sessions:
 // - the getter is forced only while Held sessions exist, and WCRefine's settings
@@ -52,9 +58,14 @@ static const void *kWCRCanonicalScopeKey = &kWCRCanonicalScopeKey;
 static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 
-static NSString * const kWCRAFVersion = @"1.9.6"; // plan B: respect WCRefine unread switch
+static NSString * const kWCRAFVersion = @"1.9.7"; // hold auto-expiry
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
+// v1.9.7: username -> NSNumber(seconds since 1970) when 保持 was pressed.
+static NSString * const kWCRAFHeldSinceDefaultsKey = @"com.local.wcrefine.activefront.heldSince.v1";
+// v1.9.7: NSInteger days; 0 = never expire; absent = default.
+static NSString * const kWCRAFHoldExpiryDaysDefaultsKey = @"com.local.wcrefine.activefront.holdExpiryDays.v1";
+static const NSInteger kWCRAFDefaultHoldExpiryDays = 7;
 // Legacy (<= v1.9.5) Surfaced state. Only used to delete stale data once.
 static NSString * const kWCRAFLegacySurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
 
@@ -747,10 +758,197 @@ static void WCRRefreshHomeGlobal(__unused NSString *reason) {
     });
 }
 
+#pragma mark - Hold expiry (v1.9.7)
+
+// Hold expiry never uses timers. It is evaluated lazily for Held sessions
+// inside WCRefine's own refresh pass (which ActiveFront already triggers on
+// every home appearance), so the cost is a few date comparisons per refresh.
+
+static NSInteger gWCRHoldExpiryDaysCache = -1;
+static NSMutableDictionary<NSString *, NSNumber *> *gWCRHeldSinceCache = nil;
+static NSMutableSet<NSString *> *gWCRPendingHoldExpiry = nil;
+
+static NSInteger WCRHoldExpiryDays(void) {
+    @synchronized (WCRAFStateLock()) {
+        if (gWCRHoldExpiryDaysCache < 0) {
+            id value = [[NSUserDefaults standardUserDefaults]
+                           objectForKey:kWCRAFHoldExpiryDaysDefaultsKey];
+            NSInteger days =
+                [value respondsToSelector:@selector(integerValue)] ?
+                    [value integerValue] :
+                    kWCRAFDefaultHoldExpiryDays;
+            gWCRHoldExpiryDaysCache = days < 0 ? 0 : days;
+        }
+        return gWCRHoldExpiryDaysCache;
+    }
+}
+
+static void WCRSetHoldExpiryDays(NSInteger days) {
+    if (days < 0) days = 0;
+    @synchronized (WCRAFStateLock()) {
+        gWCRHoldExpiryDaysCache = days;
+        [[NSUserDefaults standardUserDefaults]
+            setInteger:days
+                forKey:kWCRAFHoldExpiryDaysDefaultsKey];
+    }
+    WCRAF_LOG(@"hold expiry days = %ld", (long)days);
+}
+
+// Caller must hold WCRAFStateLock().
+static NSMutableDictionary<NSString *, NSNumber *> *WCRHeldSinceMapLocked(void) {
+    if (!gWCRHeldSinceCache) {
+        gWCRHeldSinceCache = [NSMutableDictionary dictionary];
+        id stored = [[NSUserDefaults standardUserDefaults]
+                        objectForKey:kWCRAFHeldSinceDefaultsKey];
+        if ([stored isKindOfClass:[NSDictionary class]]) {
+            [(NSDictionary *)stored enumerateKeysAndObjectsUsingBlock:
+                ^(id key, id obj, __unused BOOL *stop) {
+                if ([key isKindOfClass:[NSString class]] &&
+                    [(NSString *)key length] > 0 &&
+                    [obj isKindOfClass:[NSNumber class]]) {
+                    gWCRHeldSinceCache[key] = obj;
+                }
+            }];
+        }
+    }
+    return gWCRHeldSinceCache;
+}
+
+static void WCRSaveHeldSinceMapLocked(void) {
+    [[NSUserDefaults standardUserDefaults]
+        setObject:[WCRHeldSinceMapLocked() copy]
+           forKey:kWCRAFHeldSinceDefaultsKey];
+}
+
+static NSTimeInterval WCRHeldSince(NSString *username) {
+    if (username.length == 0) return 0;
+    @synchronized (WCRAFStateLock()) {
+        return [WCRHeldSinceMapLocked()[username] doubleValue];
+    }
+}
+
+// since <= 0 removes the entry.
+static void WCRSetHeldSince(NSString *username, NSTimeInterval since) {
+    if (username.length == 0) return;
+    @synchronized (WCRAFStateLock()) {
+        NSMutableDictionary *map = WCRHeldSinceMapLocked();
+        if (since > 0) {
+            map[username] = @(since);
+        } else {
+            if (!map[username]) return;
+            [map removeObjectForKey:username];
+        }
+        WCRSaveHeldSinceMapLocked();
+    }
+}
+
+// Keeps heldSince in sync with the Held set. Held sessions that predate
+// v1.9.7 get "now" as their start, so nothing expires right after updating.
+static void WCRSyncHeldSinceWithHeldSet(void) {
+    NSSet<NSString *> *held =
+        WCRStringSetForDefaultsKey(kWCRAFHeldUsernamesDefaultsKey);
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+
+    @synchronized (WCRAFStateLock()) {
+        NSMutableDictionary *map = WCRHeldSinceMapLocked();
+        BOOL changed = NO;
+
+        for (NSString *username in [map allKeys]) {
+            if (![held containsObject:username]) {
+                [map removeObjectForKey:username];
+                changed = YES;
+            }
+        }
+        for (NSString *username in held) {
+            if (!map[username]) {
+                map[username] = @(now);
+                changed = YES;
+            }
+        }
+        if (changed) WCRSaveHeldSinceMapLocked();
+    }
+}
+
+// Time of the session's latest message (seconds since 1970), 0 if unknown.
+static NSTimeInterval WCRSessionLastMessageTime(id session) {
+    if (!session) return 0;
+
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    id native = provider ? [provider nativeSessionFromObject:session] : nil;
+    if (!native) native = session;
+
+    NSArray<NSString *> *paths =
+        @[@"m_uLastTime", @"m_msgWrap.m_uiCreateTime"];
+
+    for (NSString *path in paths) {
+        @try {
+            id value = [native valueForKeyPath:path];
+            if ([value respondsToSelector:@selector(doubleValue)]) {
+                double t = [value doubleValue];
+                if (t > 1e12) t /= 1000.0; // milliseconds safeguard
+                if (t > 0) return t;
+            }
+        } @catch (__unused NSException *exception) {
+        }
+    }
+    return 0;
+}
+
+// Expired = no new message for N days since max(保持 time, last message).
+static BOOL WCRHeldSessionExpired(NSString *username, id session) {
+    NSInteger days = WCRHoldExpiryDays();
+    if (days <= 0) return NO;
+
+    NSTimeInterval since = WCRHeldSince(username);
+    if (since <= 0) return NO; // filled by WCRSyncHeldSinceWithHeldSet
+
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSTimeInterval activity = MAX(since, WCRSessionLastMessageTime(session));
+
+    return now - activity >= (NSTimeInterval)days * 86400.0;
+}
+
+// Called from the predicate; the actual state write + refresh is deferred so
+// the predicate itself never mutates state during WCRefine's pass.
+static void WCRScheduleHoldExpiry(NSString *username) {
+    if (username.length == 0) return;
+
+    BOOL schedule = NO;
+    @synchronized (WCRAFStateLock()) {
+        if (!gWCRPendingHoldExpiry) {
+            gWCRPendingHoldExpiry = [NSMutableSet set];
+        }
+        if ([gWCRPendingHoldExpiry containsObject:username]) return;
+        schedule = gWCRPendingHoldExpiry.count == 0;
+        [gWCRPendingHoldExpiry addObject:username];
+    }
+    if (!schedule) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSArray<NSString *> *expired = nil;
+        @synchronized (WCRAFStateLock()) {
+            expired = [gWCRPendingHoldExpiry allObjects];
+            [gWCRPendingHoldExpiry removeAllObjects];
+        }
+
+        BOOL changed = NO;
+        for (NSString *name in expired) {
+            if (WCRPersistHeld(name, NO)) changed = YES;
+            WCRSetHeldSince(name, 0);
+            WCRAF_LOG(@"hold expired: %@", name);
+        }
+        if (changed) {
+            WCRRefreshHomeGlobal(@"active_front_hold_expired");
+        }
+    });
+}
+
 static void WCRSetHeld(NSString *username, BOOL held, id host) {
     if (username.length == 0) return;
 
     BOOL changed = WCRPersistHeld(username, held);
+    WCRSetHeldSince(username,
+                    held ? [[NSDate date] timeIntervalSince1970] : 0);
 
     WCRAF_LOG(@"%@ %@",
               held ? @"keep" : @"return-to-group",
@@ -795,6 +993,7 @@ static void WCRPruneStateKeyToGroupedMembers(NSString *key) {
 
 static void WCRPruneStaleActiveFrontState(void) {
     WCRPruneStateKeyToGroupedMembers(kWCRAFHeldUsernamesDefaultsKey);
+    WCRSyncHeldSinceWithHeldSet();
 }
 
 static NewMainFrameViewController *WCRHomeControllerForTable(
@@ -1607,6 +1806,76 @@ static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) 
     return value.boolValue;
 }
 
+#pragma mark - Hold expiry picker (v1.9.7)
+
+// Long-press on 保持 / 回组. The chosen period applies to all Held sessions.
+// From 保持, choosing a period also keeps this session.
+static void WCRPresentHoldExpiryPicker(id host,
+                                       NSString *keepUsername,
+                                       UITableView *tableView,
+                                       NSIndexPath *indexPath) {
+    UIViewController *presenter = WCRPresenterForHost(host);
+    if (!presenter) return;
+
+    NSString *message = keepUsername.length > 0 ?
+        @"保持的会话超过所选天数没有新消息，会自动回到原分组。对所有保持的会话生效。\n选择后同时保持此会话。" :
+        @"保持的会话超过所选天数没有新消息，会自动回到原分组。对所有保持的会话生效。";
+
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"保持期限"
+                                            message:message
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSInteger current = WCRHoldExpiryDays();
+    NSArray<NSNumber *> *options = @[@0, @3, @7, @14, @30];
+    NSString *keep = [keepUsername copy];
+    __weak id weakHost = host;
+
+    for (NSNumber *option in options) {
+        NSInteger days = option.integerValue;
+        NSString *label = days == 0 ?
+            @"永不过期" :
+            [NSString stringWithFormat:@"%ld 天", (long)days];
+        if (days == kWCRAFDefaultHoldExpiryDays) {
+            label = [label stringByAppendingString:@"（默认）"];
+        }
+        if (days == current) {
+            label = [@"✓ " stringByAppendingString:label];
+        }
+
+        [sheet addAction:
+            [UIAlertAction actionWithTitle:label
+                                     style:UIAlertActionStyleDefault
+                                   handler:^(__unused UIAlertAction *action) {
+            WCRSetHoldExpiryDays(days);
+            if (keep.length > 0) {
+                WCRSetHeld(keep, YES, weakHost);
+            } else {
+                WCRRefreshHomeDeferred(weakHost,
+                                       @"active_front_hold_expiry_changed");
+            }
+        }]];
+    }
+
+    [sheet addAction:
+        [UIAlertAction actionWithTitle:@"取消"
+                                 style:UIAlertActionStyleCancel
+                               handler:nil]];
+
+    UIPopoverPresentationController *popover =
+        sheet.popoverPresentationController;
+    if (popover) {
+        UITableViewCell *cell =
+            indexPath ? [tableView cellForRowAtIndexPath:indexPath] : nil;
+        popover.sourceView = cell ?: presenter.view;
+        popover.sourceRect = cell ? cell.bounds : presenter.view.bounds;
+    }
+
+    [presenter presentViewController:sheet
+                            animated:YES
+                          completion:nil];
+}
+
 #pragma mark - Controller
 
 
@@ -1616,6 +1885,7 @@ static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) 
 + (instancetype)shared;
 - (void)handlePan:(UIPanGestureRecognizer *)pan;
 - (void)actionTapped:(UIButton *)sender;
+- (void)actionLongPressed:(UILongPressGestureRecognizer *)gesture;
 @end
 
 @implementation WCRRightSwipeController
@@ -1873,6 +2143,51 @@ static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) 
     }
 }
 
+- (void)actionLongPressed:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+
+    UIView *v = gesture.view;
+    UITableViewCell *cell = nil;
+    while (v) {
+        if ([v isKindOfClass:[UITableViewCell class]]) {
+            cell = (UITableViewCell *)v;
+            break;
+        }
+        v = v.superview;
+    }
+    if (!cell) return;
+
+    id host = nil;
+    UITableView *tableView = nil;
+    NSIndexPath *indexPath = nil;
+    id session = nil;
+    NSString *username = nil;
+
+    WCRRightActionKind kind =
+        WCRActionKindForCell(cell,
+                             &host,
+                             &tableView,
+                             &indexPath,
+                             &session,
+                             &username);
+
+    if (kind != WCRRightActionKeep && kind != WCRRightActionReturn) return;
+
+    UIImpactFeedbackGenerator *haptic =
+        [[UIImpactFeedbackGenerator alloc]
+            initWithStyle:UIImpactFeedbackStyleMedium];
+    [haptic impactOccurred];
+
+    WCRCloseCell(cell, YES);
+
+    NSString *keep = kind == WCRRightActionKeep ? username : nil;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(0.18 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        WCRPresentHoldExpiryPicker(host, keep, tableView, indexPath);
+    });
+}
+
 @end
 
 #pragma mark - Attach / priority
@@ -1946,6 +2261,15 @@ static void WCRAttachToCell(UITableViewCell *cell) {
         [button addTarget:[WCRRightSwipeController shared]
                    action:@selector(actionTapped:)
          forControlEvents:UIControlEventTouchUpInside];
+
+        // v1.9.7: long-press 保持 / 回组 -> hold expiry picker. The recognizer
+        // cancels the button's touches, so a long-press never also taps.
+        UILongPressGestureRecognizer *longPress =
+            [[UILongPressGestureRecognizer alloc]
+                initWithTarget:[WCRRightSwipeController shared]
+                        action:@selector(actionLongPressed:)];
+        longPress.minimumPressDuration = 0.45;
+        [button addGestureRecognizer:longPress];
 
         [actionView addSubview:button];
 
@@ -2078,8 +2402,8 @@ static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
     return WCRHasAnyHeld();
 }
 
-// Pure query (no state writes):
-// - Held + still in a custom group -> keep on home.
+// Query only (state writes are deferred via WCRScheduleHoldExpiry):
+// - Held + still in a custom group + not expired -> keep on home.
 // - Everything else -> WCRefine's own decision, but only when the user's real
 //   switch is ON. With the real switch OFF nothing else is ever excluded,
 //   even though the getter is temporarily ON for Held sessions.
@@ -2091,7 +2415,11 @@ static BOOL hook_shouldExclude(id self, SEL _cmd, id session) {
     if (username.length > 0 &&
         WCRIsHeld(username) &&
         WCRIsInCustomGroup(username)) {
-        return YES;
+        if (!WCRHeldSessionExpired(username, session)) {
+            return YES;
+        }
+        // v1.9.7: expired -> behave as not held now; persist asynchronously.
+        WCRScheduleHoldExpiry(username);
     }
 
     if (!WCRRealExcludeUnreadEnabled()) {

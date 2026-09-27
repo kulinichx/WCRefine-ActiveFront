@@ -1,5 +1,16 @@
 # WCRefine Group v1.5 (TrollStore)
 
+## ActiveFront v1.9.7 — 保持 auto-expiry
+
+- A **保持** session returns to its original group automatically after **N days without a new message** (counted from the later of: when 保持 was pressed, the session's last message).
+- N = 永不过期 / 3 / 7 / 14 / 30 days, **default 7**. One global setting for all Held sessions.
+- Set N by **long-pressing the right-swipe 保持 or 回组 button** (haptic + action sheet). From 保持, picking a period also keeps that session.
+- No timers or background work: expiry is checked lazily inside WCRefine's own home refresh pass (triggered on every home appearance). The predicate only schedules the state write; the write + refresh run asynchronously once per batch.
+- Last-message time is read from the native session via KVC `m_uLastTime`, fallback `m_msgWrap.m_uiCreateTime`.
+- New NSUserDefaults keys: `com.local.wcrefine.activefront.heldSince.v1` (username → seconds), `com.local.wcrefine.activefront.holdExpiryDays.v1` (integer, 0 = never).
+- Upgrading: sessions held before v1.9.7 start counting from the first launch of v1.9.7, so nothing expires immediately.
+- Log lines: `hold expiry days = N`, `hold expired: <username>`.
+
 ## ActiveFront v1.9.6 — WCRefine 2.1-8 compatibility (plan B)
 
 WCRefine's own **首页分组管理 → 展开分组设置 → 不收纳非免打扰未读** switch is now the single source of truth for unread sessions. ActiveFront only projects the sessions the user explicitly **保持**.
