@@ -1,5 +1,15 @@
-// ActiveFront.RIGHT_v1_9_5_RC1.m
-// WCRefine ActiveFront - v1.9.5 RC1 built on the validated v1.9.2 state machine.
+// ActiveFront.RIGHT_v1_9_6.m
+// WCRefine ActiveFront - v1.9.6 (WCRefine 2.1-8 compatibility, plan B).
+// v1.9.6: WCRefine's own "不收纳非免打扰未读" switch is now the single source of
+// truth for unread sessions. ActiveFront only projects its own Held sessions:
+// - the getter is forced only while Held sessions exist, and WCRefine's settings
+//   page always sees the user's real value;
+// - non-Held sessions follow the real switch (switch off -> never excluded);
+// - removed Surfaced state, the 12 s startup unread fallback and the
+//   noteIncoming/noteRead hooks (never called by WCRefine 2.1-7 / 2.1-8);
+// - Held set is cached in memory (the predicate runs once per home session).
+//
+// v1.9.5 RC1 built on the validated v1.9.2 state machine.
 // Identity fix: rendered m_cellData stays authoritative, while WCRefine synthetic
 // WCRefine_groupEntry_* rows are rejected and never fall through to indexPath.
 // Release scope: ActiveFront right-swipe only. No OpenIM layout experiment,
@@ -16,8 +26,8 @@
 // - grouped + Held -> 回组
 //
 // ActiveFront never replaces WCRefine's group database. It only uses WCRefine's
-// existing group manager/provider APIs and maintains independent Surfaced/Held
-// projection state.
+// existing group manager/provider APIs and maintains independent Held projection
+// state (v1.9.6: Surfaced state removed).
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -42,13 +52,12 @@ static const void *kWCRCanonicalScopeKey = &kWCRCanonicalScopeKey;
 static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 
-static NSString * const kWCRAFVersion = @"1.9.5-RC1"; // daily-use RC1: no startup/debug alert
+static NSString * const kWCRAFVersion = @"1.9.6"; // plan B: respect WCRefine unread switch
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
-static NSString * const kWCRAFSurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
+// Legacy (<= v1.9.5) Surfaced state. Only used to delete stale data once.
+static NSString * const kWCRAFLegacySurfacedUsernamesDefaultsKey = @"com.local.wcrefine.activefront.surfacedUsernames.v1";
 
-static BOOL gWCRBootstrapUnreadFallbackOpen = YES;
-static const NSTimeInterval kWCRBootstrapUnreadFallbackSeconds = 12.0;
 
 static void WCRAFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void WCRAFLog(NSString *format, ...) {
@@ -89,10 +98,6 @@ static void WCRAFLog(NSString *format, ...) {
 - (BOOL)shouldExcludeNativeSessionFromGroupingForUnreadPolicy:(id)session;
 @end
 
-@interface WCRQuickChatRuntime : NSObject
-- (void)noteIncomingMessageForUsername:(NSString *)username;
-- (void)noteReadForUsername:(NSString *)username;
-@end
 
 @interface NewMainFrameViewController : UIViewController
 - (id)logicGetSessionAtIndexPath:(NSIndexPath *)indexPath;
@@ -572,21 +577,43 @@ static NSObject *WCRAFStateLock(void) {
     return lock;
 }
 
+// In-memory cache of the persisted string sets. WCRefine 2.1-8 evaluates the
+// unread predicate once per home session on every structural refresh, so the
+// predicate must not re-read NSUserDefaults each time. All writes go through
+// this file and keep the cache in sync. Access only under WCRAFStateLock().
+static NSMutableDictionary<NSString *, NSSet<NSString *> *> *WCRAFStateCache(void) {
+    static NSMutableDictionary<NSString *, NSSet<NSString *> *> *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [NSMutableDictionary dictionary];
+    });
+    return cache;
+}
+
+static NSSet<NSString *> *WCRLoadStringSetFromDefaults(NSString *key) {
+    id stored = [[NSUserDefaults standardUserDefaults] objectForKey:key];
+    if (![stored isKindOfClass:[NSArray class]]) return [NSSet set];
+
+    NSMutableSet<NSString *> *result = [NSMutableSet set];
+    for (id obj in (NSArray *)stored) {
+        if ([obj isKindOfClass:[NSString class]] &&
+            [(NSString *)obj length] > 0) {
+            [result addObject:obj];
+        }
+    }
+    return [result copy];
+}
+
 static NSSet<NSString *> *WCRStringSetForDefaultsKey(NSString *key) {
     if (key.length == 0) return [NSSet set];
 
     @synchronized (WCRAFStateLock()) {
-        id stored = [[NSUserDefaults standardUserDefaults] objectForKey:key];
-        if (![stored isKindOfClass:[NSArray class]]) return [NSSet set];
+        NSSet<NSString *> *cached = WCRAFStateCache()[key];
+        if (cached) return cached;
 
-        NSMutableSet<NSString *> *result = [NSMutableSet set];
-        for (id obj in (NSArray *)stored) {
-            if ([obj isKindOfClass:[NSString class]] &&
-                [(NSString *)obj length] > 0) {
-                [result addObject:obj];
-            }
-        }
-        return [result copy];
+        NSSet<NSString *> *loaded = WCRLoadStringSetFromDefaults(key);
+        WCRAFStateCache()[key] = loaded;
+        return loaded;
     }
 }
 
@@ -596,17 +623,8 @@ static BOOL WCRPersistSetMembership(NSString *key,
     if (key.length == 0 || username.length == 0) return NO;
 
     @synchronized (WCRAFStateLock()) {
-        id stored = [[NSUserDefaults standardUserDefaults] objectForKey:key];
-        NSMutableSet<NSString *> *set = [NSMutableSet set];
-
-        if ([stored isKindOfClass:[NSArray class]]) {
-            for (id obj in (NSArray *)stored) {
-                if ([obj isKindOfClass:[NSString class]] &&
-                    [(NSString *)obj length] > 0) {
-                    [set addObject:obj];
-                }
-            }
-        }
+        NSMutableSet<NSString *> *set =
+            [WCRLoadStringSetFromDefaults(key) mutableCopy];
 
         BOOL previous = [set containsObject:username];
         if (enabled) {
@@ -614,6 +632,8 @@ static BOOL WCRPersistSetMembership(NSString *key,
         } else {
             [set removeObject:username];
         }
+
+        WCRAFStateCache()[key] = [set copy];
 
         if (previous == enabled) return NO;
 
@@ -637,21 +657,21 @@ static BOOL WCRPersistHeld(NSString *username, BOOL held) {
                                    held);
 }
 
-static BOOL WCRIsSurfaced(NSString *username) {
-    return username.length > 0 &&
-           [WCRStringSetForDefaultsKey(kWCRAFSurfacedUsernamesDefaultsKey)
-               containsObject:username];
+static BOOL WCRHasAnyHeld(void) {
+    return WCRStringSetForDefaultsKey(kWCRAFHeldUsernamesDefaultsKey).count > 0;
 }
 
-static BOOL WCRPersistSurfaced(NSString *username, BOOL surfaced) {
-    return WCRPersistSetMembership(kWCRAFSurfacedUsernamesDefaultsKey,
-                                   username,
-                                   surfaced);
-}
-
-static BOOL WCRHasAnyActiveFrontProjection(void) {
-    return WCRStringSetForDefaultsKey(kWCRAFHeldUsernamesDefaultsKey).count > 0 ||
-           WCRStringSetForDefaultsKey(kWCRAFSurfacedUsernamesDefaultsKey).count > 0;
+// v1.9.6 removed Surfaced state. Delete the stale key left by <= v1.9.5 so it
+// can never be mistaken for live state again.
+static void WCRRemoveLegacySurfacedState(void) {
+    @synchronized (WCRAFStateLock()) {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        if ([defaults objectForKey:kWCRAFLegacySurfacedUsernamesDefaultsKey]) {
+            [defaults removeObjectForKey:kWCRAFLegacySurfacedUsernamesDefaultsKey];
+            WCRAF_LOG(@"removed legacy surfaced state");
+        }
+        [WCRAFStateCache() removeObjectForKey:kWCRAFLegacySurfacedUsernamesDefaultsKey];
+    }
 }
 
 static NSSet<NSString *> *WCRCustomGroupIdSet(void) {
@@ -701,31 +721,6 @@ static NSArray<WCRefineGroup *> *WCRAvailableGroupsForScope(NSUInteger scope) {
     return groups;
 }
 
-static BOOL WCRSessionUnreadState(id session, BOOL *knownOut) {
-    if (knownOut) *knownOut = NO;
-    if (!session) return NO;
-
-    WCRefineGroupDataProvider *provider = WCRDataProvider();
-    id native = provider ? [provider nativeSessionFromObject:session] : nil;
-    if (!native) native = session;
-
-    NSArray<NSString *> *keys =
-        @[@"m_uUnReadCount", @"m_unReadCount", @"unReadCount"];
-
-    for (NSString *key in keys) {
-        @try {
-            id value = [native valueForKey:key];
-            if ([value respondsToSelector:@selector(unsignedIntegerValue)]) {
-                if (knownOut) *knownOut = YES;
-                return [value unsignedIntegerValue] > 0;
-            }
-        } @catch (__unused NSException *exception) {
-        }
-    }
-
-    return NO;
-}
-
 static void WCRRefreshHome(id host, NSString *reason) {
     [[NSNotificationCenter defaultCenter]
         postNotificationName:kWCRHomeGroupsDidChangeNotification
@@ -756,10 +751,6 @@ static void WCRSetHeld(NSString *username, BOOL held, id host) {
     if (username.length == 0) return;
 
     BOOL changed = WCRPersistHeld(username, held);
-
-    if (!held) {
-        changed = WCRPersistSurfaced(username, NO) || changed;
-    }
 
     WCRAF_LOG(@"%@ %@",
               held ? @"keep" : @"return-to-group",
@@ -798,12 +789,12 @@ static void WCRPruneStateKeyToGroupedMembers(NSString *key) {
         NSArray<NSString *> *stable =
             [[clean allObjects] sortedArrayUsingSelector:@selector(compare:)];
         [[NSUserDefaults standardUserDefaults] setObject:stable forKey:key];
+        WCRAFStateCache()[key] = [clean copy];
     }
 }
 
 static void WCRPruneStaleActiveFrontState(void) {
     WCRPruneStateKeyToGroupedMembers(kWCRAFHeldUsernamesDefaultsKey);
-    WCRPruneStateKeyToGroupedMembers(kWCRAFSurfacedUsernamesDefaultsKey);
 }
 
 static NewMainFrameViewController *WCRHomeControllerForTable(
@@ -1133,8 +1124,7 @@ static id WCRSessionForCell(UITableViewCell *cell,
 static BOOL WCRResolveSessionState(id session,
                                    NSString **usernameOut,
                                    BOOL *groupedOut,
-                                   BOOL *heldOut,
-                                   BOOL *surfacedOut) {
+                                   BOOL *heldOut) {
     WCRefineGroupDataProvider *provider = WCRDataProvider();
     if (!provider || !session) return NO;
 
@@ -1159,12 +1149,10 @@ static BOOL WCRResolveSessionState(id session,
 
     BOOL grouped = WCRIsInCustomGroup(username);
     BOOL held = grouped && WCRIsHeld(username);
-    BOOL surfaced = grouped && WCRIsSurfaced(username);
 
     if (usernameOut) *usernameOut = username;
     if (groupedOut) *groupedOut = grouped;
     if (heldOut) *heldOut = held;
-    if (surfacedOut) *surfacedOut = surfaced;
 
     return YES;
 }
@@ -1187,19 +1175,13 @@ static WCRRightActionKind WCRActionKindForCell(UITableViewCell *cell,
     NSString *username = nil;
     BOOL grouped = NO;
     BOOL held = NO;
-    BOOL surfaced = NO;
 
     if (!WCRResolveSessionState(session,
                                 &username,
                                 &grouped,
-                                &held,
-                                &surfaced)) {
+                                &held)) {
         return WCRRightActionNone;
     }
-
-    // Surfaced is intentionally not required for action selection in v1.9.2.
-    // Keep it resolved for diagnostics and the existing projection hooks.
-    (void)surfaced;
 
     WCRRightActionKind kind = WCRRightActionNone;
 
@@ -1219,10 +1201,9 @@ static WCRRightActionKind WCRActionKindForCell(UITableViewCell *cell,
         // If a grouped friend/chatroom is currently a REAL visible row on the
         // home list, the correct action is always "保持".
         //
-        // Do not gate this on our Surfaced flag. WCRefine's own unread
-        // exclusion is what makes an unread grouped conversation appear on
-        // home. The Surfaced flag is supplemental state and can legitimately
-        // be 0 after keep -> return or on later incoming messages.
+        // WCRefine's own exclusion (unread switch, @me, pinned exclusions...)
+        // is what makes a grouped conversation appear on home; ActiveFront
+        // no longer keeps a separate Surfaced flag (v1.9.6).
         kind = WCRRightActionKeep;
     }
 
@@ -1247,25 +1228,6 @@ static NSString *WCRUsernameForCell(UITableViewCell *cell) {
                                &username);
 
     return username;
-}
-
-static void WCRCloseVisibleRightSwipeForUsername(NSString *username) {
-    if (username.length == 0) return;
-
-    UITableView *tableView = WCRMainTable();
-    if (!tableView) return;
-
-    for (UITableViewCell *cell in tableView.visibleCells) {
-        if (!WCRIsMainFrameCell(cell)) continue;
-
-        NSString *cellUsername = WCRUsernameForCell(cell);
-        if (![cellUsername isEqualToString:username]) continue;
-
-        // Hide before the provider/table refresh can remove/reuse the row.
-        // This prevents a visible “保持/分组/回组” view from travelling with a
-        // recycled NewMainFrameCell into another conversation.
-        WCRHardResetCellVisual(cell, NO);
-    }
 }
 
 static NSString *WCRTitleForActionKind(WCRRightActionKind kind) {
@@ -1391,13 +1353,6 @@ static void WCRPresentGroupPicker(id host,
             }
 
             WCRPersistHeld(username, NO);
-
-            BOOL unreadKnown = NO;
-            BOOL hasUnread =
-                WCRSessionUnreadState(session, &unreadKnown);
-
-            WCRPersistSurfaced(username,
-                               unreadKnown && hasUnread);
 
             WCRAF_LOG(@"assigned %@ -> %@", username, groupId);
             WCRRefreshHomeDeferred(host,
@@ -2063,8 +2018,7 @@ static void WCRAttachToCell(UITableViewCell *cell) {
 
 static BOOL (*orig_configExcludeUnread)(id, SEL) = NULL;
 static BOOL (*orig_shouldExclude)(id, SEL, id) = NULL;
-static void (*orig_noteIncoming)(id, SEL, NSString *) = NULL;
-static void (*orig_noteRead)(id, SEL, NSString *) = NULL;
+static void (*orig_settingsBuildBasicSection)(id, SEL) = NULL;
 static void (*orig_activeViewDidAppear)(id, SEL, BOOL) = NULL;
 static void (*orig_groupingWillDisplay)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *) = NULL;
 static void (*orig_cellPrepareForReuse)(id, SEL) = NULL;
@@ -2072,123 +2026,91 @@ static void (*orig_cellDidMoveToWindow)(id, SEL) = NULL;
 
 static BOOL gWCRHookConfig = NO;
 static BOOL gWCRHookProvider = NO;
-static BOOL gWCRHookIncoming = NO;
-static BOOL gWCRHookRead = NO;
 static BOOL gWCRHookHome = NO;
 static BOOL gWCRHookWillDisplay = NO;
 static BOOL gWCRHookCellReuse = NO;
 static BOOL gWCRHookCellDidMove = NO;
-static BOOL gWCRBootstrapCloseScheduled = NO;
+static BOOL gWCRHookSettings = NO; // optional, not required for allInstalled
 
+// > 0 while WCRefine's group-management page builds its basic section. The
+// config getter then returns the user's real value so the switch UI is honest.
+static NSInteger gWCRSettingsRealValueDepth = 0;
+
+// The user's real "不收纳非免打扰未读" value, bypassing our getter override.
+static BOOL WCRRealExcludeUnreadEnabled(void) {
+    Class configClass = NSClassFromString(@"WCRefineConfig");
+    if (!configClass ||
+        ![configClass respondsToSelector:@selector(shared)]) {
+        return NO;
+    }
+
+    WCRefineConfig *config = [configClass shared];
+    if (!config) return NO;
+
+    SEL getter = @selector(homeGroupingExcludeUnreadEnabled);
+
+    if (orig_configExcludeUnread) {
+        return orig_configExcludeUnread(config, getter);
+    }
+
+    // Config hook not installed: the getter is still WCRefine's own.
+    if ([config respondsToSelector:getter]) {
+        return config.homeGroupingExcludeUnreadEnabled;
+    }
+    return NO;
+}
+
+// v1.9.6 (plan B): WCRefine's switch is the single source of truth.
+// - Real value ON  -> return ON (WCRefine behaves exactly as configured).
+// - Real value OFF -> return ON only while we have Held sessions, because
+//   WCRefine consults the unread predicate only when this getter is YES.
+// - While WCRefine's settings page is building, always return the real value.
 static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
-    BOOL original =
+    BOOL real =
         orig_configExcludeUnread ?
             orig_configExcludeUnread(self, _cmd) :
             NO;
 
-    return original ||
-           gWCRBootstrapUnreadFallbackOpen ||
-           WCRHasAnyActiveFrontProjection();
+    if (real || gWCRSettingsRealValueDepth > 0) {
+        return real;
+    }
+
+    return WCRHasAnyHeld();
 }
 
+// Pure query (no state writes):
+// - Held + still in a custom group -> keep on home.
+// - Everything else -> WCRefine's own decision, but only when the user's real
+//   switch is ON. With the real switch OFF nothing else is ever excluded,
+//   even though the getter is temporarily ON for Held sessions.
 static BOOL hook_shouldExclude(id self, SEL _cmd, id session) {
-    BOOL originalDecision =
-        orig_shouldExclude ?
-            orig_shouldExclude(self, _cmd, session) :
-            NO;
-
     NSString *username =
         [(WCRefineGroupDataProvider *)self
             usernameForNativeObject:session];
 
-    if (username.length == 0) {
-        return originalDecision;
-    }
-
-    if (WCRIsHeld(username) &&
+    if (username.length > 0 &&
+        WCRIsHeld(username) &&
         WCRIsInCustomGroup(username)) {
         return YES;
     }
 
-    if (WCRIsSurfaced(username) &&
-        WCRIsInCustomGroup(username)) {
-        BOOL unreadKnown = NO;
-        BOOL hasUnread =
-            WCRSessionUnreadState(session, &unreadKnown);
-
-        if (!unreadKnown || hasUnread) {
-            return YES;
-        }
-
-        WCRPersistSurfaced(username, NO);
+    if (!WCRRealExcludeUnreadEnabled()) {
         return NO;
     }
 
-    if (gWCRBootstrapUnreadFallbackOpen &&
-        WCRIsInCustomGroup(username)) {
-        BOOL unreadKnown = NO;
-        BOOL hasUnread =
-            WCRSessionUnreadState(session, &unreadKnown);
+    return orig_shouldExclude ?
+        orig_shouldExclude(self, _cmd, session) :
+        NO;
+}
 
-        if ((unreadKnown && hasUnread) ||
-            (!unreadKnown && originalDecision)) {
-            WCRPersistSurfaced(username, YES);
-            return YES;
+static void hook_settingsBuildBasicSection(id self, SEL _cmd) {
+    gWCRSettingsRealValueDepth++;
+    @try {
+        if (orig_settingsBuildBasicSection) {
+            orig_settingsBuildBasicSection(self, _cmd);
         }
-    }
-
-    return originalDecision;
-}
-
-static void hook_noteIncoming(id self,
-                              SEL _cmd,
-                              NSString *username) {
-    BOOL valid =
-        [username isKindOfClass:[NSString class]] &&
-        username.length > 0;
-
-    BOOL grouped =
-        valid && WCRIsInCustomGroup(username);
-
-    if (grouped) {
-        WCRPersistSurfaced(username, YES);
-        WCRAF_LOG(@"incoming surfaced: %@", username);
-    }
-
-    if (orig_noteIncoming) {
-        orig_noteIncoming(self, _cmd, username);
-    }
-
-    if (grouped) {
-        WCRRefreshHomeGlobal(@"active_front_incoming");
-    }
-}
-
-static void hook_noteRead(id self,
-                          SEL _cmd,
-                          NSString *username) {
-    BOOL valid =
-        [username isKindOfClass:[NSString class]] &&
-        username.length > 0;
-
-    BOOL wasSurfaced =
-        valid && WCRIsSurfaced(username);
-
-    if (wasSurfaced) {
-        // The row may disappear/reorder immediately after the read is
-        // consumed. Clear its right-swipe view before that table mutation.
-        WCRCloseVisibleRightSwipeForUsername(username);
-
-        WCRPersistSurfaced(username, NO);
-        WCRAF_LOG(@"read consumed surfaced: %@", username);
-    }
-
-    if (orig_noteRead) {
-        orig_noteRead(self, _cmd, username);
-    }
-
-    if (wasSurfaced) {
-        WCRRefreshHomeGlobal(@"active_front_read");
+    } @finally {
+        gWCRSettingsRealValueDepth--;
     }
 }
 
@@ -2301,34 +2223,13 @@ static BOOL WCRInstallInstanceHook(Class cls,
     return YES;
 }
 
-static void WCRScheduleBootstrapUnreadFallbackClose(void) {
-    if (gWCRBootstrapCloseScheduled) return;
-    gWCRBootstrapCloseScheduled = YES;
-
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW,
-                      (int64_t)(kWCRBootstrapUnreadFallbackSeconds *
-                                NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{
-            if (!gWCRBootstrapUnreadFallbackOpen) return;
-
-            gWCRBootstrapUnreadFallbackOpen = NO;
-
-            [[NSNotificationCenter defaultCenter]
-                postNotificationName:kWCRHomeGroupsDidChangeNotification
-                              object:nil];
-
-            WCRAF_LOG(@"bootstrap unread fallback closed");
-        });
-}
-
 static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
     Class config =
         NSClassFromString(@"WCRefineConfig");
     Class provider =
         NSClassFromString(@"WCRefineGroupDataProvider");
-    Class quickRuntime =
-        NSClassFromString(@"WCRQuickChatRuntime");
+    Class settingsController =
+        NSClassFromString(@"WCRefineGroupManagementViewController");
     Class mainFrame =
         NSClassFromString(@"NewMainFrameViewController");
     Class mainFrameCell =
@@ -2352,22 +2253,14 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                 (IMP *)&orig_shouldExclude);
     }
 
-    if (!gWCRHookIncoming && quickRuntime) {
-        gWCRHookIncoming =
+    // Optional: only makes WCRefine's settings switch show the real value.
+    if (!gWCRHookSettings && settingsController) {
+        gWCRHookSettings =
             WCRInstallInstanceHook(
-                quickRuntime,
-                @selector(noteIncomingMessageForUsername:),
-                (IMP)hook_noteIncoming,
-                (IMP *)&orig_noteIncoming);
-    }
-
-    if (!gWCRHookRead && quickRuntime) {
-        gWCRHookRead =
-            WCRInstallInstanceHook(
-                quickRuntime,
-                @selector(noteReadForUsername:),
-                (IMP)hook_noteRead,
-                (IMP *)&orig_noteRead);
+                settingsController,
+                @selector(buildBasicSection),
+                (IMP)hook_settingsBuildBasicSection,
+                (IMP *)&orig_settingsBuildBasicSection);
     }
 
     if (!gWCRHookHome && mainFrame) {
@@ -2406,37 +2299,31 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                 (IMP *)&orig_cellDidMoveToWindow);
     }
 
-    if (gWCRHookProvider) {
-        WCRScheduleBootstrapUnreadFallbackClose();
-    }
-
     BOOL allInstalled =
         gWCRHookConfig &&
         gWCRHookProvider &&
-        gWCRHookIncoming &&
-        gWCRHookRead &&
         gWCRHookHome &&
         gWCRHookWillDisplay &&
         gWCRHookCellReuse &&
         gWCRHookCellDidMove;
 
     if (allInstalled) {
-        WCRAF_LOG(@"business hooks installed config=1 provider=1 incoming=1 read=1 home=1 willDisplay=1 reuse=1 didMove=1");
+        WCRAF_LOG(@"business hooks installed config=1 provider=1 home=1 willDisplay=1 reuse=1 didMove=1 settings=%d",
+                  gWCRHookSettings);
         WCRPruneStaleActiveFrontState();
         WCRRefreshHomeGlobal(@"active_front_hooks_installed");
         return;
     }
 
     if (attemptsRemaining == 0) {
-        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d incoming=%d read=%d home=%d willDisplay=%d reuse=%d didMove=%d",
+        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d home=%d willDisplay=%d reuse=%d didMove=%d settings=%d",
                   gWCRHookConfig,
                   gWCRHookProvider,
-                  gWCRHookIncoming,
-                  gWCRHookRead,
                   gWCRHookHome,
                   gWCRHookWillDisplay,
                   gWCRHookCellReuse,
-                  gWCRHookCellDidMove);
+                  gWCRHookCellDidMove,
+                  gWCRHookSettings);
         return;
     }
 
@@ -2476,7 +2363,7 @@ static void WCRRepeat(NSUInteger remaining) {
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
-        WCRAF_LOG(@"dylib loaded; starting v1.9.5 release");
+        WCRAF_LOG(@"dylib loaded; starting v%@", kWCRAFVersion);
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
@@ -2490,6 +2377,7 @@ static void WCRRightGroupUIInit(void) {
             dispatch_time(DISPATCH_TIME_NOW,
                           (int64_t)(4.0 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{
+                WCRRemoveLegacySurfacedState();
                 WCRTryInstallBusinessHooks(80);
             });
 

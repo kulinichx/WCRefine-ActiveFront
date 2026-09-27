@@ -1,5 +1,22 @@
 # WCRefine Group v1.5 (TrollStore)
 
+## ActiveFront v1.9.6 — WCRefine 2.1-8 compatibility (plan B)
+
+WCRefine's own **首页分组管理 → 展开分组设置 → 不收纳非免打扰未读** switch is now the single source of truth for unread sessions. ActiveFront only projects the sessions the user explicitly **保持**.
+
+| WCRefine switch | 保持 sessions | Other grouped sessions |
+|---|---|---|
+| OFF | stay on home | always folded into their group (unread or not) |
+| ON  | stay on home | WCRefine's native rule (non-muted unread → home) |
+
+- `homeGroupingExcludeUnreadEnabled` getter: returns the real value; forced ON only while Held sessions exist and the real value is OFF.
+- WCRefine's settings page (`-[WCRefineGroupManagementViewController buildBasicSection]`) always sees the real value, so the switch UI is honest. This hook is optional.
+- `shouldExcludeNativeSessionFromGroupingForUnreadPolicy:` is a pure query: Held + in custom group → YES; otherwise WCRefine's original decision only when the real switch is ON, else NO.
+- Removed Surfaced state (`surfacedUsernames.v1` is deleted once on startup), the 12 s startup unread fallback, and the `WCRQuickChatRuntime noteIncoming/noteRead` hooks (never called by WCRefine 2.1-7/2.1-8).
+- Held set is cached in memory; the predicate no longer reads NSUserDefaults per session.
+- Required hooks: config, provider, home, willDisplay, reuse, didMove. Log line: `business hooks installed ... settings=0/1`.
+- Behaviour change: 分组 on an unread session no longer keeps it on home until read; it follows the WCRefine switch immediately.
+
 ## v1.5 runtime-hook fix
 
 - Removed the global all-or-nothing runtime readiness gate.
@@ -59,7 +76,7 @@ v1.1 deliberately **does not enable, disable, delete, or rewrite** WCRefine's ow
 
 For the clean ActiveFront experience we currently recommend testing with WCRefine's unread-message group turned off. If the user turns WCRefine's unread feature back on, its original unread policy is allowed to continue running; ActiveFront does not silently change that preference.
 
-Internally, ActiveFront only makes WCRefine's per-session projection predicate available while ActiveFront has Surfaced/Held state (plus a short startup recovery window). Outside those cases the original WCRefine getter result is returned unchanged.
+Since v1.9.6 ActiveFront respects WCRefine's switch: it only makes the per-session predicate available while Held sessions exist, never changes the decision for non-Held sessions, and the settings page always shows the real value. (Older builds used Surfaced state plus a 12 s startup window; both were removed.)
 
 ## Packaging model
 
