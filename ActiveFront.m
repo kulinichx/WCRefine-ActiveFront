@@ -4,6 +4,9 @@
 // without a new message (N = never/3/7/14/30, default 7). Choose N by
 // long-pressing the right-swipe 保持/回组 button. No timers: expiry is
 // evaluated lazily inside WCRefine's own home refresh pass.
+// v1.9.7: The right-swipe title is tinted per action (分组 blue, 保持 orange,
+// 回组 green) on the transparent background, so it stays readable in light
+// mode (was fixed white = invisible on a white cell).
 //
 // v1.9.6 (WCRefine 2.1-8 compatibility, plan B):
 // v1.9.6: WCRefine's own "不收纳非免打扰未读" switch is now the single source of
@@ -1443,6 +1446,23 @@ static NSString *WCRTitleForActionKind(WCRRightActionKind kind) {
     }
 }
 
+// Per-action title colour on the transparent action area. System colours are
+// dynamic (light/dark variants), so the title is readable on white, pinned
+// grey and dark cells alike.
+static UIColor *WCRColorForActionKind(WCRRightActionKind kind) {
+    switch (kind) {
+        case WCRRightActionGroup:
+            return [UIColor systemBlueColor];
+        case WCRRightActionKeep:
+            return [UIColor systemOrangeColor];
+        case WCRRightActionReturn:
+            return [UIColor systemGreenColor];
+        case WCRRightActionNone:
+        default:
+            return [UIColor systemGrayColor];
+    }
+}
+
 static BOOL WCRPrepareActionForCell(UITableViewCell *cell) {
     if (!cell) return NO;
 
@@ -1468,6 +1488,8 @@ static BOOL WCRPrepareActionForCell(UITableViewCell *cell) {
     }
 
     [button setTitle:title forState:UIControlStateNormal];
+    [button setTitleColor:WCRColorForActionKind(kind)
+                 forState:UIControlStateNormal];
     return YES;
 }
 
@@ -2252,7 +2274,8 @@ static void WCRAttachToCell(UITableViewCell *cell) {
         UIButton *button =
             [UIButton buttonWithType:UIButtonTypeSystem];
         [button setTitle:@"" forState:UIControlStateNormal];
-        [button setTitleColor:[UIColor whiteColor]
+        // Real colour is set per action in WCRPrepareActionForCell.
+        [button setTitleColor:WCRColorForActionKind(WCRRightActionNone)
                      forState:UIControlStateNormal];
         button.titleLabel.font =
             [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];

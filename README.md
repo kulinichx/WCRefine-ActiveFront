@@ -10,6 +10,7 @@
 - New NSUserDefaults keys: `com.local.wcrefine.activefront.heldSince.v1` (username → seconds), `com.local.wcrefine.activefront.holdExpiryDays.v1` (integer, 0 = never).
 - Upgrading: sessions held before v1.9.7 start counting from the first launch of v1.9.7, so nothing expires immediately.
 - Log lines: `hold expiry days = N`, `hold expired: <username>`.
+- Right-swipe title colour: per action on the transparent background — 分组 `systemBlue`, 保持 `systemOrange`, 回组 `systemGreen` (dynamic light/dark variants). Previously fixed white, which was invisible in light mode.
 
 ## ActiveFront v1.9.6 — WCRefine 2.1-8 compatibility (plan B)
 
