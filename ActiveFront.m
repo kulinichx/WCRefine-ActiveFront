@@ -1,5 +1,5 @@
-// ActiveFront.RIGHT_v1_9_7.m
-// WCRefine ActiveFront - v1.9.7 (hold auto-expiry).
+// ActiveFront.RIGHT_v1_9_8.m
+// WCRefine ActiveFront - v1.9.8 (low-wakeup production build).
 // v1.9.7: Held sessions return to their group automatically after N days
 // without a new message (N = never/3/7/14/30, default 7). Choose N by
 // long-pressing the right-swipe 保持/回组 button. No timers: expiry is
@@ -61,7 +61,7 @@ static const void *kWCRCanonicalScopeKey = &kWCRCanonicalScopeKey;
 static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 
 
-static NSString * const kWCRAFVersion = @"1.9.7"; // hold auto-expiry
+static NSString * const kWCRAFVersion = @"1.9.8"; // low-wakeup production build
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static NSString * const kWCRAFHeldUsernamesDefaultsKey = @"com.local.wcrefine.activefront.heldUsernames.v1";
 // v1.9.7: username -> NSNumber(seconds since 1970) when 保持 was pressed.
@@ -83,6 +83,19 @@ static void WCRAFLog(NSString *format, ...) {
     NSLog(@"[WCRefineGroup %@] %@", kWCRAFVersion, message);
 }
 #define WCRAF_LOG(...) WCRAFLog(__VA_ARGS__)
+
+// Per-cell identity logs are useful during bring-up, but they run in table
+// display/gesture paths and expose internal usernames to the unified log.
+// Keep production builds quiet unless explicitly compiled for diagnostics.
+#ifndef WCRAF_VERBOSE_CELL_LOGS
+#define WCRAF_VERBOSE_CELL_LOGS 0
+#endif
+
+#if WCRAF_VERBOSE_CELL_LOGS
+#define WCRAF_CELL_LOG(...) WCRAFLog(__VA_ARGS__)
+#else
+#define WCRAF_CELL_LOG(...) do { } while (0)
+#endif
 
 @interface WCRefineConfig : NSObject
 + (instancetype)shared;
@@ -971,9 +984,9 @@ static void WCRSetHeld(NSString *username, BOOL held, id host) {
     WCRRefreshHomeDeferred(host, reason);
 }
 
-static void WCRPruneStateKeyToGroupedMembers(NSString *key) {
+static BOOL WCRPruneStateKeyToGroupedMembers(NSString *key) {
     NSSet<NSString *> *stored = WCRStringSetForDefaultsKey(key);
-    if (stored.count == 0) return;
+    if (stored.count == 0) return NO;
 
     NSMutableSet<NSString *> *clean =
         [NSMutableSet setWithCapacity:stored.count];
@@ -984,7 +997,7 @@ static void WCRPruneStateKeyToGroupedMembers(NSString *key) {
         }
     }
 
-    if ([clean isEqualToSet:stored]) return;
+    if ([clean isEqualToSet:stored]) return NO;
 
     @synchronized (WCRAFStateLock()) {
         NSArray<NSString *> *stable =
@@ -992,11 +1005,14 @@ static void WCRPruneStateKeyToGroupedMembers(NSString *key) {
         [[NSUserDefaults standardUserDefaults] setObject:stable forKey:key];
         WCRAFStateCache()[key] = [clean copy];
     }
+    return YES;
 }
 
-static void WCRPruneStaleActiveFrontState(void) {
-    WCRPruneStateKeyToGroupedMembers(kWCRAFHeldUsernamesDefaultsKey);
+static BOOL WCRPruneStaleActiveFrontState(void) {
+    BOOL changed =
+        WCRPruneStateKeyToGroupedMembers(kWCRAFHeldUsernamesDefaultsKey);
     WCRSyncHeldSinceWithHeldSet();
+    return changed;
 }
 
 static NewMainFrameViewController *WCRHomeControllerForTable(
@@ -1235,15 +1251,15 @@ static void WCRBindCanonicalHomeRow(UITableViewCell *cell,
                              @(eligibleConversation ? scope : 0),
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    WCRAF_LOG(@"canonical row %@ index=%ld/%ld source=%@ session=%@ user=%@ scope=%lu eligible=%d",
-              WCRClassName(cell),
-              (long)indexPath.section,
-              (long)indexPath.row,
-              source ?: @"<none>",
-              WCRClassName(resolvedSession),
-              username ?: @"<nil>",
-              (unsigned long)scope,
-              eligibleConversation);
+    WCRAF_CELL_LOG(@"canonical row %@ index=%ld/%ld source=%@ session=%@ user=%@ scope=%lu eligible=%d",
+                   WCRClassName(cell),
+                   (long)indexPath.section,
+                   (long)indexPath.row,
+                   source ?: @"<none>",
+                   WCRClassName(resolvedSession),
+                   username ?: @"<nil>",
+                   (unsigned long)scope,
+                   eligibleConversation);
 }
 
 static id WCRSessionForCell(UITableViewCell *cell,
@@ -1309,12 +1325,12 @@ static id WCRSessionForCell(UITableViewCell *cell,
     objc_setAssociatedObject(cell, kWCRCanonicalScopeKey, @(scope),
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    WCRAF_LOG(@"action row index=%ld/%ld source=%@ user=%@ scope=%lu",
-              (long)indexPath.section,
-              (long)indexPath.row,
-              source ?: @"<none>",
-              username ?: @"<nil>",
-              (unsigned long)scope);
+    WCRAF_CELL_LOG(@"action row index=%ld/%ld source=%@ user=%@ scope=%lu",
+                   (long)indexPath.section,
+                   (long)indexPath.row,
+                   source ?: @"<none>",
+                   username ?: @"<nil>",
+                   (unsigned long)scope);
 
     if (hostOut) *hostOut = host;
     if (tableOut) *tableOut = tableView;
@@ -1419,19 +1435,6 @@ static WCRRightActionKind WCRActionKindForCell(UITableViewCell *cell,
 }
 
 
-static NSString *WCRUsernameForCell(UITableViewCell *cell) {
-    NSString *username = nil;
-
-    (void)WCRActionKindForCell(cell,
-                               NULL,
-                               NULL,
-                               NULL,
-                               NULL,
-                               &username);
-
-    return username;
-}
-
 static NSString *WCRTitleForActionKind(WCRRightActionKind kind) {
     switch (kind) {
         case WCRRightActionGroup:
@@ -1463,15 +1466,13 @@ static UIColor *WCRColorForActionKind(WCRRightActionKind kind) {
     }
 }
 
-static BOOL WCRPrepareActionForCell(UITableViewCell *cell) {
+static BOOL WCRApplyActionKindToCell(UITableViewCell *cell,
+                                     WCRRightActionKind kind) {
     if (!cell) return NO;
 
     UIView *actionView = objc_getAssociatedObject(cell, kWCRActionViewKey);
     UIButton *button = objc_getAssociatedObject(cell, kWCRButtonKey);
     if (!button) return NO;
-
-    WCRRightActionKind kind =
-        WCRActionKindForCell(cell, NULL, NULL, NULL, NULL, NULL);
 
     NSString *title = WCRTitleForActionKind(kind);
     if (title.length == 0) {
@@ -1491,6 +1492,12 @@ static BOOL WCRPrepareActionForCell(UITableViewCell *cell) {
     [button setTitleColor:WCRColorForActionKind(kind)
                  forState:UIControlStateNormal];
     return YES;
+}
+
+static BOOL WCRPrepareActionForCell(UITableViewCell *cell) {
+    WCRRightActionKind kind =
+        WCRActionKindForCell(cell, NULL, NULL, NULL, NULL, NULL);
+    return WCRApplyActionKindToCell(cell, kind);
 }
 
 static UIViewController *WCRPresenterForHost(id host) {
@@ -2073,7 +2080,11 @@ static void WCRPresentHoldExpiryPicker(id host,
         case UIGestureRecognizerStateEnded:
         case UIGestureRecognizerStateCancelled:
         case UIGestureRecognizerStateFailed: {
-            CGFloat currentX = cell.contentView.transform.tx;
+            // Our translation is relative to WeChat's captured baseline.
+            // Using the absolute tx can misclassify the gesture when WeChat
+            // already applies its own transform to the cell content view.
+            CGFloat currentX =
+                cell.contentView.transform.tx - WCRBaseTransform(cell).tx;
             BOOL cancelled =
                 (pan.state == UIGestureRecognizerStateCancelled ||
                  pan.state == UIGestureRecognizerStateFailed);
@@ -2237,7 +2248,14 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     UITableView *tableView = WCRTableForCell(cell);
     if (!WCRIsActiveFrontHomeTable(tableView)) return;
 
-    NSString *currentUsername = WCRUsernameForCell(cell);
+    NSString *currentUsername = nil;
+    WCRRightActionKind currentKind =
+        WCRActionKindForCell(cell,
+                             NULL,
+                             NULL,
+                             NULL,
+                             NULL,
+                             &currentUsername);
     NSString *boundUsername =
         objc_getAssociatedObject(cell, kWCRBoundUsernameKey);
 
@@ -2343,7 +2361,7 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     }
 
     WCRLayoutAction(cell);
-    WCRPrepareActionForCell(cell);
+    WCRApplyActionKindToCell(cell, currentKind);
 
     // Reconcile the visual state on every scan. A valid action title does not
     // mean its view should be visible: closed rows must always keep the action
@@ -2472,9 +2490,17 @@ static void hook_activeViewDidAppear(id self,
         orig_activeViewDidAppear(self, _cmd, animated);
     }
 
-    WCRPruneStaleActiveFrontState();
-    WCRRefreshHomeDeferred(self,
-                           @"active_front_home_appear");
+    BOOL stateChanged = WCRPruneStaleActiveFrontState();
+
+    // WCRefine already performs its normal home refresh in the original
+    // viewDidAppear: chain. Trigger an additional grouping pass only while
+    // ActiveFront has Held sessions to evaluate, or when pruning changed the
+    // projection state. This avoids an unconditional reload on every return
+    // to the WeChat home screen.
+    if (stateChanged || WCRHasAnyHeld()) {
+        WCRRefreshHomeDeferred(self,
+                               @"active_front_home_appear");
+    }
 }
 
 static void hook_groupingWillDisplay(
@@ -2522,15 +2548,9 @@ static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
     UITableViewCell *cell = (UITableViewCell *)self;
     if (!cell.window) return;
 
-    // This is attachment-only insurance.  It does not decide 分组/保持/回组.
-    // A cell inserted after the startup scan can still receive the existing
-    // right-only recognizer; action identity is resolved at gesture time.
-    __weak UITableViewCell *weakCell = cell;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UITableViewCell *strongCell = weakCell;
-        if (!strongCell || !strongCell.window) return;
-        WCRAttachToCell(strongCell);
-    });
+    // UIKit invokes didMoveToWindow on the main thread. Avoid scheduling a
+    // second main-queue block for every visible/reused cell.
+    WCRAttachToCell(cell);
 }
 
 static BOOL WCRInstallInstanceHook(Class cls,
@@ -2680,7 +2700,7 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
 
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW,
-                      (int64_t)(0.25 * NSEC_PER_SEC)),
+                      (int64_t)(0.50 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
             WCRTryInstallBusinessHooks(attemptsRemaining - 1);
         });
@@ -2688,27 +2708,28 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
 
 #pragma mark - Scan
 
-static void WCRScan(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UITableView *tableView = WCRMainTable();
-        if (!tableView) return;
+static BOOL WCRScan(void) {
+    UITableView *tableView = WCRMainTable();
+    if (!tableView) return NO;
 
-        for (UITableViewCell *cell in tableView.visibleCells) {
-            if (!WCRIsMainFrameCell(cell)) continue;
-            WCRAttachToCell(cell);
-        }
-    });
+    for (UITableViewCell *cell in tableView.visibleCells) {
+        if (!WCRIsMainFrameCell(cell)) continue;
+        WCRAttachToCell(cell);
+    }
+    return YES;
 }
 
-static void WCRRepeat(NSUInteger remaining) {
+static void WCRTryInitialScan(NSUInteger remaining) {
     if (remaining == 0) return;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t)(0.45 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        WCRScan();
-        WCRRepeat(remaining - 1);
-    });
+    if (WCRScan()) return;
+
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW,
+                      (int64_t)(0.50 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+            WCRTryInitialScan(remaining - 1);
+        });
 }
 
 __attribute__((constructor))
@@ -2720,8 +2741,9 @@ static void WCRRightGroupUIInit(void) {
             dispatch_time(DISPATCH_TIME_NOW,
                           (int64_t)(3.0 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{
-                WCRScan();
-                WCRRepeat(180);
+                // Readiness probe only: stop as soon as the home table exists.
+                // Runtime hooks cover cells created after startup.
+                WCRTryInitialScan(10);
             });
 
         dispatch_after(
@@ -2729,7 +2751,9 @@ static void WCRRightGroupUIInit(void) {
                           (int64_t)(4.0 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{
                 WCRRemoveLegacySurfacedState();
-                WCRTryInstallBusinessHooks(80);
+                // Preserve the original ~20 second compatibility window while
+                // halving the retry frequency.
+                WCRTryInstallBusinessHooks(40);
             });
 
     }
