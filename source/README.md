@@ -6,15 +6,24 @@
 
 ## 当前交付状态
 
-此目录是修复后的源码副本，不是已编译、已上机的新插件。
+此目录包含修复源码和已通过 Apple 工具链构建的候选产物，**尚未真机验收**。
 
 - 原始源码位于 `G:\WCRefine\WCRefineGroup\源码\ActiveFront.m`，没有改动。
 - 原始源码 SHA-256：`49e1c7c667ffdbe43e27c83d902c74f9e161f8b027f463ec1a8d5b381473c786`。
 - 工作区根目录的 `WCRefineGroup.dylib` 仍是先前的 `offline-hotfix2` 二进制。
   它不包含本轮源码修复，SHA-256 仍为
   `118a29784faf6675a8e7176dda4db4cc395b6cef68ac8786bdce295eaa316819`。
-- 本机为 Windows，未找到可用的 Apple Foundation/UIKit、iPhoneOS SDK 和 Xcode
-  工具链；本轮没有完成 Objective-C 编译、原生状态测试或真机验证。
+- 新编译版位于 `source/build/WCRefineGroup.dylib`，187,088 字节，
+  SHA-256：`a77c2076e90dfd52f6cc51c7288ec24f8621732d386cb9352d9de7873568d632`。
+- 本机为 Windows；已使用既有 GitHub Actions 的 macOS/Xcode 环境，
+  完成 26 项原生 Foundation 测试、iOS ARM64 编译/链接、
+  `codesign --verify` 和结构验收。构建日志零警告。
+- 成功构建提交为 `679c6bf077bdc73f703ba6969e99870fec08e615`，
+  Actions run 为 `41169629952`，Xcode 16.4 / iPhoneOS SDK 18.5，
+  目标 ARM64、最低 iOS 14.0。具体证据见
+  `../audit/source_build_acceptance.json` 和 `../audit/ci/41169629952/`。
+- 下载压缩包哈希、二进制哈希、编译输入哈希均已在本地再次核对；
+  CodeDirectory 代码页哈希检查通过。未验证设备签名信任与注入效果。
 - 不应把根目录的旧二进制重命名、重新计算版本号后冒充本轮源码构建产物。
 
 ## 源码改动
@@ -125,7 +134,8 @@ A→B→A 旧上下文、批次取出后续期/设置往返/撤销、逐联系�
 旧回调与新批次、多候选提交、未知时间、重新载入、
 错误记录保护、显式迁移、非法时钟、持久化异常、保存回调内切号/嵌套写入，
 以及仅有孤立时间戳的协调。它直接链接真实 `WCRAFStateStore.m`，
-不是 Python 仿制模型。**这些测试在本机尚未执行。**
+不是 Python 仿制模型。**26 项已在 macOS CI 实际执行并全部通过；
+它们不是 UIKit 测试，也不是 iPhone 真机测试。**
 
 Windows 可执行的源码静态契约检查：
 
@@ -155,9 +165,13 @@ Windows 可执行的源码静态契约检查：
 产物仍叫 `WCRefineGroup.dylib`，附带原生测试日志和验收清单。
 Runner 使用 `macos-15`；Action 固定到已核对的提交，而不是浮动标签。
 
-配置在本工作区准备不等于已提交或已推送，也不等于 CI 已运行。
-对外上传源码或修改原工程前，需要单独取得许可；
-原工程已有的未跟踪 Python 文件不属于本次修改，不应加入提交。
+已取得许可并同步到既有工程、推送 `feature/active-front`。
+首轮定位到缺少 CoreGraphics 链接，第二轮验收发现报告布尔值类型错误；
+修正后成功构建提交为 `679c6bf077bdc73f703ba6969e99870fec08e615`。
+此前失败构建未作为完成产物交付。原工程已有的未跟踪 Python 文件未加入提交。
+
+本地 `source/build/` 是本轮验收产物；根目录旧补丁刻意保留不动。
+实际测试应使用新编译文件，不要把根目录旧补丁误认成本轮版本。
 
 ## 设备验收清单
 
