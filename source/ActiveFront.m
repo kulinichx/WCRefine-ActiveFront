@@ -2690,7 +2690,7 @@ static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
         WCRAF_LOG(@"dylib loaded; starting v%@", kWCRAFVersion);
 
-        static id groupChangeObserver;
+        static id groupChangeObserver __attribute__((unused));
         groupChangeObserver = [[NSNotificationCenter defaultCenter]
             addObserverForName:kWCRHomeGroupsDidChangeNotification object:nil queue:nil
             usingBlock:^(__unused NSNotification *notification) {

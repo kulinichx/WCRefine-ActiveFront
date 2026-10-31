@@ -16,7 +16,7 @@ xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -isysroot "$SDK" \
     -fobjc-arc -fobjc-arc-exceptions -fblocks -O2 -fvisibility=hidden -Wall -Wextra \
     -Werror=implicit-function-declaration -Werror=objc-method-access -Werror=return-type \
     -DWCRAF_DIAGNOSTICS=0 -DWCRAF_VERBOSE_CELL_LOGS=0 \
-    -dynamiclib -framework Foundation -framework UIKit -lobjc \
+    -dynamiclib -framework Foundation -framework UIKit -framework CoreGraphics \
     -Wl,-install_name,@rpath/WCRefineGroup.dylib \
     -Wl,-current_version,1.9.9 -Wl,-compatibility_version,1.0 -Wl,-dead_strip \
     "$ROOT/ActiveFront.m" "$ROOT/WCRAFStateStore.m" -o "$TARGET"
