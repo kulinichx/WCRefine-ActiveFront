@@ -11,6 +11,7 @@ mkdir -p "$OUT"
 # Stage every attempt separately. A failed build cannot truncate a previous result.
 STAGE="$(mktemp -d "$OUT/.attempt.XXXXXX")"
 bash "$ROOT/test_core.sh" "$STAGE/tests"
+python3 -m json.tool "$STAGE/tests/native-tests.json"
 TARGET="$STAGE/WCRefineGroup.dylib"
 xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -isysroot "$SDK" \
     -fobjc-arc -fobjc-arc-exceptions -fblocks -O2 -fvisibility=hidden -Wall -Wextra \

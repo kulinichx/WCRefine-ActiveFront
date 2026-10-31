@@ -482,7 +482,7 @@ int main(int argc, const char *argv[]) {
         @autoreleasepool {
             NSError *error = nil;
             NSDictionary *report = @{
-                @"passed": @(failed == 0), @"tests_run": @(count), @"failures": @(failed),
+                @"passed": (failed == 0 ? @YES : @NO), @"tests_run": @(count), @"failures": @(failed),
                 @"scope": @"Native Foundation tests of WCRAFStateStore; not UIKit/device tests",
                 @"ios_runtime_tested": @NO
             };
