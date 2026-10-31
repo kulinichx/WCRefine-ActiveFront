@@ -1,0 +1,55 @@
+name: Build WCRefineGroup Source Repair
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/active-front
+    paths:
+      - source/**
+      - .github/workflows/build-dylib.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test and build source repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p source/build
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          bash source/build_ios.sh 2>&1 | tee source/build/ci-build.log
+
+      - name: Upload validated library
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: WCRefineGroup-source-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            source/build/WCRefineGroup.dylib
+            source/build/WCRefineGroup.dylib.sha256
+            source/build/build_manifest.json
+            source/build/native-tests.json
+            source/build/native-tests.log
+            source/build/test-inputs.json
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: WCRefineGroup-build-log-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: source/build/ci-build.log
