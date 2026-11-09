@@ -22,6 +22,25 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)isHeld:(NSString *)username context:(WCRAFAccountContext *)context;
 - (BOOL)hasAnyHeldForContext:(WCRAFAccountContext *)context;
 - (BOOL)setHeld:(BOOL)held username:(NSString *)username context:(WCRAFAccountContext *)context;
+// Initialize once per account; old conversations must not all reappear on upgrade.
+- (BOOL)enableMessageActivityForContext:(WCRAFAccountContext *)context;
+- (BOOL)isMessageActive:(NSString *)username
+                context:(WCRAFAccountContext *)context
+        lastMessageTime:(NSTimeInterval)lastMessageTime
+            unreadCount:(NSInteger)unreadCount
+                grouped:(BOOL)grouped;
+// Unknown unread counts use -1 and never start/complete a read countdown.
+- (BOOL)observeMessageActivity:(NSString *)username
+                       context:(WCRAFAccountContext *)context
+               lastMessageTime:(NSTimeInterval)lastMessageTime
+                   unreadCount:(NSInteger)unreadCount
+                       grouped:(BOOL)grouped
+                   homeVisible:(BOOL)homeVisible;
+- (BOOL)hasMessageActivityForContext:(WCRAFAccountContext *)context;
+- (BOOL)hasTrackedMessageActivity:(NSString *)username context:(WCRAFAccountContext *)context;
+- (NSTimeInterval)nextMessageActivityDeadlineForContext:(WCRAFAccountContext *)context;
+- (NSInteger)readGraceMinutesForContext:(WCRAFAccountContext *)context;
+- (BOOL)setReadGraceMinutes:(NSInteger)minutes context:(WCRAFAccountContext *)context;
 - (NSInteger)expiryDaysForContext:(WCRAFAccountContext *)context;
 - (BOOL)setExpiryDays:(NSInteger)days context:(WCRAFAccountContext *)context;
 - (BOOL)isExpired:(NSString *)username

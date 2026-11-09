@@ -3,6 +3,12 @@
 
 static NSString * const WCRAFAccountKeyPrefix = @"com.local.wcrefine.activefront.account.v2.";
 static NSInteger const WCRAFDefaultExpiryDays = 7;
+static NSInteger const WCRAFDefaultReadGraceMinutes = 15;
+
+static BOOL WCRAFValidTime(id value) {
+    return [value isKindOfClass:[NSNumber class]] &&
+           isfinite([value doubleValue]) && [value doubleValue] > 0;
+}
 
 static BOOL WCRAFValidDays(id value, NSInteger *result) {
     if (![value isKindOfClass:[NSNumber class]]) return NO;
@@ -42,6 +48,10 @@ static BOOL WCRAFValidDays(id value, NSInteger *result) {
     uint64_t _batch;
     NSMutableSet<NSString *> *_held;
     NSMutableDictionary<NSString *, NSNumber *> *_since;
+    NSTimeInterval _activitySince;
+    NSMutableDictionary<NSString *, NSNumber *> *_returned;
+    NSMutableDictionary<NSString *, NSDictionary *> *_activity;
+    NSInteger _graceMinutes;
     NSInteger _days;
     BOOL _recordExists;
     BOOL _writable;
@@ -101,6 +111,10 @@ static BOOL WCRAFValidDays(id value, NSInteger *result) {
             _context = nil;
             _held = [NSMutableSet set];
             _since = [NSMutableDictionary dictionary];
+            _activitySince = 0;
+            _returned = [NSMutableDictionary dictionary];
+            _activity = [NSMutableDictionary dictionary];
+            _graceMinutes = WCRAFDefaultReadGraceMinutes;
             _days = WCRAFDefaultExpiryDays;
             _writable = YES;
             _recordExists = NO;
@@ -150,6 +164,52 @@ static BOOL WCRAFValidDays(id value, NSInteger *result) {
                             }
                         }
                         WCRAFValidDays(raw[@"days"], &_days);
+                        if (raw[@"activitySince"] || raw[@"returned"]) {
+                            if (!WCRAFValidTime(raw[@"activitySince"]) ||
+                                ![raw[@"returned"] isKindOfClass:[NSDictionary class]]) {
+                                _writable = NO;
+                            } else {
+                                _activitySince = [raw[@"activitySince"] doubleValue];
+                                for (id name in raw[@"returned"]) {
+                                    id time = raw[@"returned"][name];
+                                    if (![name isKindOfClass:[NSString class]] || [name length] == 0 ||
+                                        !WCRAFValidTime(time)) {
+                                        _writable = NO;
+                                        break;
+                                    }
+                                    _returned[name] = time;
+                                }
+                            }
+                        }
+                        if (raw[@"activity"]) {
+                            if (_activitySince <= 0 ||
+                                ![raw[@"activity"] isKindOfClass:[NSDictionary class]]) {
+                                _writable = NO;
+                            } else {
+                                for (id name in raw[@"activity"]) {
+                                    id entry = raw[@"activity"][name];
+                                    if (![name isKindOfClass:[NSString class]] || [name length] == 0 ||
+                                        ![entry isKindOfClass:[NSDictionary class]] ||
+                                        !WCRAFValidTime(entry[@"message"]) ||
+                                        ![entry[@"readAt"] isKindOfClass:[NSNumber class]] ||
+                                        !isfinite([entry[@"readAt"] doubleValue]) ||
+                                        [entry[@"readAt"] doubleValue] < 0) {
+                                        _writable = NO;
+                                        break;
+                                    }
+                                    _activity[name] = [entry copy];
+                                }
+                            }
+                        }
+                        if (raw[@"graceMinutes"]) {
+                            id minutes = raw[@"graceMinutes"];
+                            if (![minutes isKindOfClass:[NSNumber class]] ||
+                                ![@[@5, @15, @30] containsObject:minutes]) {
+                                _writable = NO;
+                            } else {
+                                _graceMinutes = [minutes integerValue];
+                            }
+                        }
                     }
                 }
             }
@@ -170,14 +230,24 @@ static BOOL WCRAFValidDays(id value, NSInteger *result) {
 - (BOOL)saveHeld:(NSSet<NSString *> *)held
           since:(NSDictionary<NSString *, NSNumber *> *)since
            days:(NSInteger)days
+  activitySince:(NSTimeInterval)activitySince
+       returned:(NSDictionary<NSString *, NSNumber *> *)returned
+       activity:(NSDictionary<NSString *, NSDictionary *> *)activity
+   graceMinutes:(NSInteger)graceMinutes
         context:(WCRAFAccountContext *)context {
     if (_saving || ![self isCurrentContext:context]) return NO;
-    NSDictionary *record = @{
+    NSMutableDictionary *record = [@{
         @"schema": @2,
         @"held": [[held allObjects] sortedArrayUsingSelector:@selector(compare:)],
         @"since": [since copy],
         @"days": @(days)
-    };
+    } mutableCopy];
+    if (activitySince > 0) {
+        record[@"activitySince"] = @(activitySince);
+        record[@"returned"] = [returned copy];
+        record[@"activity"] = [activity copy];
+    }
+    record[@"graceMinutes"] = @(graceMinutes);
     // Defaults can invoke observers synchronously. Refuse nested writes and
     // never install this snapshot if an observer has switched accounts.
     _saving = YES;
@@ -196,10 +266,142 @@ static BOOL WCRAFValidDays(id value, NSInteger *result) {
     if (![self isCurrentContext:context]) return NO;
     _held = [held mutableCopy];
     _since = [since mutableCopy];
+    _activitySince = activitySince;
+    _returned = [returned mutableCopy];
+    _activity = [activity mutableCopy];
+    _graceMinutes = graceMinutes;
     _days = days;
     _recordExists = YES;
     _timestampsNeedReconcile = NO;
     return YES;
+}
+
+- (BOOL)saveHeld:(NSSet<NSString *> *)held
+          since:(NSDictionary<NSString *, NSNumber *> *)since
+           days:(NSInteger)days
+        context:(WCRAFAccountContext *)context {
+    return [self saveHeld:held since:since days:days activitySince:_activitySince
+                returned:_returned activity:_activity graceMinutes:_graceMinutes context:context];
+}
+
+- (BOOL)enableMessageActivityForContext:(WCRAFAccountContext *)context {
+    @synchronized (self) {
+        if (_saving || ![self isCurrentContext:context]) return NO;
+        if (_activitySince > 0) return YES;
+        NSTimeInterval now = [self readClock];
+        if (now < 1) return NO;
+        // Session timestamps have second precision. Include messages in this startup second.
+        return [self saveHeld:_held since:_since days:_days activitySince:floor(now)
+                    returned:_returned activity:_activity graceMinutes:_graceMinutes context:context];
+    }
+}
+
+- (BOOL)isMessageActive:(NSString *)username
+                context:(WCRAFAccountContext *)context
+        lastMessageTime:(NSTimeInterval)lastMessageTime
+            unreadCount:(NSInteger)unreadCount
+                grouped:(BOOL)grouped {
+    if (username.length == 0) return NO;
+    @synchronized (self) {
+        if (![self isCurrentContext:context] || _activitySince <= 0) return NO;
+        NSTimeInterval now = [self readClock];
+        if (now <= 0) return NO;
+        NSDictionary *entry = _activity[username];
+        NSTimeInterval recorded = [entry[@"message"] doubleValue];
+        BOOL validTime = isfinite(lastMessageTime) && lastMessageTime > 0 && lastMessageTime <= now;
+        NSTimeInterval message = validTime ? MAX(recorded, lastMessageTime) : recorded;
+        if (message <= 0 || message <= [_returned[username] doubleValue] ||
+            (message < _activitySince && recorded <= 0 && unreadCount <= 0)) return NO;
+        // A new or unread message gets a full window, never the previous message's deadline.
+        if (!validTime || !grouped || unreadCount != 0 || message > recorded) return YES;
+        NSTimeInterval readAt = [entry[@"readAt"] doubleValue];
+        return readAt <= 0 || now - readAt < (NSTimeInterval)_graceMinutes * 60.0;
+    }
+}
+
+- (BOOL)observeMessageActivity:(NSString *)username
+                       context:(WCRAFAccountContext *)context
+               lastMessageTime:(NSTimeInterval)lastMessageTime
+                   unreadCount:(NSInteger)unreadCount
+                       grouped:(BOOL)grouped
+                   homeVisible:(BOOL)homeVisible {
+    if (username.length == 0) return NO;
+    @synchronized (self) {
+        if (_saving || ![self isCurrentContext:context] || _activitySince <= 0) return NO;
+        NSTimeInterval now = [self readClock];
+        if (now <= 0 || !isfinite(lastMessageTime) || lastMessageTime <= 0 ||
+            lastMessageTime > now ||
+            lastMessageTime <= [_returned[username] doubleValue]) return NO;
+        NSDictionary *entry = _activity[username];
+        // Preserve already-unread conversations on upgrade as well. Only read
+        // historical conversations require a post-enable message to surface.
+        if (lastMessageTime < _activitySince && !entry && unreadCount <= 0) return NO;
+        NSTimeInterval recorded = [entry[@"message"] doubleValue];
+        if (lastMessageTime < recorded) return NO;
+        NSTimeInterval readAt = lastMessageTime > recorded ? 0 : [entry[@"readAt"] doubleValue];
+        if (!grouped || unreadCount != 0) {
+            readAt = 0;
+        } else if (homeVisible && readAt <= 0) {
+            readAt = now;
+        }
+        NSMutableDictionary *activity = [_activity mutableCopy];
+        NSMutableDictionary *returned = [_returned mutableCopy];
+        if (grouped && unreadCount == 0 && readAt > 0 &&
+            now - readAt >= (NSTimeInterval)_graceMinutes * 60.0) {
+            [activity removeObjectForKey:username];
+            returned[username] = @(lastMessageTime);
+        } else {
+            NSDictionary *updated = @{@"message": @(lastMessageTime), @"readAt": @(readAt)};
+            if ([entry isEqual:updated]) return NO;
+            activity[username] = updated;
+        }
+        return [self saveHeld:_held since:_since days:_days activitySince:_activitySince
+                    returned:returned activity:activity graceMinutes:_graceMinutes context:context];
+    }
+}
+
+- (BOOL)hasMessageActivityForContext:(WCRAFAccountContext *)context {
+    @synchronized (self) {
+        return [self isCurrentContext:context] && _activity.count > 0;
+    }
+}
+
+- (BOOL)hasTrackedMessageActivity:(NSString *)username context:(WCRAFAccountContext *)context {
+    @synchronized (self) {
+        return [self isCurrentContext:context] && _activity[username] != nil;
+    }
+}
+
+- (NSTimeInterval)nextMessageActivityDeadlineForContext:(WCRAFAccountContext *)context {
+    @synchronized (self) {
+        if (![self isCurrentContext:context]) return 0;
+        NSTimeInterval now = [self readClock];
+        if (now <= 0) return 0;
+        NSTimeInterval next = 0;
+        for (NSString *name in _activity) {
+            if ([_held containsObject:name]) continue;
+            NSTimeInterval readAt = [_activity[name][@"readAt"] doubleValue];
+            NSTimeInterval deadline = readAt + (NSTimeInterval)_graceMinutes * 60.0;
+            if (readAt > 0 && deadline > now && (next == 0 || deadline < next)) next = deadline;
+        }
+        return next;
+    }
+}
+
+- (NSInteger)readGraceMinutesForContext:(WCRAFAccountContext *)context {
+    @synchronized (self) {
+        return [self isCurrentContext:context] ? _graceMinutes : WCRAFDefaultReadGraceMinutes;
+    }
+}
+
+- (BOOL)setReadGraceMinutes:(NSInteger)minutes context:(WCRAFAccountContext *)context {
+    @synchronized (self) {
+        if (_saving || ![self isCurrentContext:context] ||
+            ![@[@5, @15, @30] containsObject:@(minutes)]) return NO;
+        if (minutes == _graceMinutes) return YES;
+        return [self saveHeld:_held since:_since days:_days activitySince:_activitySince
+                    returned:_returned activity:_activity graceMinutes:minutes context:context];
+    }
 }
 
 - (BOOL)isHeld:(NSString *)username context:(WCRAFAccountContext *)context {
@@ -240,6 +442,8 @@ static BOOL WCRAFValidDays(id value, NSInteger *result) {
         if (_saving || ![self isCurrentContext:context]) return NO;
         NSMutableSet *names = [_held mutableCopy];
         NSMutableDictionary *times = [_since mutableCopy];
+        NSMutableDictionary *returned = [_returned mutableCopy];
+        NSMutableDictionary *activity = [_activity mutableCopy];
         if (held) {
             NSTimeInterval now = [self readClock];
             if (!isfinite(now) || now <= 0) return NO;
@@ -248,9 +452,17 @@ static BOOL WCRAFValidDays(id value, NSInteger *result) {
         } else {
             [names removeObject:username];
             [times removeObjectForKey:username];
+            if (_activitySince > 0) {
+                NSTimeInterval now = [self readClock];
+                if (now < 1) return NO;
+                // Do not immediately surface the same message after an explicit return.
+                returned[username] = @(MAX(floor(now), [returned[username] doubleValue]));
+                [activity removeObjectForKey:username];
+            }
         }
         [self cancelPendingForContext:context];
-        return [self saveHeld:names since:times days:_days context:context];
+        return [self saveHeld:names since:times days:_days activitySince:_activitySince
+                    returned:returned activity:activity graceMinutes:_graceMinutes context:context];
     }
 }
 

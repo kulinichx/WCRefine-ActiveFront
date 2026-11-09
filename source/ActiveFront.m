@@ -1,5 +1,9 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.9 source repair (device validation pending).
+// WCRefine ActiveFront - v1.9.10 message activity (device validation pending).
+// Friend/chat-room messages surface temporarily without changing membership.
+// Unread sessions stay visible. After reading and returning home, a 15-minute
+// grace window offers "保持"; only explicit Held state uses the days setting.
+// One foreground-only deadline timer, no periodic polling or message swizzles.
 // v1.9.7: Held sessions return to their group automatically after N days
 // without a new message (N = never/3/7/14/30, default 7). Choose N by
 // long-pressing the right-swipe 保持/回组 button. No timers: expiry is
@@ -63,7 +67,7 @@ static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 static const void *kWCRCanonicalAccountKey = &kWCRCanonicalAccountKey;
 
 
-static NSString * const kWCRAFVersion = @"1.9.9-source";
+static NSString * const kWCRAFVersion = @"1.9.10-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 7;
 
@@ -136,6 +140,8 @@ static void WCRAFLog(NSString *format, ...) {
 
 static WCRAFStateStore *WCRAFStore(void);
 static void WCRInvalidateGroupIndex(void);
+static void WCRUpdateActivityTimer(WCRAFAccountContext *context);
+static void WCRCancelActivityTimer(void);
 
 
 @interface NewMainFrameViewController : UIViewController
@@ -807,6 +813,21 @@ static NSTimeInterval WCRSessionLastMessageTime(id session) {
     return 0;
 }
 
+static NSInteger WCRSessionUnreadCount(id native) {
+    @try {
+        // Confirmed KVC key in the supplied WCRefine host. Do not interpret a
+        // missing key or an unsupported value as zero/unread cleared.
+        id value = [native valueForKey:@"m_uUnReadCount"];
+        if (![value isKindOfClass:[NSNumber class]]) return -1;
+        double count = [value doubleValue];
+        if (!isfinite(count) || count < 0 || floor(count) != count ||
+            count >= (double)NSIntegerMax) return -1;
+        return [value integerValue];
+    } @catch (__unused NSException *exception) {
+        return -1;
+    }
+}
+
 // Expired = no new message for N days since max(保持 time, last message).
 // Called from the predicate; the actual state write + refresh is deferred so
 // the predicate itself never mutates state during WCRefine's pass.
@@ -908,6 +929,127 @@ static BOOL WCRIsSyntheticGroupEntryUsername(NSString *username) {
     // may additionally end in @chatroom, so scope alone cannot identify them.
     return [username isEqualToString:@"WCRefine_groupEntry"] ||
            [username hasPrefix:@"WCRefine_groupEntry_"];
+}
+
+static NewMainFrameViewController *WCRActivityHomeController(void) {
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return nil;
+    UIViewController *top = WCRTopVC();
+    Class homeClass = NSClassFromString(@"NewMainFrameViewController");
+    return homeClass && [top isKindOfClass:homeClass] ? (id)top : nil;
+}
+
+static NSTimer *gWCRActivityTimer;
+static NSTimeInterval gWCRActivityTimerDeadline;
+static WCRAFAccountContext *gWCRActivityTimerContext;
+
+static void WCRCancelActivityTimer(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ WCRCancelActivityTimer(); });
+        return;
+    }
+    [gWCRActivityTimer invalidate];
+    gWCRActivityTimer = nil;
+    gWCRActivityTimerDeadline = 0;
+    gWCRActivityTimerContext = nil;
+}
+
+static void WCRUpdateActivityTimer(WCRAFAccountContext *context) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ WCRUpdateActivityTimer(context); });
+        return;
+    }
+    if (![WCRAFStore() isCurrentContext:context] || !WCRActivityHomeController()) {
+        WCRCancelActivityTimer();
+        return;
+    }
+    NSTimeInterval deadline = [WCRAFStore() nextMessageActivityDeadlineForContext:context];
+    if (gWCRActivityTimer && gWCRActivityTimerDeadline == deadline &&
+        gWCRActivityTimerContext == context) return;
+    WCRCancelActivityTimer();
+    if (deadline <= 0) return;
+    gWCRActivityTimerDeadline = deadline;
+    gWCRActivityTimerContext = context;
+    gWCRActivityTimer = [NSTimer timerWithTimeInterval:
+        MAX(0.1, deadline - [[NSDate date] timeIntervalSince1970])
+        repeats:NO block:^(__unused NSTimer *timer) {
+        WCRCancelActivityTimer();
+        if (![WCRAFStore() isCurrentContext:context]) return;
+        NewMainFrameViewController *home = WCRActivityHomeController();
+        if (home) WCRRefreshHome(home, @"active_front_read_grace_expired", context);
+    }];
+    gWCRActivityTimer.tolerance = 0.5;
+    [[NSRunLoop mainRunLoop] addTimer:gWCRActivityTimer forMode:NSRunLoopCommonModes];
+}
+
+// Coalesce a complete grouping pass, then resolve the latest session again.
+// The predicate must not persist state or recurse into a home refresh.
+static NSMutableDictionary<NSString *, WCRAFAccountContext *> *gWCRActivityObservations;
+static BOOL gWCRActivityObservationScheduled;
+
+static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountContext *context) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            WCRScheduleActivityObservation(username, context);
+        });
+        return;
+    }
+    if (username.length == 0 || ![WCRAFStore() isCurrentContext:context]) return;
+    if (!gWCRActivityObservations) gWCRActivityObservations = [NSMutableDictionary dictionary];
+    gWCRActivityObservations[username] = context;
+    if (gWCRActivityObservationScheduled) return;
+    gWCRActivityObservationScheduled = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSDictionary *observations = [gWCRActivityObservations copy];
+        [gWCRActivityObservations removeAllObjects];
+        gWCRActivityObservationScheduled = NO;
+        BOOL changed = NO;
+        WCRAFAccountContext *current = [WCRAFStore() currentContext];
+        for (NSString *name in observations) {
+            WCRAFAccountContext *captured = observations[name];
+            if (![WCRAFStore() isCurrentContext:captured]) continue;
+            @try {
+                WCRefineGroupDataProvider *provider = WCRDataProvider();
+                if (![provider respondsToSelector:@selector(fulfilledSessionForUsername:fallback:)]) continue;
+                id latest = [provider fulfilledSessionForUsername:name fallback:nil];
+                id native = [provider nativeSessionFromObject:latest] ?: latest;
+                if (!native || ![[provider usernameForNativeObject:native] isEqualToString:name]) continue;
+                NSUInteger scope = [provider groupScopeForNativeSession:native];
+                if (scope != 1 && scope != 2) continue;
+                changed |= [WCRAFStore() observeMessageActivity:name context:captured
+                    lastMessageTime:WCRSessionLastMessageTime(native)
+                    unreadCount:WCRSessionUnreadCount(native)
+                    grouped:WCRIsInCustomGroup(name)
+                    homeVisible:WCRActivityHomeController() != nil];
+            } @catch (__unused NSException *exception) {
+                // Unknown session/read state never initiates a return.
+            }
+        }
+        if (changed) WCRRefreshHomeGlobal(@"active_front_message_activity", current);
+        WCRUpdateActivityTimer(current);
+    });
+}
+
+static BOOL WCRIsMessageActiveSession(id session, NSString *username,
+                                      WCRAFAccountContext *context) {
+    if (!session || !context || username.length == 0 ||
+        WCRIsSyntheticGroupEntryUsername(username)) return NO;
+    @try {
+        WCRefineGroupDataProvider *provider = WCRDataProvider();
+        id native = [provider nativeSessionFromObject:session] ?: session;
+        if (!provider) return NO;
+        NSUInteger scope = [provider groupScopeForNativeSession:native];
+        if (scope != 1 && scope != 2) return NO;
+        BOOL active = [WCRAFStore() isMessageActive:username context:context
+                            lastMessageTime:WCRSessionLastMessageTime(native)
+                            unreadCount:WCRSessionUnreadCount(native)
+                            grouped:WCRIsInCustomGroup(username)];
+        if (active || [WCRAFStore() hasTrackedMessageActivity:username context:context]) {
+            WCRScheduleActivityObservation(username, context);
+        }
+        return active;
+    } @catch (__unused NSException *exception) {
+        return NO;
+    }
 }
 
 static BOOL WCRIdentityFromCandidate(id candidate,
@@ -1250,6 +1392,7 @@ static BOOL WCRResolveSessionState(id session,
     }
 
     BOOL grouped = WCRIsInCustomGroup(username);
+    // Temporary activity must still offer "保持", not pretend it is already Held.
     BOOL held = grouped && WCRIsHeld(username);
 
     if (usernameOut) *usernameOut = username;
@@ -1305,7 +1448,7 @@ static WCRRightActionKind WCRActionKindForCell(UITableViewCell *cell,
         //
         // WCRefine's own exclusion (unread switch, @me, pinned exclusions...)
         // is what makes a grouped conversation appear on home; ActiveFront
-        // no longer keeps a separate Surfaced flag (v1.9.6).
+        // has no active friend message for this row.
         kind = WCRRightActionKeep;
     }
 
@@ -1740,6 +1883,36 @@ static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) 
 
 #pragma mark - Hold expiry picker (v1.9.7)
 
+static void WCRPresentReadGracePicker(id host, UITableView *tableView,
+                                      NSIndexPath *indexPath, WCRAFAccountContext *context) {
+    if (![WCRAFStore() isCurrentContext:context]) return;
+    UIViewController *presenter = WCRPresenterForHost(host);
+    if (!presenter) return;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"阅读后缓冲"
+        message:@"好友和群聊有新消息会临时显示在主页。未读时不回组；已读并返回主页后开始缓冲，期间可右滑保持。未分组的会话不自动收回。"
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    NSInteger current = [WCRAFStore() readGraceMinutesForContext:context];
+    __weak id weakHost = host;
+    for (NSNumber *option in @[@5, @15, @30]) {
+        NSInteger minutes = option.integerValue;
+        NSString *label = [NSString stringWithFormat:@"%@%ld 分钟%@",
+            minutes == current ? @"✓ " : @"", (long)minutes, minutes == 15 ? @"（默认）" : @""];
+        [sheet addAction:[UIAlertAction actionWithTitle:label style:UIAlertActionStyleDefault
+            handler:^(__unused UIAlertAction *action) {
+            if (![WCRAFStore() setReadGraceMinutes:minutes context:context]) return;
+            WCRRefreshHomeDeferred(weakHost, @"active_front_read_grace_changed", context);
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    if (sheet.popoverPresentationController) {
+        UITableViewCell *cell = indexPath ? [tableView cellForRowAtIndexPath:indexPath] : nil;
+        sheet.popoverPresentationController.sourceView = cell ?: presenter.view;
+        sheet.popoverPresentationController.sourceRect = cell ? cell.bounds : presenter.view.bounds;
+    }
+    if (![WCRAFStore() isCurrentContext:context]) return;
+    [presenter presentViewController:sheet animated:YES completion:nil];
+}
+
 // Long-press on 保持 / 回组. The chosen period applies to all Held sessions.
 // From 保持, choosing a period also keeps this session.
 static void WCRPresentHoldExpiryPicker(id host,
@@ -1752,8 +1925,8 @@ static void WCRPresentHoldExpiryPicker(id host,
     if (!presenter) return;
 
     NSString *message = keepUsername.length > 0 ?
-        @"保持的会话超过所选天数没有新消息，会自动回到原分组。仅对当前账号的保持会话生效。\n选择后同时保持此会话。" :
-        @"保持的会话超过所选天数没有新消息，会自动回到原分组。仅对当前账号的保持会话生效。";
+        @"手动保持的会话超过所选天数没有新消息，会自动回到原分组；不影响阅读后缓冲。仅对当前账号生效。\n选择后同时保持此会话。" :
+        @"手动保持的会话超过所选天数没有新消息，会自动回到原分组；不影响阅读后缓冲。仅对当前账号生效。";
 
     UIAlertController *sheet =
         [UIAlertController alertControllerWithTitle:@"保持期限"
@@ -1792,6 +1965,15 @@ static void WCRPresentHoldExpiryPicker(id host,
     }
 
     __weak UIAlertController *weakSheet = sheet;
+    NSString *graceLabel = [NSString stringWithFormat:@"阅读后缓冲：%ld 分钟…",
+        (long)[WCRAFStore() readGraceMinutesForContext:context]];
+    [sheet addAction:[UIAlertAction actionWithTitle:graceLabel style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *action) {
+        [weakSheet dismissViewControllerAnimated:YES completion:^{
+            WCRPresentReadGracePicker(weakHost, tableView, indexPath, context);
+        }];
+    }]];
+
     [sheet addAction:
         [UIAlertAction actionWithTitle:@"导入旧版保持记录…"
                                  style:UIAlertActionStyleDefault
@@ -2331,6 +2513,7 @@ static BOOL (*orig_configExcludeUnread)(id, SEL) = NULL;
 static BOOL (*orig_shouldExclude)(id, SEL, id) = NULL;
 static void (*orig_settingsBuildBasicSection)(id, SEL) = NULL;
 static void (*orig_activeViewDidAppear)(id, SEL, BOOL) = NULL;
+static void (*orig_activeViewWillDisappear)(id, SEL, BOOL) = NULL;
 static void (*orig_groupingWillDisplay)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *) = NULL;
 static void (*orig_cellPrepareForReuse)(id, SEL) = NULL;
 static void (*orig_cellDidMoveToWindow)(id, SEL) = NULL;
@@ -2338,6 +2521,7 @@ static void (*orig_cellDidMoveToWindow)(id, SEL) = NULL;
 static BOOL gWCRHookConfig = NO;
 static BOOL gWCRHookProvider = NO;
 static BOOL gWCRHookHome = NO;
+static BOOL gWCRHookHomeDisappear = NO;
 static BOOL gWCRHookWillDisplay = NO;
 static BOOL gWCRHookCellReuse = NO;
 static BOOL gWCRHookCellDidMove = NO;
@@ -2371,10 +2555,10 @@ static BOOL WCRRealExcludeUnreadEnabled(void) {
     return NO;
 }
 
-// v1.9.6 (plan B): WCRefine's switch is the single source of truth.
+// The real switch still controls WCRefine's unread policy.
 // - Real value ON  -> return ON (WCRefine behaves exactly as configured).
-// - Real value OFF -> return ON only while we have Held sessions, because
-//   WCRefine consults the unread predicate only when this getter is YES.
+// - Real value OFF -> enable the predicate for message activity as well as Held
+//   sessions, including the first new message when there are no Held entries.
 // - While WCRefine's settings page is building, always return the real value.
 static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
     BOOL real =
@@ -2382,14 +2566,14 @@ static BOOL hook_configExcludeUnread(id self, SEL _cmd) {
             orig_configExcludeUnread(self, _cmd) :
             NO;
 
-    if (real || gWCRSettingsRealValueDepth > 0) {
-        return real;
-    }
-
-    return WCRHasAnyHeld();
+    if (gWCRSettingsRealValueDepth > 0) return real;
+    WCRAFAccountContext *context = [WCRAFStore() currentContext];
+    BOOL activityEnabled = context && [WCRAFStore() enableMessageActivityForContext:context];
+    return real || activityEnabled || WCRHasAnyHeld();
 }
 
 // Query only (state writes are deferred via WCRScheduleHoldExpiry):
+// - Unread/temporary friend or chat-room message -> keep on home.
 // - Held + still in a custom group + not expired -> keep on home.
 // - Everything else -> WCRefine's own decision, but only when the user's real
 //   switch is ON. With the real switch OFF nothing else is ever excluded,
@@ -2400,6 +2584,10 @@ static BOOL hook_shouldExclude(id self, SEL _cmd, id session) {
             usernameForNativeObject:session];
 
     WCRAFAccountContext *context = [WCRAFStore() currentContext];
+    if (WCRIsMessageActiveSession(session, username, context)) {
+        [WCRAFStore() cancelExpiry:username context:context];
+        if ([WCRAFStore() isCurrentContext:context]) return YES;
+    }
     if (username.length > 0 && context &&
         [WCRAFStore() isHeld:username context:context] &&
         WCRIsInCustomGroup(username)) {
@@ -2435,21 +2623,26 @@ static void hook_settingsBuildBasicSection(id self, SEL _cmd) {
 static void hook_activeViewDidAppear(id self,
                                      SEL _cmd,
                                      BOOL animated) {
+    WCRAFAccountContext *context = [WCRAFStore() currentContext];
+    if (context) [WCRAFStore() enableMessageActivityForContext:context];
     if (orig_activeViewDidAppear) {
         orig_activeViewDidAppear(self, _cmd, animated);
     }
 
     BOOL stateChanged = WCRPruneStaleActiveFrontState();
 
-    // WCRefine already performs its normal home refresh in the original
-    // viewDidAppear: chain. Trigger an additional grouping pass only while
-    // ActiveFront has Held sessions to evaluate, or when pruning changed the
-    // projection state. This avoids an unconditional reload on every return
-    // to the WeChat home screen.
-    if (stateChanged || WCRHasAnyHeld()) {
+    // Re-evaluate read state after returning from chat. This starts the grace
+    // window here, not while the user is still in the conversation.
+    if (stateChanged || context || WCRHasAnyHeld()) {
         WCRRefreshHomeDeferred(self,
                                @"active_front_home_appear", [WCRAFStore() currentContext]);
     }
+    WCRUpdateActivityTimer([WCRAFStore() currentContext]);
+}
+
+static void hook_activeViewWillDisappear(id self, SEL _cmd, BOOL animated) {
+    WCRCancelActivityTimer();
+    if (orig_activeViewWillDisappear) orig_activeViewWillDisappear(self, _cmd, animated);
 }
 
 static void hook_groupingWillDisplay(
@@ -2592,6 +2785,12 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                 (IMP *)&orig_activeViewDidAppear);
     }
 
+    if (!gWCRHookHomeDisappear && mainFrame) {
+        gWCRHookHomeDisappear = WCRInstallInstanceHook(mainFrame,
+            @selector(viewWillDisappear:), (IMP)hook_activeViewWillDisappear,
+            (IMP *)&orig_activeViewWillDisappear);
+    }
+
     if (!gWCRHookWillDisplay && mainFrame) {
         gWCRHookWillDisplay =
             WCRInstallInstanceHook(
@@ -2623,23 +2822,27 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         gWCRHookConfig &&
         gWCRHookProvider &&
         gWCRHookHome &&
+        gWCRHookHomeDisappear &&
         gWCRHookWillDisplay &&
         gWCRHookCellReuse &&
         gWCRHookCellDidMove;
 
     if (allInstalled) {
-        WCRAF_LOG(@"business hooks installed config=1 provider=1 home=1 willDisplay=1 reuse=1 didMove=1 settings=%d",
+        WCRAF_LOG(@"business hooks installed config=1 provider=1 home=1 disappear=1 willDisplay=1 reuse=1 didMove=1 settings=%d",
                   gWCRHookSettings);
+        WCRAFAccountContext *context = [WCRAFStore() currentContext];
+        if (context) [WCRAFStore() enableMessageActivityForContext:context];
         WCRPruneStaleActiveFrontState();
         WCRRefreshHomeGlobal(@"active_front_hooks_installed", [WCRAFStore() currentContext]);
         return;
     }
 
     if (attemptsRemaining == 0) {
-        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d home=%d willDisplay=%d reuse=%d didMove=%d settings=%d",
+        WCRAF_LOG(@"business hooks incomplete config=%d provider=%d home=%d disappear=%d willDisplay=%d reuse=%d didMove=%d settings=%d",
                   gWCRHookConfig,
                   gWCRHookProvider,
                   gWCRHookHome,
+                  gWCRHookHomeDisappear,
                   gWCRHookWillDisplay,
                   gWCRHookCellReuse,
                   gWCRHookCellDidMove,
@@ -2697,6 +2900,26 @@ static void WCRRightGroupUIInit(void) {
             WCRInvalidateGroupIndex();
             WCRAFAccountContext *context = [WCRAFStore() currentContext];
             if (context) [WCRAFStore() cancelPendingForContext:context];
+            WCRUpdateActivityTimer(context);
+        }];
+
+        static id resignObserver __attribute__((unused));
+        resignObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationWillResignActiveNotification object:nil
+            queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *notification) {
+            WCRCancelActivityTimer();
+        }];
+        static id activeObserver __attribute__((unused));
+        activeObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
+            queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *notification) {
+            NewMainFrameViewController *home = WCRActivityHomeController();
+            WCRAFAccountContext *context = [WCRAFStore() currentContext];
+            if (home && context) {
+                [WCRAFStore() enableMessageActivityForContext:context];
+                WCRRefreshHomeDeferred(home, @"active_front_app_active", context);
+                WCRUpdateActivityTimer(context);
+            }
         }];
 
         dispatch_after(
