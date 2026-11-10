@@ -10,7 +10,7 @@ FOUNDATION_EXPORT BOOL WCRAFAllowsAutomaticActivity(NSUInteger scope, NSInteger 
 @property(nonatomic, assign, readonly) uint64_t epoch;
 @end
 
-// A release belongs to the account/row/state captured at gesture begin.
+// A threshold crossing belongs to the account/row/state captured at gesture begin.
 @interface WCRAFSwipeIntent : NSObject
 @property(nonatomic, strong, readonly) WCRAFAccountContext *context;
 @property(nonatomic, copy, readonly) NSString *username;
@@ -20,8 +20,9 @@ FOUNDATION_EXPORT BOOL WCRAFAllowsAutomaticActivity(NSUInteger scope, NSInteger 
                          grouped:(BOOL)grouped held:(BOOL)held;
 - (BOOL)matchesUsername:(NSString *)username context:(WCRAFAccountContext *)context
                grouped:(BOOL)grouped held:(BOOL)held;
-- (BOOL)shouldReturnAtDistance:(double)distance rowWidth:(double)width
-                  actionWidth:(double)actionWidth ended:(BOOL)ended;
+// Consumes the first valid crossing while dragging; does not wait for release.
+- (BOOL)consumeReturnAtDistance:(double)distance rowWidth:(double)width
+                   actionWidth:(double)actionWidth cancelled:(BOOL)cancelled;
 @end
 FOUNDATION_EXPORT double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth);
 

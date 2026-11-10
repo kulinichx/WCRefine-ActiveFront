@@ -976,41 +976,63 @@ static void SwipeDistanceBoundary(Fixture *f) {
         context:[f.store currentContext] grouped:YES held:NO];
     double threshold = WCRAFSwipeReturnThreshold(390, 82);
     CHECK(threshold > 82 * 2);
-    CHECK(![intent shouldReturnAtDistance:threshold - 0.01 rowWidth:390 actionWidth:82 ended:YES]);
-    CHECK([intent shouldReturnAtDistance:threshold rowWidth:390 actionWidth:82 ended:YES]);
-    CHECK([intent shouldReturnAtDistance:390 rowWidth:390 actionWidth:82 ended:YES]);
+    CHECK(![intent consumeReturnAtDistance:threshold - 0.01 rowWidth:390 actionWidth:82 cancelled:NO]);
+    CHECK([intent consumeReturnAtDistance:threshold rowWidth:390 actionWidth:82 cancelled:NO]);
+    CHECK(![intent consumeReturnAtDistance:390 rowWidth:390 actionWidth:82 cancelled:NO]);
 }
 
-static void SwipePullbackCancels(Fixture *f) {
+static void SwipePullbackBeforeThreshold(Fixture *f) {
     WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"room"
         context:[f.store currentContext] grouped:YES held:YES];
-    CHECK([intent shouldReturnAtDistance:300 rowWidth:390 actionWidth:82 ended:YES]);
-    CHECK(![intent shouldReturnAtDistance:120 rowWidth:390 actionWidth:82 ended:YES]);
+    CHECK(![intent consumeReturnAtDistance:210 rowWidth:390 actionWidth:82 cancelled:NO]);
+    CHECK(![intent consumeReturnAtDistance:120 rowWidth:390 actionWidth:82 cancelled:NO]);
     CHECK(![f.store isMessageReturnSuppressed:@"room" context:intent.context lastMessageTime:f.now]);
 }
 
 static void SwipeCancellationNeverReturns(Fixture *f) {
     WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"room"
         context:[f.store currentContext] grouped:YES held:NO];
-    CHECK(![intent shouldReturnAtDistance:390 rowWidth:390 actionWidth:82 ended:NO]);
+    CHECK(![intent consumeReturnAtDistance:390 rowWidth:390 actionWidth:82 cancelled:YES]);
     CHECK([f.defaults persistentDomainForName:f.suite].count == 0);
+}
+
+static void SwipeThresholdCommitsDuringDrag(Fixture *f) {
+    WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"room"
+        context:[f.store currentContext] grouped:YES held:NO];
+    NSUInteger commits = 0;
+    for (NSNumber *sample in @[@20, @81, @82, @83, @160, @210, @220, @250]) {
+        if ([intent consumeReturnAtDistance:sample.doubleValue rowWidth:390 actionWidth:82 cancelled:NO]) {
+            CHECK(sample.doubleValue == 220);
+            commits++;
+        }
+    }
+    CHECK(commits == 1);
+}
+
+static void SwipeCommitIsConsumedAcrossLaterEvents(Fixture *f) {
+    WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"room"
+        context:[f.store currentContext] grouped:YES held:YES];
+    CHECK([intent consumeReturnAtDistance:250 rowWidth:390 actionWidth:82 cancelled:NO]);
+    CHECK(![intent consumeReturnAtDistance:82 rowWidth:390 actionWidth:82 cancelled:NO]);
+    CHECK(![intent consumeReturnAtDistance:390 rowWidth:390 actionWidth:82 cancelled:NO]);
+    CHECK(![intent consumeReturnAtDistance:390 rowWidth:390 actionWidth:82 cancelled:YES]);
 }
 
 static void UngroupedSwipeNeverReturns(Fixture *f) {
     WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"alice"
         context:[f.store currentContext] grouped:NO held:NO];
-    CHECK(![intent shouldReturnAtDistance:10000 rowWidth:390 actionWidth:82 ended:YES]);
+    CHECK(![intent consumeReturnAtDistance:10000 rowWidth:390 actionWidth:82 cancelled:NO]);
 }
 
 static void SwipeRejectsInvalidGeometry(Fixture *f) {
     WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"room"
         context:[f.store currentContext] grouped:YES held:NO];
     for (NSNumber *value in @[@(-1), @0, @(NAN), @(INFINITY)]) {
-        CHECK(![intent shouldReturnAtDistance:value.doubleValue rowWidth:390 actionWidth:82 ended:YES]);
-        CHECK(![intent shouldReturnAtDistance:390 rowWidth:value.doubleValue actionWidth:82 ended:YES]);
-        CHECK(![intent shouldReturnAtDistance:390 rowWidth:390 actionWidth:value.doubleValue ended:YES]);
+        CHECK(![intent consumeReturnAtDistance:value.doubleValue rowWidth:390 actionWidth:82 cancelled:NO]);
+        CHECK(![intent consumeReturnAtDistance:390 rowWidth:value.doubleValue actionWidth:82 cancelled:NO]);
+        CHECK(![intent consumeReturnAtDistance:390 rowWidth:390 actionWidth:value.doubleValue cancelled:NO]);
     }
-    CHECK(![intent shouldReturnAtDistance:200 rowWidth:160 actionWidth:82 ended:YES]);
+    CHECK(![intent consumeReturnAtDistance:200 rowWidth:160 actionWidth:82 cancelled:NO]);
     CHECK(WCRAFSwipeReturnThreshold(320, 82) > 82);
     CHECK(WCRAFSwipeReturnThreshold(1024, 82) < 1024);
 }
@@ -1129,7 +1151,8 @@ int main(int argc, const char *argv[]) {
         TEST(LegacyGraceRecordsReturnWithoutCountdown), TEST(StableReturnedQueriesDoNotWrite),
         TEST(DiscardActivityPreservesHoldAndAllowsFutureMessages), TEST(DiscardRejectsStaleAccount),
         TEST(DirtyObservationRejectsStaleAndInvalidInput), TEST(TrackedEnumerationOmitsHeldAndDiscarded),
-        TEST(SwipeDistanceBoundary), TEST(SwipePullbackCancels), TEST(SwipeCancellationNeverReturns),
+        TEST(SwipeDistanceBoundary), TEST(SwipePullbackBeforeThreshold), TEST(SwipeCancellationNeverReturns),
+        TEST(SwipeThresholdCommitsDuringDrag), TEST(SwipeCommitIsConsumedAcrossLaterEvents),
         TEST(UngroupedSwipeNeverReturns), TEST(SwipeRejectsInvalidGeometry), TEST(SwipeRejectsReusedRow),
         TEST(SwipeRejectsChangedGroupingOrHold), TEST(SwipeRejectsAccountSwitch),
         TEST(ReturnSuppressionUnknownTimeIsNotNewMessage), TEST(ManualReturnFailureDoesNotSuppressOnRestart),

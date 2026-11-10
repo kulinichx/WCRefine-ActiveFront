@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.12 release-to-return (device validation pending).
+// WCRefine ActiveFront - v1.9.13 continuous full-row swipe (device validation pending).
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -56,7 +56,6 @@ static const void *kWCRButtonKey       = &kWCRButtonKey;
 static const void *kWCROpenKey         = &kWCROpenKey;
 static const void *kWCRTrackingKey     = &kWCRTrackingKey;
 static const void *kWCRStartOffsetKey  = &kWCRStartOffsetKey;
-static const void *kWCRBaseTransformKey = &kWCRBaseTransformKey;
 static const void *kWCRBoundUsernameKey = &kWCRBoundUsernameKey;
 static const void *kWCRCanonicalKnownKey = &kWCRCanonicalKnownKey;
 static const void *kWCRCanonicalSessionKey = &kWCRCanonicalSessionKey;
@@ -65,10 +64,15 @@ static const void *kWCRCanonicalScopeKey = &kWCRCanonicalScopeKey;
 static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 static const void *kWCRCanonicalAccountKey = &kWCRCanonicalAccountKey;
 static const void *kWCRSwipeIntentKey = &kWCRSwipeIntentKey;
-static const void *kWCRReturnArmedKey = &kWCRReturnArmedKey;
+static const void *kWCRSwipeForegroundKey = &kWCRSwipeForegroundKey;
+static const void *kWCRSwipeHiddenViewsKey = &kWCRSwipeHiddenViewsKey;
+static const void *kWCRSwipeOffsetKey = &kWCRSwipeOffsetKey;
+static const void *kWCRSwipeRenderedKey = &kWCRSwipeRenderedKey;
+static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
+static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.12-source";
+static NSString * const kWCRAFVersion = @"1.9.13-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 7;
 
@@ -416,42 +420,75 @@ static void WCRSetFloat(id obj, const void *key, CGFloat value) {
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-static BOOL WCRHasBaseTransform(UITableViewCell *cell) {
-    return cell && objc_getAssociatedObject(cell, kWCRBaseTransformKey) != nil;
-}
-
-static void WCRCaptureBaseTransform(UITableViewCell *cell) {
-    if (!cell) return;
-
-    NSValue *value =
-        [NSValue valueWithCGAffineTransform:cell.contentView.transform];
-
-    objc_setAssociatedObject(cell,
-                             kWCRBaseTransformKey,
-                             value,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-static CGAffineTransform WCRBaseTransform(UITableViewCell *cell) {
-    NSValue *value =
-        cell ? objc_getAssociatedObject(cell, kWCRBaseTransformKey) : nil;
-
-    if (value) {
-        return [value CGAffineTransformValue];
-    }
-
-    return cell ? cell.contentView.transform : CGAffineTransformIdentity;
-}
-
 static void WCRSetContentOffset(UITableViewCell *cell, CGFloat x) {
     if (!cell) return;
 
-    // Preserve WeChat's own baseline transform. v1.8 used an absolute
-    // CGAffineTransformMakeTranslation(), which could erase WeChat's layout
-    // transform and leave a row shifted left until the table refreshed.
-    CGAffineTransform transform = WCRBaseTransform(cell);
-    transform.tx += x;
-    cell.contentView.transform = transform;
+    UIView *foreground = objc_getAssociatedObject(cell, kWCRSwipeForegroundKey);
+    if (!foreground) return;
+    CGRect frame = cell.bounds;
+    frame.origin.x += x;
+    foreground.frame = frame;
+    WCRSetFloat(cell, kWCRSwipeOffsetKey, x);
+}
+
+static void WCRRestoreSwipeVisual(UITableViewCell *cell) {
+    UIView *foreground = objc_getAssociatedObject(cell, kWCRSwipeForegroundKey);
+    [foreground.layer removeAllAnimations];
+    [foreground removeFromSuperview];
+    NSArray *savedViews = objc_getAssociatedObject(cell, kWCRSwipeHiddenViewsKey);
+    for (NSDictionary *saved in savedViews) {
+        UIView *view = saved[@"view"];
+        if (view.superview == cell) view.alpha = [saved[@"alpha"] doubleValue];
+    }
+    objc_setAssociatedObject(cell, kWCRSwipeForegroundKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, kWCRSwipeHiddenViewsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    WCRSetFloat(cell, kWCRSwipeOffsetKey, 0);
+    [gWCRSwipeCells removeObject:cell];
+}
+
+static UIColor *WCRSwipeBackground(UITableViewCell *cell) {
+    for (id color in @[cell.backgroundView.backgroundColor ?: [NSNull null],
+                       cell.contentView.backgroundColor ?: [NSNull null],
+                       cell.backgroundColor ?: [NSNull null],
+                       WCRTableForCell(cell).backgroundColor ?: [NSNull null]]) {
+        if ([color isKindOfClass:[UIColor class]] &&
+            CGColorGetAlpha([[color resolvedColorWithTraitCollection:cell.traitCollection] CGColor]) > 0.99) {
+            return color;
+        }
+    }
+    return [UIColor secondarySystemGroupedBackgroundColor];
+}
+
+static BOOL WCRBeginSwipeVisual(UITableViewCell *cell) {
+    UIView *foreground = objc_getAssociatedObject(cell, kWCRSwipeForegroundKey);
+    if (foreground) {
+        CALayer *presentation = foreground.layer.presentationLayer;
+        CGFloat offset = presentation ? CGRectGetMinX(presentation.frame) - CGRectGetMinX(cell.bounds) :
+            WCRFloat(cell, kWCRSwipeOffsetKey);
+        [foreground.layer removeAllAnimations];
+        WCRSetContentOffset(cell, offset);
+        return YES;
+    }
+    UIView *actionView = objc_getAssociatedObject(cell, kWCRActionViewKey);
+    actionView.hidden = YES;
+    // Capture the cell, including avatars rendered outside contentView.
+    foreground = [cell snapshotViewAfterScreenUpdates:NO];
+    if (!foreground) return NO;
+    foreground.frame = cell.bounds;
+    foreground.userInteractionEnabled = NO;
+    NSMutableArray *savedViews = [NSMutableArray array];
+    for (UIView *view in cell.subviews) {
+        if (view == actionView) continue;
+        [savedViews addObject:@{@"view": view, @"alpha": @(view.alpha)}];
+        view.alpha = 0;
+    }
+    objc_setAssociatedObject(cell, kWCRSwipeHiddenViewsKey, savedViews, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, kWCRSwipeForegroundKey, foreground, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!gWCRSwipeCells) gWCRSwipeCells = [NSHashTable weakObjectsHashTable];
+    [gWCRSwipeCells addObject:cell];
+    WCRSetFloat(cell, kWCRSwipeOffsetKey, 0);
+    [cell addSubview:foreground];
+    return YES;
 }
 
 static void WCRLayoutAction(UITableViewCell *cell) {
@@ -465,12 +502,10 @@ static void WCRLayoutAction(UITableViewCell *cell) {
         h = CGRectGetHeight(cell.contentView.bounds);
     }
 
-    CGFloat offset = MAX(0.0, cell.contentView.transform.tx - WCRBaseTransform(cell).tx);
-    CGFloat width = WCRBool(cell, kWCRTrackingKey) ? MAX(kWCRActionWidth, offset) : kWCRActionWidth;
-    actionView.frame = CGRectMake(0.0, 0.0, width, h);
-    button.frame = CGRectMake(0.0, 0.0, MIN(width, kWCRActionWidth), h);
-    actionView.backgroundColor = WCRBool(cell, kWCRReturnArmedKey) ?
-        [UIColor systemGreenColor] : [UIColor clearColor];
+    CGFloat offset = MAX(0, WCRFloat(cell, kWCRSwipeOffsetKey));
+    // The action can occupy only the revealed gap, never the avatar's area.
+    actionView.frame = CGRectMake(CGRectGetMinX(cell.bounds), CGRectGetMinY(cell.bounds), offset, h);
+    button.frame = CGRectMake(0, 0, kWCRActionWidth, h);
 }
 
 static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
@@ -482,9 +517,9 @@ static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
     WCRSetBool(cell, kWCROpenKey, NO);
     WCRSetBool(cell, kWCRTrackingKey, NO);
     WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
-    WCRSetBool(cell, kWCRReturnArmedKey, NO);
     objc_setAssociatedObject(cell, kWCRSwipeIntentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    actionView.backgroundColor = [UIColor clearColor];
+    objc_setAssociatedObject(cell, kWCRSwipeRenderedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UIView *foreground = objc_getAssociatedObject(cell, kWCRSwipeForegroundKey);
 
     // Hide the action immediately instead of waiting for the spring
     // completion. The old completion could be interrupted by a new gesture /
@@ -499,13 +534,13 @@ static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
     void (^finish)(BOOL) = ^(BOOL finished) {
         (void)finished;
 
-        if (finished && !WCRBool(cell, kWCROpenKey) &&
+        if (finished && objc_getAssociatedObject(cell, kWCRSwipeForegroundKey) == foreground &&
+            !WCRBool(cell, kWCROpenKey) &&
             !WCRBool(cell, kWCRTrackingKey)) {
+            WCRRestoreSwipeVisual(cell);
             actionView.hidden = YES;
             [button setTitle:@"" forState:UIControlStateNormal];
 
-            // Re-apply the exact WeChat baseline after the spring finishes.
-            cell.contentView.transform = WCRBaseTransform(cell);
             [cell setNeedsLayout];
         }
     };
@@ -535,14 +570,8 @@ static void WCRHardResetCellVisual(UITableViewCell *cell,
     UIButton *button =
         objc_getAssociatedObject(cell, kWCRButtonKey);
 
-    [cell.contentView.layer removeAllAnimations];
     [actionView.layer removeAllAnimations];
-
-    // If this cell was still carrying one of our offsets, first restore the
-    // exact WeChat baseline captured before the right-swipe.
-    if (WCRHasBaseTransform(cell)) {
-        cell.contentView.transform = WCRBaseTransform(cell);
-    }
+    WCRRestoreSwipeVisual(cell);
 
     actionView.hidden = YES;
     [button setTitle:@"" forState:UIControlStateNormal];
@@ -550,17 +579,9 @@ static void WCRHardResetCellVisual(UITableViewCell *cell,
     WCRSetBool(cell, kWCROpenKey, NO);
     WCRSetBool(cell, kWCRTrackingKey, NO);
     WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
-    WCRSetBool(cell, kWCRReturnArmedKey, NO);
     objc_setAssociatedObject(cell, kWCRSwipeIntentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, kWCRSwipeRenderedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     actionView.backgroundColor = [UIColor clearColor];
-
-    // The next row/session that occupies this reusable cell must establish a
-    // fresh baseline. Keeping a transform captured for the previous row is
-    // what caused occasional alignment / overlay artifacts after auto-return.
-    objc_setAssociatedObject(cell,
-                             kWCRBaseTransformKey,
-                             nil,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     if (clearBinding) {
         objc_setAssociatedObject(cell,
@@ -581,9 +602,6 @@ static void WCROpenCell(UITableViewCell *cell) {
     WCRSetBool(cell, kWCROpenKey, YES);
     WCRSetBool(cell, kWCRTrackingKey, NO);
     WCRSetFloat(cell, kWCRStartOffsetKey, kWCRActionWidth);
-    WCRSetBool(cell, kWCRReturnArmedKey, NO);
-    actionView.backgroundColor = [UIColor clearColor];
-    WCRLayoutAction(cell);
 
     [UIView animateWithDuration:0.24
                           delay:0.0
@@ -593,6 +611,7 @@ static void WCROpenCell(UITableViewCell *cell) {
                                  UIViewAnimationOptionAllowUserInteraction)
                      animations:^{
         WCRSetContentOffset(cell, kWCRActionWidth);
+        WCRLayoutAction(cell);
     }
                      completion:nil];
 }
@@ -608,6 +627,12 @@ static void WCRCloseOtherCells(UITableViewCell *exceptCell) {
             continue;
         }
         WCRCloseCell(cell, YES);
+    }
+}
+
+static void WCRResetVisibleSwipeVisuals(void) {
+    for (UITableViewCell *cell in gWCRSwipeCells.allObjects) {
+        WCRHardResetCellVisual(cell, NO);
     }
 }
 
@@ -1837,8 +1862,9 @@ static void WCRSuppressOurActionForLeftMenu(UITableViewCell *cell) {
     WCRSetBool(cell, kWCROpenKey, NO);
     WCRSetBool(cell, kWCRTrackingKey, NO);
     WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
-    WCRSetBool(cell, kWCRReturnArmedKey, NO);
     objc_setAssociatedObject(cell, kWCRSwipeIntentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, kWCRSwipeRenderedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    WCRRestoreSwipeVisual(cell);
     actionView.backgroundColor = [UIColor clearColor];
 }
 
@@ -2031,26 +2057,13 @@ static BOOL WCRSwipeStillMatches(UITableViewCell *cell, WCRAFSwipeIntent *intent
         [WCRAFStore() isCurrentContext:context];
 }
 
-static void WCRUpdateSwipeAppearance(UITableViewCell *cell, WCRAFSwipeIntent *intent,
-                                     CGFloat distance) {
-    BOOL armed = [intent shouldReturnAtDistance:distance rowWidth:CGRectGetWidth(cell.bounds)
-        actionWidth:kWCRActionWidth ended:YES];
-    BOOL previouslyArmed = WCRBool(cell, kWCRReturnArmedKey);
-    WCRSetBool(cell, kWCRReturnArmedKey, armed);
-    UIButton *button = objc_getAssociatedObject(cell, kWCRButtonKey);
-    if (armed) {
-        [button setTitle:@"松手回组" forState:UIControlStateNormal];
-        [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    } else {
-        WCRApplyActionKindToCell(cell, intent.grouped ?
-            (intent.held ? WCRRightActionReturn : WCRRightActionKeep) : WCRRightActionGroup);
-    }
-    WCRLayoutAction(cell);
-    if (armed && !previouslyArmed) {
-        UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc]
-            initWithStyle:UIImpactFeedbackStyleLight];
-        [feedback impactOccurred];
-    }
+// A cheap binding check for each display frame. Full business resolution runs
+// at begin/commit, not on every change event.
+static BOOL WCRSwipeBindingMatches(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
+    return intent &&
+        objc_getAssociatedObject(cell, kWCRCanonicalAccountKey) == intent.context &&
+        [objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey) isEqualToString:intent.username] &&
+        objc_getAssociatedObject(cell, kWCRSwipeRenderedKey) == WCRRenderedCellData(cell);
 }
 
 static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
@@ -2119,30 +2132,37 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
             CGRectGetWidth(visible), removedHeight)];
         band.backgroundColor = [UIColor systemGreenColor];
         [overlay addSubview:band];
-        moving = [cell.contentView snapshotViewAfterScreenUpdates:NO];
-        moving.frame = [cell.contentView convertRect:cell.contentView.bounds toView:table];
-        CGRect movingFrame = moving.frame;
+        moving = objc_getAssociatedObject(cell, kWCRSwipeForegroundKey);
+        CGRect movingFrame = [cell convertRect:moving.frame toView:table];
         movingFrame.origin.x -= visible.origin.x;
         movingFrame.origin.y -= visible.origin.y;
-        moving.frame = movingFrame;
-        if (moving) [overlay addSubview:moving];
+        // Transfer the existing foreground only after persistence succeeds.
+        objc_setAssociatedObject(overlay, kWCRSwipeOffsetKey,
+            [NSValue valueWithCGRect:movingFrame], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         // Missing pictures should degrade to the normal host refresh.
         if (!moving || (upperRect.size.height > 0 && !upper) ||
             (lowerRect.size.height > 0 && !lower)) overlay = nil;
     }
     WCRCancelReturnAnimation();
-    // Commit once, on release. No animation callback is allowed to change state.
+    // Commit once at the threshold. No animation callback changes state.
     if (![WCRAFStore() setHeld:NO username:intent.username context:intent.context]) {
         WCRCloseCell(cell, YES);
         return;
     }
     if (overlay) {
+        objc_setAssociatedObject(cell, kWCRSwipeForegroundKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [moving removeFromSuperview];
+        moving.frame = [objc_getAssociatedObject(overlay, kWCRSwipeOffsetKey) CGRectValue];
+        [overlay addSubview:moving];
         gWCRReturnOverlay = overlay;
         gWCRReturnAnimationContext = intent.context;
         [container addSubview:overlay];
     }
     WCRCloseCell(cell, NO);
     WCRRefreshHome(host, @"active_front_swipe_return", intent.context);
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc]
+        initWithStyle:UIImpactFeedbackStyleLight];
+    [feedback impactOccurred];
     if (!overlay || gWCRReturnOverlay != overlay) return;
     [UIView animateWithDuration:0.16 delay:0 options:UIViewAnimationOptionCurveEaseOut
         animations:^{
@@ -2272,6 +2292,12 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
     if (![pan.view isKindOfClass:[UITableViewCell class]]) return;
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        WCRSetBool(pan, kWCRPanConsumedKey, NO);
+    } else if (WCRBool(pan, kWCRPanConsumedKey)) {
+        // The touch may still be down while the original cell is reused.
+        return;
+    }
 
     UITableViewCell *cell = (UITableViewCell *)pan.view;
     if (!WCRIsMainFrameCell(cell)) return;
@@ -2309,29 +2335,27 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
             objc_setAssociatedObject(cell, kWCRSwipeIntentKey, intent, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
             WCRCloseOtherCells(cell);
-            WCRLayoutAction(cell);
-
-            BOOL wasOpen = WCRBool(cell, kWCROpenKey);
-
-            // Capture WeChat's actual closed-state transform immediately
-            // before our first right-swipe. Never assume identity.
-            if (!wasOpen) {
-                WCRCaptureBaseTransform(cell);
+            if (!WCRBeginSwipeVisual(cell)) {
+                WCRCloseCell(cell, NO);
+                pan.enabled = NO;
+                pan.enabled = YES;
+                break;
             }
-
-            CGFloat startOffset = wasOpen ? kWCRActionWidth : 0.0;
+            objc_setAssociatedObject(cell, kWCRSwipeRenderedKey, WCRRenderedCellData(cell),
+                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            CGFloat startOffset = WCRFloat(cell, kWCRSwipeOffsetKey);
 
             WCRSetFloat(cell, kWCRStartOffsetKey, startOffset);
             WCRSetBool(cell, kWCRTrackingKey, YES);
+            actionView.backgroundColor = WCRSwipeBackground(cell);
             actionView.hidden = NO;
-
-            [cell.contentView.layer removeAllAnimations];
+            WCRLayoutAction(cell);
             break;
         }
 
         case UIGestureRecognizerStateChanged: {
             WCRAFSwipeIntent *intent = objc_getAssociatedObject(cell, kWCRSwipeIntentKey);
-            if (!WCRBool(cell, kWCRTrackingKey) || !WCRSwipeStillMatches(cell, intent)) {
+            if (!WCRBool(cell, kWCRTrackingKey) || !WCRSwipeBindingMatches(cell, intent)) {
                 WCRCloseCell(cell, NO);
                 break;
             }
@@ -2345,16 +2369,20 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
             x = MIN(x, intent.grouped ? CGRectGetWidth(cell.bounds) : kWCRActionWidth);
 
             WCRSetContentOffset(cell, x);
-            WCRUpdateSwipeAppearance(cell, intent, x);
+            WCRLayoutAction(cell);
+            if ([intent consumeReturnAtDistance:x rowWidth:CGRectGetWidth(cell.bounds)
+                    actionWidth:kWCRActionWidth cancelled:NO]) {
+                WCRSetBool(pan, kWCRPanConsumedKey, YES);
+                WCRAnimateReturn(cell, intent);
+            }
             break;
         }
 
         case UIGestureRecognizerStateEnded:
         case UIGestureRecognizerStateCancelled:
         case UIGestureRecognizerStateFailed: {
-            // Our translation is relative to WeChat's captured baseline.
-            // Using the absolute tx can misclassify the gesture when WeChat
-            // already applies its own transform to the cell content view.
+            // A final sample can cross the threshold even if UIKit coalesced
+            // the last Changed event. Use the same once-only distance policy.
             WCRAFSwipeIntent *intent = objc_getAssociatedObject(cell, kWCRSwipeIntentKey);
             CGFloat currentX = MAX(0, WCRFloat(cell, kWCRStartOffsetKey) + translation.x);
             BOOL cancelled =
@@ -2365,8 +2393,9 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
                 WCRCloseCell(cell, NO);
                 break;
             }
-            if ([intent shouldReturnAtDistance:currentX rowWidth:CGRectGetWidth(cell.bounds)
-                    actionWidth:kWCRActionWidth ended:!cancelled]) {
+            if ([intent consumeReturnAtDistance:currentX rowWidth:CGRectGetWidth(cell.bounds)
+                    actionWidth:kWCRActionWidth cancelled:cancelled]) {
+                WCRSetBool(pan, kWCRPanConsumedKey, YES);
                 WCRAnimateReturn(cell, intent);
                 break;
             }
@@ -2645,22 +2674,13 @@ static void WCRAttachToCell(UITableViewCell *cell) {
         WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
     }
 
-    // Seed the baseline only when the cell is clearly not in WeChat's
-    // left-swipe state. It will be refreshed again at every new WCRefine
-    // right-swipe begin.
-    if (!WCRHasBaseTransform(cell) &&
-        !WCRBool(cell, kWCROpenKey) &&
-        !WCRBool(cell, kWCRTrackingKey) &&
-        cell.contentView.transform.tx >= -1.0) {
-        WCRCaptureBaseTransform(cell);
-    }
-
     WCRLayoutAction(cell);
     WCRAFSwipeIntent *intent = objc_getAssociatedObject(cell, kWCRSwipeIntentKey);
-    if (WCRBool(cell, kWCRTrackingKey) && WCRSwipeStillMatches(cell, intent)) {
-        CGFloat distance = cell.contentView.transform.tx - WCRBaseTransform(cell).tx;
-        WCRUpdateSwipeAppearance(cell, intent, distance);
-    } else {
+    if (WCRBool(cell, kWCRTrackingKey) &&
+        (!WCRSwipeBindingMatches(cell, intent) || !WCRSwipeStillMatches(cell, intent))) {
+        WCRCloseCell(cell, NO);
+    }
+    if (!WCRBool(cell, kWCRTrackingKey)) {
         WCRApplyActionKindToCell(cell, currentKind);
     }
 
@@ -2817,6 +2837,7 @@ static void hook_activeViewDidAppear(id self,
 
 static void hook_activeViewWillDisappear(id self, SEL _cmd, BOOL animated) {
     WCRCancelReturnAnimation();
+    WCRResetVisibleSwipeVisuals();
     if (orig_activeViewWillDisappear) orig_activeViewWillDisappear(self, _cmd, animated);
 }
 
@@ -2845,15 +2866,14 @@ static void hook_groupingWillDisplay(
 }
 
 static void hook_cellPrepareForReuse(id self, SEL _cmd) {
+    if ([self isKindOfClass:[UITableViewCell class]]) {
+        // Restore before native reuse configures its own subview visibility.
+        WCRHardResetCellVisual((UITableViewCell *)self, YES);
+        WCRClearCanonicalRowBinding((UITableViewCell *)self);
+    }
     if (orig_cellPrepareForReuse) {
         orig_cellPrepareForReuse(self, _cmd);
     }
-
-    if (![self isKindOfClass:[UITableViewCell class]]) return;
-
-    UITableViewCell *cell = (UITableViewCell *)self;
-    WCRHardResetCellVisual(cell, YES);
-    WCRClearCanonicalRowBinding(cell);
 }
 
 static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
@@ -2863,7 +2883,10 @@ static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
 
     if (![self isKindOfClass:[UITableViewCell class]]) return;
     UITableViewCell *cell = (UITableViewCell *)self;
-    if (!cell.window) return;
+    if (!cell.window) {
+        WCRHardResetCellVisual(cell, NO);
+        return;
+    }
 
     // UIKit invokes didMoveToWindow on the main thread. Avoid scheduling a
     // second main-queue block for every visible/reused cell.
@@ -3088,6 +3111,7 @@ static void WCRRightGroupUIInit(void) {
             addObserverForName:UIApplicationWillResignActiveNotification object:nil
             queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *notification) {
             WCRCancelReturnAnimation();
+            WCRResetVisibleSwipeVisuals();
         }];
         static id activeObserver __attribute__((unused));
         activeObserver = [[NSNotificationCenter defaultCenter]

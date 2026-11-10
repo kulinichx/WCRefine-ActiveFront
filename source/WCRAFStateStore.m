@@ -36,7 +36,9 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
     return MAX(actionWidth * 2.0, rowWidth * 0.56);
 }
 
-@implementation WCRAFSwipeIntent
+@implementation WCRAFSwipeIntent {
+    BOOL _returnConsumed;
+}
 - (instancetype)initWithUsername:(NSString *)username context:(WCRAFAccountContext *)context
                          grouped:(BOOL)grouped held:(BOOL)held {
     self = [super init];
@@ -54,10 +56,12 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
         _context && _context == context && _context.epoch == context.epoch &&
         grouped == _grouped && held == _held;
 }
-- (BOOL)shouldReturnAtDistance:(double)distance rowWidth:(double)width
-                  actionWidth:(double)actionWidth ended:(BOOL)ended {
-    return ended && _grouped && isfinite(distance) &&
-        distance >= WCRAFSwipeReturnThreshold(width, actionWidth);
+- (BOOL)consumeReturnAtDistance:(double)distance rowWidth:(double)width
+                   actionWidth:(double)actionWidth cancelled:(BOOL)cancelled {
+    if (_returnConsumed || cancelled || !_grouped || !isfinite(distance) ||
+        distance < WCRAFSwipeReturnThreshold(width, actionWidth)) return NO;
+    _returnConsumed = YES;
+    return YES;
 }
 @end
 
