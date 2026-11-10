@@ -22,7 +22,16 @@
 - 注册 113 项原生核心测试，新增延后更新、单次确认、重复合并、
   反向请求、取消、换号、后台、拒绝、容量和重入场景。
 
-本轮待 Apple 工具链构建。当前 `build/` 仍为已验收的 1.9.16。
+本轮已完成 Apple 工具链构建：35 项本地源码契约检查、18 项构建验收器测试、
+**113 项原生 Foundation 核心测试全部通过，iOS ARM64 编译零警告。**
+Apple 签名、下载压缩包哈希、CodeDirectory 页哈希及编译输入快照验证通过。
+当前 `build/WCRefineGroup.dylib` 为 1.9.17，大小 277,536 字节，SHA-256：
+`a09091ba814044f93b4f0b239f05ba2872e95cef0babb7cf4aafd6ba943f2b9b`。
+源码提交：`a0ae994da7a7a942b8557e9141773486b7b6fde9`；
+GitHub Actions run：`42852944150`；产物 ID：`13782541089`。
+旧 1.9.16 库与验收记录已保存在
+`../audit/backups/source-build-1.9.16-219ad717a785/`，根目录旧库未替换。
+构建证据见 `../audit/source_build_acceptance.json` 与 `../audit/ci/42852944150/`。
 延后确认用于修复过早判定失败；截图不能证明群聊不生效仅由时序导致，
 实际群聊设置同步及交互效果仍需真机验证。
 
@@ -50,7 +59,7 @@ Apple 签名、下载压缩包哈希、CodeDirectory 页哈希及编译输入快
 GitHub Actions run：`42845920050`；产物 ID：`13778471931`。
 旧 1.9.15 库与验收记录已保存在
 `../audit/backups/source-build-1.9.15-9d79de69f72d/`，根目录旧库未替换。
-构建证据见 `../audit/source_build_acceptance.json` 与 `../audit/ci/42845920050/`。
+1.9.16 构建日志见 `../audit/ci/42845920050/`，验收记录随旧库备份保存。
 免扰接口在用户设备上的具体返回类型和执行结果、UIKit 手势及能耗尚未实测。
 
 ## 1.9.15：消息提醒与首页右滑
