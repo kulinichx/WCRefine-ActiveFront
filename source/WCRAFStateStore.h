@@ -16,6 +16,28 @@ FOUNDATION_EXPORT NSInteger WCRAFReadNativeNotifyOpen(id _Nullable contact);
 FOUNDATION_EXPORT WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(
     id _Nullable manager, id _Nullable contact, BOOL notify);
 
+typedef NS_ENUM(NSInteger, WCRAFNotifyOutcome) {
+    WCRAFNotifyConfirmed,
+    WCRAFNotifyReadUnavailable,
+    WCRAFNotifyWriteUnavailable,
+    WCRAFNotifyRejected,
+    WCRAFNotifyUnconfirmed,
+    WCRAFNotifyBusy
+};
+
+@class WCRAFAccountContext;
+// Main-queue operations: one write, immediate readback, at most one deferred read.
+@interface WCRAFNotifyCoordinator : NSObject
+- (instancetype)initWithValidator:(BOOL (^)(WCRAFAccountContext *))validator
+                       scheduler:(void (^)(void (^)(void)))scheduler;
+- (void)changeUsername:(NSString *)username context:(WCRAFAccountContext *)context
+                notify:(BOOL)notify read:(NSInteger (^)(void))read
+                 write:(WCRAFNativeNotifyResult (^)(void))write
+            completion:(void (^)(WCRAFNotifyOutcome))completion;
+- (void)invalidateUsername:(NSString *)username;
+- (void)cancelAll;
+@end
+
 @interface WCRAFAccountContext : NSObject
 @property(nonatomic, copy, readonly) NSString *account;
 @property(nonatomic, assign, readonly) uint64_t epoch;

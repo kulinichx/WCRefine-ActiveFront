@@ -94,6 +94,114 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
     } @catch (__unused NSException *exception) { return WCRAFNativeNotifyUnavailable; }
 }
 
+@interface WCRAFNotifyRequest : NSObject
+@property(nonatomic, copy) NSString *username;
+@property(nonatomic, strong) WCRAFAccountContext *context;
+@property(nonatomic) BOOL notify;
+@property(nonatomic, copy) NSInteger (^read)(void);
+@property(nonatomic, copy) void (^completion)(WCRAFNotifyOutcome);
+@end
+@implementation WCRAFNotifyRequest
+@end
+
+@implementation WCRAFNotifyCoordinator {
+    NSMutableDictionary<NSString *, WCRAFNotifyRequest *> *_requests;
+    BOOL (^_validator)(WCRAFAccountContext *);
+    void (^_scheduler)(void (^)(void));
+}
+- (instancetype)initWithValidator:(BOOL (^)(WCRAFAccountContext *))validator
+                       scheduler:(void (^)(void (^)(void)))scheduler {
+    self = [super init];
+    if (self) {
+        _requests = [NSMutableDictionary dictionary];
+        _validator = [validator copy];
+        _scheduler = [scheduler copy];
+    }
+    return self;
+}
+- (BOOL)isCurrent:(WCRAFNotifyRequest *)request {
+    if (_requests[request.username] != request) return NO;
+    if (_validator(request.context) && _requests[request.username] == request) return YES;
+    if (_requests[request.username] == request) [_requests removeObjectForKey:request.username];
+    return NO;
+}
+- (NSInteger)read:(WCRAFNotifyRequest *)request {
+    @try { return request.read(); }
+    @catch (__unused NSException *exception) { return -1; }
+}
+- (void)finish:(WCRAFNotifyRequest *)request outcome:(WCRAFNotifyOutcome)outcome {
+    if (![self isCurrent:request]) return;
+    [_requests removeObjectForKey:request.username];
+    request.completion(outcome);
+}
+- (void)changeUsername:(NSString *)username context:(WCRAFAccountContext *)context
+                notify:(BOOL)notify read:(NSInteger (^)(void))read
+                 write:(WCRAFNativeNotifyResult (^)(void))write
+            completion:(void (^)(WCRAFNotifyOutcome))completion {
+    if (username.length == 0 || !_validator(context)) return;
+    WCRAFNotifyRequest *previous = _requests[username];
+    if (previous && previous.context == context && previous.notify == notify) {
+        // Coalesce duplicate taps/sends without another write or scheduled wakeup.
+        previous.read = read;
+        previous.completion = completion;
+        return;
+    }
+    BOOL superseding = previous && previous.context == context;
+    [_requests removeObjectForKey:username];
+    if (_requests.count >= 128) {
+        completion(WCRAFNotifyBusy);
+        return;
+    }
+    WCRAFNotifyRequest *request = [WCRAFNotifyRequest new];
+    request.username = username;
+    request.context = context;
+    request.notify = notify;
+    request.read = read;
+    request.completion = completion;
+    _requests[username] = request;
+    NSInteger before = [self read:request];
+    if (![self isCurrent:request]) return;
+    if (before != 0 && before != 1) {
+        [self finish:request outcome:WCRAFNotifyReadUnavailable];
+        return;
+    }
+    if (before == (notify ? 1 : 0) && !superseding) {
+        [self finish:request outcome:WCRAFNotifyConfirmed];
+        return;
+    }
+    WCRAFNativeNotifyResult result = WCRAFNativeNotifyUnavailable;
+    @try { result = write(); }
+    @catch (__unused NSException *exception) { }
+    if (![self isCurrent:request]) return;
+    if (result == WCRAFNativeNotifyUnavailable) {
+        [self finish:request outcome:WCRAFNotifyWriteUnavailable];
+        return;
+    }
+    NSInteger after = [self read:request];
+    if (![self isCurrent:request]) return;
+    if (after == (notify ? 1 : 0)) {
+        [self finish:request outcome:WCRAFNotifyConfirmed];
+        return;
+    }
+    __weak WCRAFNotifyCoordinator *weakSelf = self;
+    _scheduler(^{
+        WCRAFNotifyCoordinator *coordinator = weakSelf;
+        if (!coordinator || ![coordinator isCurrent:request]) return;
+        NSInteger latest = [coordinator read:request];
+        WCRAFNotifyOutcome outcome = latest == (notify ? 1 : 0) ?
+            WCRAFNotifyConfirmed : (result == WCRAFNativeNotifyRejected ?
+                WCRAFNotifyRejected : WCRAFNotifyUnconfirmed);
+        [coordinator finish:request outcome:outcome];
+    });
+}
+- (void)invalidateUsername:(NSString *)username {
+    [_requests removeObjectForKey:username];
+}
+- (void)cancelAll {
+    [_requests removeAllObjects];
+}
+@end
+
 BOOL WCRAFAllowsAutomaticActivity(NSUInteger scope, NSInteger muted, NSInteger folded) {
     if (folded == 1) return NO;
     return (scope == 1 && muted != 1) || (scope == 2 && muted == 0);

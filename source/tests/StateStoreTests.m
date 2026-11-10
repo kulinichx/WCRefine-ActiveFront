@@ -194,6 +194,65 @@ static int QualifiedNotifyWrite(id self, __unused SEL cmd, id contact, int notif
 }
 @end
 
+@interface NotifyOperationFixture : NSObject
+@property(nonatomic, strong) Fixture *fixture;
+@property(nonatomic, strong) WCRAFAccountContext *context;
+@property(nonatomic, strong) WCRAFNotifyCoordinator *coordinator;
+@property(nonatomic, strong) NotifyIntReader *contact;
+@property(nonatomic, strong) NotifyIntWriter *manager;
+@property(nonatomic, strong) NSMutableArray *scheduled;
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *outcomes;
+@property(nonatomic) NSUInteger reads;
+@property(nonatomic) BOOL foreground;
+- (instancetype)initWithFixture:(Fixture *)fixture;
+- (void)request:(BOOL)notify;
+- (void)runNext;
+@end
+
+@implementation NotifyOperationFixture
+- (instancetype)initWithFixture:(Fixture *)fixture {
+    self = [super init];
+    if (self) {
+        _fixture = fixture;
+        _context = [fixture.store currentContext];
+        _contact = [NotifyIntReader new];
+        _contact.value = 1;
+        _manager = [NotifyIntWriter new];
+        _manager.updatesState = NO;
+        _foreground = YES;
+        _scheduled = [NSMutableArray array];
+        _outcomes = [NSMutableArray array];
+        __weak NotifyOperationFixture *weakSelf = self;
+        _coordinator = [[WCRAFNotifyCoordinator alloc]
+            initWithValidator:^BOOL(WCRAFAccountContext *context) {
+                NotifyOperationFixture *current = weakSelf;
+                return current.foreground && [current.fixture.store isCurrentContext:context];
+            } scheduler:^(void (^confirm)(void)) {
+                [weakSelf.scheduled addObject:[confirm copy]];
+            }];
+    }
+    return self;
+}
+- (void)request:(BOOL)notify {
+    __weak NotifyOperationFixture *weakSelf = self;
+    [self.coordinator changeUsername:@"room@chatroom" context:self.context notify:notify
+        read:^NSInteger {
+            weakSelf.reads++;
+            return WCRAFReadNativeNotifyOpen(weakSelf.contact);
+        } write:^WCRAFNativeNotifyResult {
+            return WCRAFInvokeNativeNotify(weakSelf.manager, weakSelf.contact, notify);
+        } completion:^(WCRAFNotifyOutcome outcome) {
+            [weakSelf.outcomes addObject:@(outcome)];
+        }];
+}
+- (void)runNext {
+    CHECK(self.scheduled.count > 0);
+    void (^confirm)(void) = self.scheduled.firstObject;
+    [self.scheduled removeObjectAtIndex:0];
+    confirm();
+}
+@end
+
 static void NoAutomaticLegacyMigration(Fixture *f) {
     [f.defaults setObject:@[@"alice"] forKey:LegacyNames];
     [f.defaults setInteger:3 forKey:LegacyDays];
@@ -1572,6 +1631,143 @@ static void NativeNotifyVoidReturnStillRequiresReadback(Fixture *f) {
     CHECK(WCRAFReadNativeNotifyOpen(contact) == 0);
 }
 
+static void NotifyDeferredStateConfirmsOnce(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    CHECK(op.manager.calls == 1 && op.reads == 2);
+    CHECK(op.outcomes.count == 0 && op.scheduled.count == 1);
+    op.contact.value = 0; // Simulate the host updating after the setter returns.
+    [op runNext];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    CHECK(op.manager.calls == 1 && op.reads == 3 && op.scheduled.count == 0);
+}
+
+static void NotifyUnchangedStateFailsAfterOneRead(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    [op runNext];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyUnconfirmed)]]);
+    CHECK(op.manager.calls == 1 && op.reads == 3 && op.scheduled.count == 0);
+}
+
+static void NotifyAlreadyDesiredDoesNotSchedule(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:YES];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    CHECK(op.manager.calls == 0 && op.reads == 1 && op.scheduled.count == 0);
+}
+
+static void NotifyImmediateWriteDoesNotSchedule(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    op.manager.updatesState = YES;
+    [op request:NO];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    CHECK(op.manager.calls == 1 && op.reads == 2 && op.scheduled.count == 0);
+}
+
+static void NotifyDuplicateRequestsShareConfirmation(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    [op request:NO];
+    [op request:NO];
+    CHECK(op.manager.calls == 1 && op.reads == 2 && op.scheduled.count == 1);
+    op.contact.value = 0;
+    [op runNext];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+}
+
+static void NotifyOppositeRequestSupersedesPending(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    // Current state is still ON, but the earlier OFF request is in flight.
+    [op request:YES];
+    CHECK(op.manager.calls == 2 && op.manager.notify);
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    [op runNext];
+    CHECK(op.outcomes.count == 1 && op.scheduled.count == 0);
+}
+
+static void NotifyExplicitCancellationPreventsLateCompletion(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    [op.coordinator invalidateUsername:@"room@chatroom"];
+    op.contact.value = 0;
+    [op runNext];
+    CHECK(op.outcomes.count == 0 && op.reads == 2 && op.manager.calls == 1);
+}
+
+static void NotifyAccountSwitchDropsConfirmation(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    f.account = @"account-B";
+    op.contact.value = 0;
+    [op runNext];
+    CHECK(op.outcomes.count == 0 && op.reads == 2);
+}
+
+static void NotifyBackgroundCancellationDropsAll(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    op.foreground = NO;
+    [op.coordinator cancelAll];
+    [op runNext];
+    CHECK(op.outcomes.count == 0 && op.reads == 2);
+    [op request:NO];
+    CHECK(op.manager.calls == 1 && op.scheduled.count == 0);
+}
+
+static void NotifyRejectStillAcceptsConfirmedState(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    op.manager.response = 0;
+    [op request:NO];
+    op.contact.value = 0;
+    [op runNext];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    op.contact.value = 1;
+    [op request:NO];
+    [op runNext];
+    CHECK(op.outcomes.lastObject.integerValue == WCRAFNotifyRejected);
+}
+
+static void NotifyUnavailableReadAndWriteFailWithoutSchedule(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    op.contact.throwRead = YES;
+    [op request:NO];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyReadUnavailable)]]);
+    CHECK(op.manager.calls == 0 && op.scheduled.count == 0);
+    op.contact.throwRead = NO;
+    op.manager.throwWrite = YES;
+    [op request:NO];
+    CHECK(op.outcomes.lastObject.integerValue == WCRAFNotifyWriteUnavailable);
+    CHECK(op.scheduled.count == 0);
+}
+
+static void NotifyPendingRequestsAreBounded(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    for (NSUInteger index = 0; index < 129; index++) {
+        [op.coordinator changeUsername:[NSString stringWithFormat:@"room-%lu", (unsigned long)index]
+            context:op.context notify:NO read:^NSInteger { return 1; }
+            write:^WCRAFNativeNotifyResult { return WCRAFNativeNotifyInvoked; }
+            completion:^(WCRAFNotifyOutcome outcome) { [op.outcomes addObject:@(outcome)]; }];
+    }
+    CHECK(op.scheduled.count == 128);
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyBusy)]]);
+    [op.coordinator cancelAll];
+    while (op.scheduled.count) [op runNext];
+    CHECK(op.outcomes.count == 1);
+}
+
+static void NotifyReentrantCancellationStopsReadback(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op.coordinator changeUsername:@"room" context:op.context notify:NO
+        read:^NSInteger { op.reads++; return 1; }
+        write:^WCRAFNativeNotifyResult {
+            [op.coordinator invalidateUsername:@"room"];
+            return WCRAFNativeNotifyInvoked;
+        } completion:^(__unused WCRAFNotifyOutcome outcome) { op.foreground = NO; }];
+    CHECK(op.reads == 1 && op.scheduled.count == 0 && op.foreground);
+}
+
 int main(int argc, const char *argv[]) {
     if (argc > 2) return 2;
     struct Test { const char *name; void (*run)(Fixture *); } tests[] = {
@@ -1623,7 +1819,14 @@ int main(int argc, const char *argv[]) {
         TEST(NativeNotifyWritesIntegerReturnAndFlagWidths), TEST(NativeNotifyPreservesWideReturnValues),
         TEST(NativeNotifyRejectsUnsupportedSignaturesBeforeWrite), TEST(NativeNotifyRejectedCallDoesNotClaimSuccess),
         TEST(NativeNotifySubmissionStillRequiresStateConfirmation), TEST(NativeNotifyExceptionsPreserveNativeState),
-        TEST(NativeNotifySupportsQualifiedIntegerEncodings), TEST(NativeNotifyVoidReturnStillRequiresReadback)
+        TEST(NativeNotifySupportsQualifiedIntegerEncodings), TEST(NativeNotifyVoidReturnStillRequiresReadback),
+        TEST(NotifyDeferredStateConfirmsOnce), TEST(NotifyUnchangedStateFailsAfterOneRead),
+        TEST(NotifyAlreadyDesiredDoesNotSchedule), TEST(NotifyImmediateWriteDoesNotSchedule),
+        TEST(NotifyDuplicateRequestsShareConfirmation), TEST(NotifyOppositeRequestSupersedesPending),
+        TEST(NotifyExplicitCancellationPreventsLateCompletion), TEST(NotifyAccountSwitchDropsConfirmation),
+        TEST(NotifyBackgroundCancellationDropsAll), TEST(NotifyRejectStillAcceptsConfirmedState),
+        TEST(NotifyUnavailableReadAndWriteFailWithoutSchedule), TEST(NotifyPendingRequestsAreBounded),
+        TEST(NotifyReentrantCancellationStopsReadback)
 #undef TEST
     };
     int failed = 0;
