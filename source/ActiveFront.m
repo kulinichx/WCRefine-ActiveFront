@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.14 neutral return animation (device validation pending).
+// WCRefine ActiveFront - v1.9.15 native reminders and acknowledged outgoing activity.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -47,12 +47,14 @@
 #import <objc/runtime.h>
 #import <math.h>
 #import <stdarg.h>
+#import <string.h>
 
 static const CGFloat kWCRActionWidth = 82.0;
 
 static const void *kWCRPanKey          = &kWCRPanKey;
 static const void *kWCRActionViewKey   = &kWCRActionViewKey;
 static const void *kWCRButtonKey       = &kWCRButtonKey;
+static const void *kWCRMuteButtonKey   = &kWCRMuteButtonKey;
 static const void *kWCROpenKey         = &kWCROpenKey;
 static const void *kWCRTrackingKey     = &kWCRTrackingKey;
 static const void *kWCRStartOffsetKey  = &kWCRStartOffsetKey;
@@ -72,9 +74,9 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.14-source";
+static NSString * const kWCRAFVersion = @"1.9.15-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
-static const NSInteger kWCRAFDefaultHoldExpiryDays = 7;
+static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
 
 #ifndef WCRAF_DIAGNOSTICS
@@ -146,6 +148,8 @@ static void WCRAFLog(NSString *format, ...) {
 static WCRAFStateStore *WCRAFStore(void);
 static void WCRInvalidateGroupIndex(void);
 static void WCRCancelReturnAnimation(void);
+static void WCRInvalidateOutgoing(NSString *username, WCRAFAccountContext *context);
+static UIViewController *WCRTopVC(void);
 
 
 @interface NewMainFrameViewController : UIViewController
@@ -162,6 +166,7 @@ static void WCRCancelReturnAnimation(void);
 @interface WCRGroupingSessionListViewController : UIViewController
 @property(nonatomic, copy) NSString *groupId;
 @property(nonatomic, strong) UITableView *tableView;
+@property(nonatomic, copy) NSArray *items;
 @end
 
 // Confirmed private accessor used by WCRefine/WeChat cell code.  The runtime
@@ -174,7 +179,9 @@ typedef NS_ENUM(NSInteger, WCRRightActionKind) {
     WCRRightActionNone = 0,
     WCRRightActionGroup,
     WCRRightActionKeep,
-    WCRRightActionReturn
+    WCRRightActionReturn,
+    WCRRightActionMute,
+    WCRRightActionRemind
 };
 
 #pragma mark - Helpers
@@ -312,6 +319,107 @@ static BOOL WCRIsActiveFrontHomeTable(UITableView *tableView) {
     // MainFrameTableView. This prevents WCRefine's internal lists from being
     // modified if their implementation changes.
     return NO;
+}
+
+static WCRGroupingSessionListViewController *WCRGroupControllerForTable(UITableView *table) {
+    id owner = WCRViewControllerForView(table);
+    if (!WCRIsGroupingSessionListController(owner)) owner = table.delegate;
+    if (!WCRIsGroupingSessionListController(owner)) return nil;
+    @try {
+        return [owner tableView] == table ? owner : nil;
+    } @catch (__unused NSException *exception) { return nil; }
+}
+
+static BOOL WCRIsSupportedSwipeTable(UITableView *table) {
+    return WCRIsActiveFrontHomeTable(table) || WCRGroupControllerForTable(table) != nil;
+}
+
+static CGFloat WCRActionExtent(UITableViewCell *cell) {
+    return kWCRActionWidth * (WCRGroupControllerForTable(WCRTableForCell(cell)) ? 1 : 2);
+}
+
+// Call only signatures checked against the currently loaded native classes.
+static id WCRObjectResult(id receiver, NSString *selectorName) {
+    SEL selector = NSSelectorFromString(selectorName);
+    NSMethodSignature *signature = [receiver methodSignatureForSelector:selector];
+    if (signature.numberOfArguments != 2 || signature.methodReturnType[0] != '@') return nil;
+    return ((id (*)(id, SEL))[receiver methodForSelector:selector])(receiver, selector);
+}
+
+static NSInteger WCRContactMuted(NSString *username) {
+    @try {
+        Class helper = NSClassFromString(@"WCRefineChatRoomMuteHelper");
+        SEL lookup = NSSelectorFromString(@"wcr_contactForName:");
+        NSMethodSignature *sig = [helper methodSignatureForSelector:lookup];
+        if (sig.numberOfArguments != 3 || sig.methodReturnType[0] != '@' ||
+            [sig getArgumentTypeAtIndex:2][0] != '@') return -1;
+        id contact = ((id (*)(id, SEL, id))[helper methodForSelector:lookup])(helper, lookup, username);
+        SEL read = NSSelectorFromString(@"isChatStatusNotifyOpen");
+        sig = [contact methodSignatureForSelector:read];
+        if (sig.numberOfArguments != 2 ||
+            (sig.methodReturnType[0] != 'B' && sig.methodReturnType[0] != 'c')) return -1;
+        BOOL open = ((BOOL (*)(id, SEL))[contact methodForSelector:read])(contact, read);
+        return open ? 0 : 1;
+    } @catch (__unused NSException *exception) { return -1; }
+}
+
+static NSMutableDictionary<NSString *, NSDictionary *> *gWCRReminderChanges;
+
+static void WCRRememberReminder(NSString *username, BOOL muted, WCRAFAccountContext *context) {
+    @synchronized (WCRAFStore()) {
+        if (![WCRAFStore() isCurrentContext:context]) return;
+        if (!gWCRReminderChanges) gWCRReminderChanges = [NSMutableDictionary dictionary];
+        if (gWCRReminderChanges.count >= 128) [gWCRReminderChanges removeAllObjects];
+        gWCRReminderChanges[username] = @{@"context": context, @"muted": @(muted)};
+    }
+}
+
+static BOOL WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContext *context) {
+    if (username.length == 0 || ![WCRAFStore() isCurrentContext:context]) return NO;
+    @try {
+        NSInteger before = WCRContactMuted(username);
+        if (before < 0) return NO;
+        if (before == (muted ? 1 : 0)) {
+            WCRRememberReminder(username, muted, context);
+            return YES;
+        }
+        Class helper = NSClassFromString(@"WCRefineChatRoomMuteHelper");
+        SEL lookup = NSSelectorFromString(@"wcr_contactForName:");
+        id contact = ((id (*)(id, SEL, id))[helper methodForSelector:lookup])(helper, lookup, username);
+        id manager = WCRObjectResult(helper, @"wcr_contactMgr");
+        SEL change = NSSelectorFromString(@"ChangeNotifyStatus:withStatus:sync:");
+        NSMethodSignature *sig = [manager methodSignatureForSelector:change];
+        if (!contact || sig.numberOfArguments != 5 ||
+            [sig getArgumentTypeAtIndex:2][0] != '@') return NO;
+        for (NSUInteger index = 3; index < 5; index++) {
+            const char type = [sig getArgumentTypeAtIndex:index][0];
+            if (!strchr("BcCiIsSlLqQ", type)) return NO;
+        }
+        const char result = sig.methodReturnType[0];
+        if (result != 'v' && result != 'B' && result != 'c') return NO;
+        if (![WCRAFStore() isCurrentContext:context]) return NO;
+        NSInvocation *call = [NSInvocation invocationWithMethodSignature:sig];
+        call.target = manager;
+        call.selector = change;
+        // NSInvocation copies the argument's native width (1/2/4/8 bytes).
+        uint64_t notify = muted ? 0 : 1, sync = 1;
+        [call setArgument:&contact atIndex:2];
+        [call setArgument:&notify atIndex:3];
+        [call setArgument:&sync atIndex:4];
+        [call invoke];
+        BOOL success = [WCRAFStore() isCurrentContext:context] &&
+            WCRContactMuted(username) == (muted ? 1 : 0);
+        if (success) WCRRememberReminder(username, muted, context);
+        return success;
+    } @catch (__unused NSException *exception) { return NO; }
+}
+
+static void WCRReminderFailure(void) {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"未能修改消息提醒"
+        message:@"请在微信聊天设置中确认消息免打扰状态。" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+    UIViewController *presenter = WCRTopVC();
+    [presenter presentViewController:alert animated:YES completion:nil];
 }
 
 static UIViewController *WCRTopVC(void) {
@@ -506,6 +614,8 @@ static void WCRLayoutAction(UITableViewCell *cell) {
     // The action can occupy only the revealed gap, never the avatar's area.
     actionView.frame = CGRectMake(CGRectGetMinX(cell.bounds), CGRectGetMinY(cell.bounds), offset, h);
     button.frame = CGRectMake(0, 0, kWCRActionWidth, h);
+    UIButton *mute = objc_getAssociatedObject(cell, kWCRMuteButtonKey);
+    mute.frame = CGRectMake(kWCRActionWidth, 0, kWCRActionWidth, h);
 }
 
 static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
@@ -601,7 +711,7 @@ static void WCROpenCell(UITableViewCell *cell) {
 
     WCRSetBool(cell, kWCROpenKey, YES);
     WCRSetBool(cell, kWCRTrackingKey, NO);
-    WCRSetFloat(cell, kWCRStartOffsetKey, kWCRActionWidth);
+    WCRSetFloat(cell, kWCRStartOffsetKey, WCRActionExtent(cell));
 
     [UIView animateWithDuration:0.24
                           delay:0.0
@@ -610,7 +720,7 @@ static void WCROpenCell(UITableViewCell *cell) {
                         options:(UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
                      animations:^{
-        WCRSetContentOffset(cell, kWCRActionWidth);
+        WCRSetContentOffset(cell, WCRActionExtent(cell));
         WCRLayoutAction(cell);
     }
                      completion:nil];
@@ -618,7 +728,7 @@ static void WCROpenCell(UITableViewCell *cell) {
 
 static void WCRCloseOtherCells(UITableViewCell *exceptCell) {
     UITableView *tableView = WCRTableForCell(exceptCell);
-    if (!WCRIsActiveFrontHomeTable(tableView)) return;
+    if (!WCRIsSupportedSwipeTable(tableView)) return;
 
     for (UITableViewCell *cell in tableView.visibleCells) {
         if (cell == exceptCell) continue;
@@ -872,11 +982,34 @@ static NSInteger WCRSessionBooleanFlag(id native, NSString *key) {
     }
 }
 
-static BOOL WCRSessionAllowsAutomaticActivity(id native, NSUInteger scope) {
+static NSInteger WCREffectiveMuted(id native, NSString *username, WCRAFAccountContext *context) {
+    NSInteger flag = WCRSessionBooleanFlag(native, @"m_bShowUnReadAsRedDot");
+    @synchronized (WCRAFStore()) {
+        NSDictionary *change = username.length > 0 ? gWCRReminderChanges[username] : nil;
+        if (!change) return flag;
+        if (change[@"context"] != context || ![WCRAFStore() isCurrentContext:context]) {
+            [gWCRReminderChanges removeObjectForKey:username];
+            return flag;
+        }
+        NSInteger expected = [change[@"muted"] boolValue] ? 1 : 0;
+        if (flag == expected) {
+            [gWCRReminderChanges removeObjectForKey:username];
+            return flag;
+        }
+        // A just-modified contact may precede the native session cache.
+        // Recheck only this contact until the session catches up, never the list.
+        NSInteger actual = WCRContactMuted(username);
+        if (actual != expected) [gWCRReminderChanges removeObjectForKey:username];
+        return actual < 0 ? flag : actual;
+    }
+}
+
+static BOOL WCRSessionAllowsAutomaticActivity(id native, NSUInteger scope,
+                                              NSString *username, WCRAFAccountContext *context) {
     // These are the supplied host's own unread-policy/folded-session flags.
     // Do not fetch every room's contact or maintain a stale mute cache.
     return WCRAFAllowsAutomaticActivity(scope,
-        scope == 2 ? WCRSessionBooleanFlag(native, @"m_bShowUnReadAsRedDot") : -1,
+        WCREffectiveMuted(native, username, context),
         WCRSessionBooleanFlag(native, @"m_isFolding"));
 }
 
@@ -919,6 +1052,7 @@ static void WCRScheduleHoldExpiry(NSString *username,
 static void WCRSetHeld(NSString *username, BOOL held, id host,
                         WCRAFAccountContext *context) {
     if (username.length == 0) return;
+    WCRInvalidateOutgoing(username, context);
     if (![WCRAFStore() setHeld:held username:username context:context]) return;
 
     WCRAF_LOG(@"%@ %@",
@@ -1027,7 +1161,7 @@ static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountConte
                 NSUInteger scope = [provider groupScopeForNativeSession:native];
                 BOOL grouped = WCRIsInCustomGroup(name);
                 BOOL held = [WCRAFStore() isHeld:name context:captured];
-                BOOL allowed = WCRSessionAllowsAutomaticActivity(native, scope);
+                BOOL allowed = WCRSessionAllowsAutomaticActivity(native, scope, name, captured);
                 NSTimeInterval message = WCRSessionLastMessageTime(native);
                 NSInteger unread = WCRSessionUnreadCount(native);
                 if (!allowed || !grouped || held) {
@@ -1076,7 +1210,7 @@ static BOOL WCRIsMessageActiveSession(id session, NSString *username,
         if (scope != 1 && scope != 2) return NO;
         BOOL grouped = WCRIsInCustomGroup(username);
         BOOL tracked = [WCRAFStore() hasTrackedMessageActivity:username context:context];
-        if (!WCRSessionAllowsAutomaticActivity(native, scope) || !grouped ||
+        if (!WCRSessionAllowsAutomaticActivity(native, scope, username, context) || !grouped ||
             [WCRAFStore() isHeld:username context:context]) {
             if (tracked) WCRScheduleActivityObservation(username, context, NO);
             return NO;
@@ -1157,7 +1291,7 @@ static BOOL WCRConversationFromCandidate(id candidate,
 
 static id WCRResolveRenderedConversationForCell(
     UITableViewCell *cell,
-    NewMainFrameViewController *host,
+    id host,
     NSIndexPath *indexPath,
     NSString **usernameOut,
     NSUInteger *scopeOut,
@@ -1196,6 +1330,21 @@ static id WCRResolveRenderedConversationForCell(
 
     // FALLBACK is allowed only when the rendered cellData genuinely has no
     // usable identity.  This preserves v1.9.4's fix for late/reused real rows.
+    if (WCRIsGroupingSessionListController(host)) {
+        @try {
+            NSArray *items = [(WCRGroupingSessionListViewController *)host items];
+            if (indexPath.section != 0 || indexPath.row < 0 ||
+                (NSUInteger)indexPath.row >= items.count) return nil;
+            id item = items[indexPath.row];
+            id session = WCRObjectResult(item, @"session");
+            if (!WCRConversationFromCandidate(session, &renderedSession,
+                    &renderedUsername, &renderedScope)) return nil;
+            if (usernameOut) *usernameOut = renderedUsername;
+            if (scopeOut) *scopeOut = renderedScope;
+            if (sourceOut) *sourceOut = @"group-item";
+            return renderedSession;
+        } @catch (__unused NSException *exception) { return nil; }
+    }
     id liveSession = nil;
     if (host && indexPath &&
         [host respondsToSelector:
@@ -1243,7 +1392,7 @@ static id WCRResolveRenderedConversationForCell(
 }
 
 static void WCRBindCanonicalHomeRow(UITableViewCell *cell,
-                                    NewMainFrameViewController *host,
+                                    id host,
                                     UITableView *tableView,
                                     NSIndexPath *indexPath) {
     if (!cell || !host || !tableView || !indexPath) return;
@@ -1331,13 +1480,12 @@ static id WCRSessionForCell(UITableViewCell *cell,
     }
 
     UITableView *tableView = WCRTableForCell(cell);
-    if (!WCRIsActiveFrontHomeTable(tableView)) return nil;
+    if (!WCRIsSupportedSwipeTable(tableView)) return nil;
 
     NSIndexPath *indexPath = [tableView indexPathForCell:cell];
     if (!indexPath) return nil;
 
-    NewMainFrameViewController *host =
-        WCRHomeControllerForTable(tableView);
+    id host = WCRGroupControllerForTable(tableView) ?: (id)WCRHomeControllerForTable(tableView);
     if (!host) return nil;
 
     NSString *username = nil;
@@ -1474,16 +1622,12 @@ static WCRRightActionKind WCRActionKindForCell(UITableViewCell *cell,
 
     WCRRightActionKind kind = WCRRightActionNone;
 
-    if (!grouped) {
-        NSUInteger scope =
-            [WCRDataProvider() groupScopeForNativeSession:session];
-
-        NSArray<WCRefineGroup *> *available =
-            WCRAvailableGroupsForScope(scope);
-
-        if (available.count > 0) {
-            kind = WCRRightActionGroup;
-        }
+    if (WCRGroupControllerForTable(tableView)) {
+        NSInteger muted = WCRContactMuted(username);
+        kind = muted == 1 ? WCRRightActionRemind :
+            (muted == 0 ? WCRRightActionMute : WCRRightActionNone);
+    } else if (!grouped) {
+        kind = WCRRightActionGroup;
     } else if (held) {
         kind = WCRRightActionReturn;
     } else {
@@ -1514,6 +1658,10 @@ static NSString *WCRTitleForActionKind(WCRRightActionKind kind) {
             return @"保持";
         case WCRRightActionReturn:
             return @"回组";
+        case WCRRightActionMute:
+            return @"免扰";
+        case WCRRightActionRemind:
+            return @"提醒";
         case WCRRightActionNone:
         default:
             return nil;
@@ -1531,6 +1679,9 @@ static UIColor *WCRColorForActionKind(WCRRightActionKind kind) {
             return [UIColor systemOrangeColor];
         case WCRRightActionReturn:
             return [UIColor systemGreenColor];
+        case WCRRightActionMute:
+        case WCRRightActionRemind:
+            return [UIColor secondaryLabelColor];
         case WCRRightActionNone:
         default:
             return [UIColor systemGrayColor];
@@ -1562,6 +1713,9 @@ static BOOL WCRApplyActionKindToCell(UITableViewCell *cell,
     [button setTitle:title forState:UIControlStateNormal];
     [button setTitleColor:WCRColorForActionKind(kind)
                  forState:UIControlStateNormal];
+    UIButton *mute = objc_getAssociatedObject(cell, kWCRMuteButtonKey);
+    mute.hidden = WCRGroupControllerForTable(WCRTableForCell(cell)) != nil;
+    [mute setTitle:@"免扰" forState:UIControlStateNormal];
     return YES;
 }
 
@@ -1607,10 +1761,12 @@ static void WCRPresentGroupPicker(id host,
     NSArray<WCRefineGroup *> *groups = WCRAvailableGroupsForScope(scope);
 
     if (groups.count == 0) {
-        // RC1: fail silently when there is no compatible custom group.
-        // This avoids a modal “点好/OK” prompt in normal daily use.
-        WCRAF_LOG(@"no compatible groups for %@ scope=%lu",
-                  username, (unsigned long)scope);
+        UIViewController *presenter = WCRPresenterForHost(host);
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"暂无可用分组"
+            message:@"请先在分组设置中创建对应的好友或群聊分组。"
+            preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+        [presenter presentViewController:alert animated:YES completion:nil];
         return;
     }
 
@@ -1931,28 +2087,26 @@ static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) 
 
 #pragma mark - Hold expiry picker (v1.9.7)
 
-// Long-press on 保持 / 回组. The chosen period applies to all Held sessions.
-// From 保持, choosing a period also keeps this session.
+// Each conversation owns its chosen period; existing account defaults still load.
 static void WCRPresentHoldExpiryPicker(id host,
                                        NSString *keepUsername,
                                        UITableView *tableView,
                                        NSIndexPath *indexPath,
                                        WCRAFAccountContext *context) {
-    if (![WCRAFStore() isCurrentContext:context]) return;
+    if (keepUsername.length == 0 || ![WCRAFStore() isCurrentContext:context]) return;
     UIViewController *presenter = WCRPresenterForHost(host);
     if (!presenter) return;
 
-    NSString *message = keepUsername.length > 0 ?
-        @"手动保持的会话超过所选天数没有新消息，会自动回到原分组。仅对当前账号生效。\n选择后同时保持此会话。" :
-        @"手动保持的会话超过所选天数没有新消息，会自动回到原分组。仅对当前账号生效。";
+    NSString *message = @"此会话在所选天数内没有新消息后自动回组。选择后保持此会话。";
 
     UIAlertController *sheet =
         [UIAlertController alertControllerWithTitle:@"保持期限"
                                             message:message
                                      preferredStyle:UIAlertControllerStyleActionSheet];
 
-    NSInteger current = [WCRAFStore() expiryDaysForContext:context];
-    NSArray<NSNumber *> *options = @[@0, @3, @7, @14, @30];
+    NSInteger current = [WCRAFStore() expiryDaysForUsername:keepUsername context:context];
+    NSMutableArray<NSNumber *> *options = [@[@1, @3, @5, @0] mutableCopy];
+    if (![options containsObject:@(current)]) [options addObject:@(current)];
     NSString *keep = [keepUsername copy];
     __weak id weakHost = host;
 
@@ -1972,44 +2126,12 @@ static void WCRPresentHoldExpiryPicker(id host,
             [UIAlertAction actionWithTitle:label
                                      style:UIAlertActionStyleDefault
                                    handler:^(__unused UIAlertAction *action) {
-            if (![WCRAFStore() setExpiryDays:days context:context]) return;
-            if (keep.length > 0) {
-                WCRSetHeld(keep, YES, weakHost, context);
-            } else {
-                WCRRefreshHomeDeferred(weakHost,
-                                       @"active_front_hold_expiry_changed", context);
-            }
+            if (![WCRAFStore() isCurrentContext:context] || !WCRIsInCustomGroup(keep)) return;
+            if (days != current &&
+                ![WCRAFStore() setExpiryDays:days username:keep context:context]) return;
+            WCRSetHeld(keep, YES, weakHost, context);
         }]];
     }
-
-    __weak UIAlertController *weakSheet = sheet;
-    [sheet addAction:
-        [UIAlertAction actionWithTitle:@"导入旧版保持记录…"
-                                 style:UIAlertActionStyleDefault
-                               handler:^(__unused UIAlertAction *action) {
-        if (![WCRAFStore() isCurrentContext:context]) return;
-        // Wait for the first sheet's dismissal; don't present on its disappearing view.
-        [weakSheet dismissViewControllerAnimated:YES completion:^{
-            if (![WCRAFStore() isCurrentContext:context]) return;
-            UIViewController *confirmationPresenter = WCRPresenterForHost(weakHost);
-            if (!confirmationPresenter) return;
-            UIAlertController *confirmation =
-                [UIAlertController alertControllerWithTitle:@"确认归属当前账号"
-                    message:@"旧版记录没有账号信息。仅在确认这些记录属于当前账号时导入；旧记录原件不会被删除，新导入的保持期限从现在开始。"
-                    preferredStyle:UIAlertControllerStyleAlert];
-            [confirmation addAction:
-                [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-            [confirmation addAction:
-                [UIAlertAction actionWithTitle:@"确认导入" style:UIAlertActionStyleDefault
-                    handler:^(__unused UIAlertAction *confirmAction) {
-                if ([WCRAFStore() importLegacyForContext:context]) {
-                    WCRRefreshHomeDeferred(weakHost, @"active_front_import_legacy", context);
-                }
-            }]];
-            if (![WCRAFStore() isCurrentContext:context]) return;
-            [confirmationPresenter presentViewController:confirmation animated:YES completion:nil];
-        }];
-    }]];
 
     [sheet addAction:
         [UIAlertAction actionWithTitle:@"取消"
@@ -2067,7 +2189,8 @@ static BOOL WCRSwipeBindingMatches(UITableViewCell *cell, WCRAFSwipeIntent *inte
 }
 
 static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
-    if (!WCRSwipeStillMatches(cell, intent) || !intent.grouped) {
+    if (!WCRIsActiveFrontHomeTable(WCRTableForCell(cell)) ||
+        !WCRSwipeStillMatches(cell, intent) || !intent.grouped) {
         WCRCloseCell(cell, YES);
         return;
     }
@@ -2145,6 +2268,7 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
     }
     WCRCancelReturnAnimation();
     // Commit once at the threshold. No animation callback changes state.
+    WCRInvalidateOutgoing(intent.username, intent.context);
     if (![WCRAFStore() setHeld:NO username:intent.username context:intent.context]) {
         WCRCloseCell(cell, YES);
         return;
@@ -2224,7 +2348,7 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
     if (!WCRIsMainFrameCell(cell)) return NO;
 
     UITableView *tableView = WCRTableForCell(cell);
-    if (!WCRIsActiveFrontHomeTable(tableView)) return NO;
+    if (!WCRIsSupportedSwipeTable(tableView)) return NO;
     if (gWCRReturnOverlay) return NO;
 
     CGPoint velocity = [pan velocityInView:cell];
@@ -2365,12 +2489,12 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
                 x = 0.0;
             }
 
-            // Ungrouped rows stop exactly at their sole, valid action.
-            x = MIN(x, intent.grouped ? CGRectGetWidth(cell.bounds) : kWCRActionWidth);
+            BOOL home = WCRIsActiveFrontHomeTable(WCRTableForCell(cell));
+            x = MIN(x, home && intent.grouped ? CGRectGetWidth(cell.bounds) : WCRActionExtent(cell));
 
             WCRSetContentOffset(cell, x);
             WCRLayoutAction(cell);
-            if ([intent consumeReturnAtDistance:x rowWidth:CGRectGetWidth(cell.bounds)
+            if (home && [intent consumeReturnAtDistance:x rowWidth:CGRectGetWidth(cell.bounds)
                     actionWidth:kWCRActionWidth cancelled:NO]) {
                 WCRSetBool(pan, kWCRPanConsumedKey, YES);
                 WCRAnimateReturn(cell, intent);
@@ -2393,19 +2517,19 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
                 WCRCloseCell(cell, NO);
                 break;
             }
-            if ([intent consumeReturnAtDistance:currentX rowWidth:CGRectGetWidth(cell.bounds)
+            if (WCRIsActiveFrontHomeTable(WCRTableForCell(cell)) &&
+                [intent consumeReturnAtDistance:currentX rowWidth:CGRectGetWidth(cell.bounds)
                     actionWidth:kWCRActionWidth cancelled:cancelled]) {
                 WCRSetBool(pan, kWCRPanConsumedKey, YES);
                 WCRAnimateReturn(cell, intent);
                 break;
             }
             objc_setAssociatedObject(cell, kWCRSwipeIntentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            WCRApplyActionKindToCell(cell, intent.grouped ?
-                (intent.held ? WCRRightActionReturn : WCRRightActionKeep) : WCRRightActionGroup);
+            WCRPrepareActionForCell(cell);
             BOOL shouldOpen = NO;
             if (!cancelled) {
                 shouldOpen =
-                    (currentX >= kWCRActionWidth * 0.52) ||
+                    (currentX >= WCRActionExtent(cell) * 0.42) ||
                     (velocity.x >= 520.0);
             }
 
@@ -2465,6 +2589,12 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
         WCRCloseCell(cell, YES);
         return;
     }
+    if (sender == objc_getAssociatedObject(cell, kWCRMuteButtonKey)) {
+        kind = WCRRightActionMute;
+    } else if (![sender.currentTitle isEqualToString:WCRTitleForActionKind(kind)]) {
+        WCRCloseCell(cell, YES);
+        return;
+    }
     WCRCloseCell(cell, YES);
 
     switch (kind) {
@@ -2490,6 +2620,21 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
             WCRSetHeld(username, NO, host, context);
             break;
 
+        case WCRRightActionMute:
+        case WCRRightActionRemind: {
+            WCRInvalidateOutgoing(username, context);
+            if (!WCRSetNativeMuted(username, kind == WCRRightActionMute, context)) {
+                WCRReminderFailure();
+                break;
+            }
+            if (kind == WCRRightActionMute && WCRIsInCustomGroup(username)) {
+                if (![WCRAFStore() setHeld:NO username:username context:context]) {
+                    WCRReminderFailure();
+                }
+            }
+            WCRRefreshHomeDeferred(host, @"active_front_reminder_changed", context);
+            break;
+        }
         case WCRRightActionNone:
         default:
             break;
@@ -2537,7 +2682,7 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
 
     WCRCloseCell(cell, YES);
 
-    NSString *keep = kind == WCRRightActionKeep ? username : nil;
+    NSString *keep = username;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                  (int64_t)(0.18 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -2570,7 +2715,7 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     if (!WCRIsMainFrameCell(cell)) return;
 
     UITableView *tableView = WCRTableForCell(cell);
-    if (!WCRIsActiveFrontHomeTable(tableView)) return;
+    if (!WCRIsSupportedSwipeTable(tableView)) return;
 
     NSString *currentUsername = nil;
     WCRRightActionKind currentKind =
@@ -2637,6 +2782,14 @@ static void WCRAttachToCell(UITableViewCell *cell) {
         [button addGestureRecognizer:longPress];
 
         [actionView addSubview:button];
+        UIButton *mute = [UIButton buttonWithType:UIButtonTypeSystem];
+        mute.titleLabel.font = button.titleLabel.font;
+        [mute setTitle:@"免扰" forState:UIControlStateNormal];
+        [mute setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
+        [mute addTarget:[WCRRightSwipeController shared] action:@selector(actionTapped:)
+            forControlEvents:UIControlEventTouchUpInside];
+        [actionView addSubview:mute];
+        objc_setAssociatedObject(cell, kWCRMuteButtonKey, mute, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         // Keep the action behind contentView, but hidden unless OUR pan begins.
         // This is what prevents the old v1.5 "left swipe sees 分组 underneath"
@@ -2701,6 +2854,169 @@ static void WCRAttachToCell(UITableViewCell *cell) {
 
 
 #pragma mark - ActiveFront projection runtime hooks
+
+static WCRAFOutgoingLedger *WCROutgoingLedger(void) {
+    static WCRAFOutgoingLedger *ledger;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ledger = [WCRAFOutgoingLedger new]; });
+    return ledger;
+}
+
+static void WCRInvalidateOutgoing(NSString *username, WCRAFAccountContext *context) {
+    if (![NSThread isMainThread] || ![WCRAFStore() isCurrentContext:context]) return;
+    [WCROutgoingLedger() invalidateUsername:username context:context];
+}
+
+static id WCRMessageValue(id wrap, NSString *key) {
+    @try { return [wrap valueForKey:key]; }
+    @catch (__unused NSException *exception) { return nil; }
+}
+
+static NSString *WCRCurrentChatUsername(void) {
+    @try {
+        id contact = WCRObjectResult(NSClassFromString(@"WCRefineHelper"),
+            @"currentChatContactFromTopViewController");
+        id username = WCRMessageValue(contact, @"m_nsUsrName");
+        return [username isKindOfClass:NSString.class] ? username : nil;
+    } @catch (__unused NSException *exception) { return nil; }
+}
+
+static uint64_t WCRMessageID(id wrap, NSString *key) {
+    id number = WCRMessageValue(wrap, key);
+    return [number isKindOfClass:NSNumber.class] ? [number unsignedLongLongValue] : 0;
+}
+
+static NSTimeInterval WCRMessageTime(id wrap) {
+    id number = WCRMessageValue(wrap, @"m_uiCreateTime");
+    double value = [number isKindOfClass:NSNumber.class] ? [number doubleValue] : 0;
+    return isfinite(value) && value > 0 ? value : 0;
+}
+
+static WCRAFOutgoingTicket *WCRStageLocalSend(NSString *username, id wrap) {
+    if (![NSThread isMainThread] || UIApplication.sharedApplication.applicationState != UIApplicationStateActive ||
+        ![username isKindOfClass:NSString.class] || WCRMessageID(wrap, @"m_n64MesSvrID") != 0 ||
+        ![WCRCurrentChatUsername() isEqualToString:username]) return nil;
+    WCRAFAccountContext *context = [WCRAFStore() currentContext];
+    if (!context || ![WCRMessageValue(wrap, @"m_nsFromUsr") isEqual:context.account] ||
+        ![WCRMessageValue(wrap, @"m_nsToUsr") isEqual:username] ||
+        !WCRIsInCustomGroup(username)) return nil;
+    NSTimeInterval time = WCRMessageTime(wrap), now = NSDate.date.timeIntervalSince1970;
+    if (time <= 0 || time > now || now - time > 60) return nil;
+    if (![WCRAFStore() isCurrentContext:context]) return nil;
+    return [WCROutgoingLedger() stageUsername:username context:context token:wrap messageTime:time];
+}
+
+static void WCRQueueSendAcknowledgment(NSString *username, id wrap) {
+    uint64_t serverID = WCRMessageID(wrap, @"m_n64MesSvrID");
+    if (!serverID || ![username isKindOfClass:NSString.class]) return;
+    WCRAFAccountContext *context = [WCRAFStore() currentContext];
+    if (!context || ![WCRMessageValue(wrap, @"m_nsFromUsr") isEqual:context.account] ||
+        ![WCRMessageValue(wrap, @"m_nsToUsr") isEqual:username]) return;
+    NSString *name = [username copy];
+    NSTimeInterval time = WCRMessageTime(wrap);
+    uint64_t localID = WCRMessageID(wrap, @"m_uiMesLocalID");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (![WCRAFStore() isCurrentContext:context]) return;
+        WCRAFOutgoingTicket *ticket = [WCROutgoingLedger() acknowledgeUsername:name context:context
+            token:wrap localID:localID serverID:serverID messageTime:time];
+        if (!ticket || !WCRIsInCustomGroup(name)) return;
+        @try {
+            id latest = [WCRDataProvider() fulfilledSessionForUsername:name fallback:nil];
+            NSString *canonicalName = nil;
+            if (!WCRConversationFromCandidate(latest, NULL, &canonicalName, NULL) ||
+                ![canonicalName isEqualToString:name] || ![WCRAFStore() isCurrentContext:context]) return;
+            if (!WCRSetNativeMuted(name, NO, context)) {
+                if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) WCRReminderFailure();
+                return;
+            }
+            NSTimeInterval latestTime = MAX(ticket.messageTime, WCRSessionLastMessageTime(latest));
+            if ([WCRAFStore() noteOutgoingMessage:name context:context lastMessageTime:latestTime]) {
+                WCRRefreshHomeGlobal(@"active_front_outgoing_acknowledged", context);
+            }
+        } @catch (__unused NSException *exception) { }
+    });
+}
+
+static void (*orig_addMsg)(id, SEL, id, id);
+static void (*orig_sessionAddMsg)(id, SEL, id, id);
+static void (*orig_sessionModMsg)(id, SEL, id, id);
+static UITableViewCell *(*orig_groupCell)(id, SEL, UITableView *, NSIndexPath *);
+static void (*orig_homeSelection)(id, SEL, UITableView *, NSIndexPath *);
+static void (*orig_groupDisappear)(id, SEL, BOOL);
+
+static void hook_addMsg(id self, SEL cmd, id username, id wrap) {
+    WCRAFOutgoingTicket *ticket = nil;
+    @try { ticket = WCRStageLocalSend(username, wrap); }
+    @catch (__unused NSException *exception) { }
+    if (orig_addMsg) orig_addMsg(self, cmd, username, wrap);
+    @try {
+        if (ticket) {
+            [WCROutgoingLedger() bindLocalID:WCRMessageID(wrap, @"m_uiMesLocalID") ticket:ticket];
+            WCRQueueSendAcknowledgment(username, wrap);
+        }
+    } @catch (__unused NSException *exception) { }
+}
+
+static void hook_sessionAddMsg(id self, SEL cmd, id username, id wrap) {
+    if (orig_sessionAddMsg) orig_sessionAddMsg(self, cmd, username, wrap);
+    @try { WCRQueueSendAcknowledgment(username, wrap); }
+    @catch (__unused NSException *exception) { }
+}
+
+static void hook_sessionModMsg(id self, SEL cmd, id username, id wrap) {
+    if (orig_sessionModMsg) orig_sessionModMsg(self, cmd, username, wrap);
+    @try { WCRQueueSendAcknowledgment(username, wrap); }
+    @catch (__unused NSException *exception) { }
+}
+
+static UITableViewCell *hook_groupCell(id self, SEL cmd, UITableView *table, NSIndexPath *path) {
+    UITableViewCell *cell = orig_groupCell ? orig_groupCell(self, cmd, table, path) : nil;
+    @try {
+        if (cell && WCRGroupControllerForTable(table) == self) {
+            WCRBindCanonicalHomeRow(cell, self, table, path);
+            WCRAttachToCell(cell);
+        }
+    } @catch (__unused NSException *exception) {
+        WCRHardResetCellVisual(cell, YES);
+        WCRClearCanonicalRowBinding(cell);
+    }
+    return cell;
+}
+
+static void hook_groupDisappear(id self, SEL cmd, BOOL animated) {
+    WCRResetVisibleSwipeVisuals();
+    if (orig_groupDisappear) orig_groupDisappear(self, cmd, animated);
+}
+
+static void hook_homeSelection(id self, SEL cmd, UITableView *table, NSIndexPath *path) {
+    UITableViewCell *cell = [table cellForRowAtIndexPath:path];
+    WCRAFAccountContext *context = objc_getAssociatedObject(cell, kWCRCanonicalAccountKey);
+    NSString *username = nil;
+    @try {
+        if (WCRIsActiveFrontHomeTable(table) && !WCRBool(cell, kWCROpenKey) &&
+            !WCRBool(cell, kWCRTrackingKey)) {
+            id session = WCRSessionForCell(cell, NULL, NULL, NULL);
+            WCRConversationFromCandidate(session, NULL, &username, NULL);
+        }
+    } @catch (__unused NSException *exception) { username = nil; }
+    if (orig_homeSelection) orig_homeSelection(self, cmd, table, path);
+    if (username.length == 0 || !context) return;
+    NSString *name = [username copy];
+    void (^opened)(void) = ^{
+        if ([WCRAFStore() isCurrentContext:context] &&
+            [WCRCurrentChatUsername() isEqualToString:name]) {
+            [WCRAFStore() markHomeConversationOpened:name context:context];
+        }
+    };
+    id<UIViewControllerTransitionCoordinator> transition = WCRTopVC().transitionCoordinator;
+    if (transition) {
+        [transition animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> result) {
+            if (!result.isCancelled) opened();
+        }];
+    } else {
+        dispatch_async(dispatch_get_main_queue(), opened);
+    }
+}
 
 static BOOL (*orig_configExcludeUnread)(id, SEL) = NULL;
 static BOOL (*orig_shouldExclude)(id, SEL, id) = NULL;
@@ -2780,6 +3096,12 @@ static BOOL hook_shouldExclude(id self, SEL _cmd, id session) {
     if (WCRIsMessageActiveSession(session, username, context)) {
         [WCRAFStore() cancelExpiry:username context:context];
         if ([WCRAFStore() isCurrentContext:context]) return YES;
+    }
+    if (context && username.length > 0 && !WCRIsSyntheticGroupEntryUsername(username) &&
+        WCRIsInCustomGroup(username)) {
+        id native = [(WCRefineGroupDataProvider *)self nativeSessionFromObject:session] ?: session;
+        NSUInteger scope = [(WCRefineGroupDataProvider *)self groupScopeForNativeSession:native];
+        if ((scope == 1 || scope == 2) && WCREffectiveMuted(native, username, context) == 1) return NO;
     }
     if (username.length > 0 && context &&
         [WCRAFStore() isHeld:username context:context] &&
@@ -2934,6 +3256,21 @@ static BOOL WCRInstallInstanceHook(Class cls,
     return YES;
 }
 
+static BOOL WCRInstallCheckedHook(Class cls, NSString *name, char result, const char *arguments,
+                                  IMP replacement, IMP *original) {
+    SEL selector = NSSelectorFromString(name);
+    Method method = cls ? class_getInstanceMethod(cls, selector) : NULL;
+    if (!method) return NO;
+    NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(method)];
+    NSUInteger count = strlen(arguments);
+    if (signature.numberOfArguments != count + 2 || signature.methodReturnType[0] != result) return NO;
+    for (NSUInteger i = 0; i < count; i++) {
+        char actual = [signature getArgumentTypeAtIndex:i + 2][0];
+        if (actual != arguments[i] && !(arguments[i] == 'B' && actual == 'c')) return NO;
+    }
+    return WCRInstallInstanceHook(cls, selector, replacement, original);
+}
+
 static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
     Class config =
         NSClassFromString(@"WCRefineConfig");
@@ -3016,6 +3353,22 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
                 (IMP *)&orig_cellDidMoveToWindow);
     }
 
+    if (!orig_addMsg) WCRInstallCheckedHook(NSClassFromString(@"CMessageMgr"),
+        @"AddMsg:MsgWrap:", 'v', "@@", (IMP)hook_addMsg, (IMP *)&orig_addMsg);
+    Class sessionManager = NSClassFromString(@"MMNewSessionMgr");
+    if (!orig_sessionAddMsg) WCRInstallCheckedHook(sessionManager,
+        @"OnAddMsg:MsgWrap:", 'v', "@@", (IMP)hook_sessionAddMsg, (IMP *)&orig_sessionAddMsg);
+    if (!orig_sessionModMsg) WCRInstallCheckedHook(sessionManager,
+        @"OnModMsg:MsgWrap:", 'v', "@@", (IMP)hook_sessionModMsg, (IMP *)&orig_sessionModMsg);
+    Class groupList = NSClassFromString(@"WCRGroupingSessionListViewController");
+    if (!orig_groupCell) WCRInstallCheckedHook(groupList,
+        @"tableView:cellForRowAtIndexPath:", '@', "@@", (IMP)hook_groupCell, (IMP *)&orig_groupCell);
+    if (!orig_groupDisappear) WCRInstallCheckedHook(groupList,
+        @"viewWillDisappear:", 'v', "B", (IMP)hook_groupDisappear, (IMP *)&orig_groupDisappear);
+    if (!orig_homeSelection) WCRInstallCheckedHook(mainFrame,
+        @"wcrGrouping_tableView:didSelectRowAtIndexPath:", 'v', "@@",
+        (IMP)hook_homeSelection, (IMP *)&orig_homeSelection);
+
     BOOL allInstalled =
         gWCRHookConfig &&
         gWCRHookProvider &&
@@ -3023,7 +3376,8 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         gWCRHookHomeDisappear &&
         gWCRHookWillDisplay &&
         gWCRHookCellReuse &&
-        gWCRHookCellDidMove;
+        gWCRHookCellDidMove && orig_addMsg && orig_sessionAddMsg && orig_sessionModMsg &&
+        orig_groupCell && orig_groupDisappear && orig_homeSelection;
 
     if (allInstalled) {
         WCRAF_LOG(@"business hooks installed config=1 provider=1 home=1 disappear=1 willDisplay=1 reuse=1 didMove=1 settings=%d",

@@ -10,6 +10,23 @@ FOUNDATION_EXPORT BOOL WCRAFAllowsAutomaticActivity(NSUInteger scope, NSInteger 
 @property(nonatomic, assign, readonly) uint64_t epoch;
 @end
 
+@interface WCRAFOutgoingTicket : NSObject
+@property(nonatomic, strong, readonly) WCRAFAccountContext *context;
+@property(nonatomic, copy, readonly) NSString *username;
+@property(nonatomic, assign, readonly) NSTimeInterval messageTime;
+@end
+
+// Accessed on the main queue. Acknowledgments require a staged local send.
+@interface WCRAFOutgoingLedger : NSObject
+- (nullable WCRAFOutgoingTicket *)stageUsername:(NSString *)username
+    context:(WCRAFAccountContext *)context token:(id)token messageTime:(NSTimeInterval)time;
+- (void)bindLocalID:(uint64_t)localID ticket:(nullable WCRAFOutgoingTicket *)ticket;
+- (nullable WCRAFOutgoingTicket *)acknowledgeUsername:(NSString *)username
+    context:(WCRAFAccountContext *)context token:(id)token localID:(uint64_t)localID
+    serverID:(uint64_t)serverID messageTime:(NSTimeInterval)time;
+- (void)invalidateUsername:(NSString *)username context:(WCRAFAccountContext *)context;
+@end
+
 // A threshold crossing belongs to the account/row/state captured at gesture begin.
 @interface WCRAFSwipeIntent : NSObject
 @property(nonatomic, strong, readonly) WCRAFAccountContext *context;
@@ -41,6 +58,10 @@ FOUNDATION_EXPORT double WCRAFSwipeReturnThreshold(double rowWidth, double actio
 - (BOOL)isHeld:(NSString *)username context:(WCRAFAccountContext *)context;
 - (BOOL)hasAnyHeldForContext:(WCRAFAccountContext *)context;
 - (BOOL)setHeld:(BOOL)held username:(NSString *)username context:(WCRAFAccountContext *)context;
+// Called only for an acknowledged local send, never a historical/synced message.
+- (BOOL)noteOutgoingMessage:(NSString *)username context:(WCRAFAccountContext *)context
+           lastMessageTime:(NSTimeInterval)lastMessageTime;
+- (BOOL)markHomeConversationOpened:(NSString *)username context:(WCRAFAccountContext *)context;
 // Initialize once per account; old conversations must not all reappear on upgrade.
 - (BOOL)enableMessageActivityForContext:(WCRAFAccountContext *)context;
 - (BOOL)isMessageActive:(NSString *)username
@@ -71,6 +92,9 @@ FOUNDATION_EXPORT double WCRAFSwipeReturnThreshold(double rowWidth, double actio
                  lastMessageTime:(NSTimeInterval)lastMessageTime;
 - (NSInteger)expiryDaysForContext:(WCRAFAccountContext *)context;
 - (BOOL)setExpiryDays:(NSInteger)days context:(WCRAFAccountContext *)context;
+- (NSInteger)expiryDaysForUsername:(NSString *)username context:(WCRAFAccountContext *)context;
+- (BOOL)setExpiryDays:(NSInteger)days username:(NSString *)username
+             context:(WCRAFAccountContext *)context;
 - (BOOL)isExpired:(NSString *)username
           context:(WCRAFAccountContext *)context
   lastMessageTime:(NSTimeInterval)lastMessageTime;
@@ -84,8 +108,6 @@ FOUNDATION_EXPORT double WCRAFSwipeReturnThreshold(double rowWidth, double actio
 - (BOOL)commitExpiry:(WCRAFExpiryCandidate *)candidate
     lastMessageTime:(NSTimeInterval)lastMessageTime;
 - (void)reconcileTimestampsForContext:(WCRAFAccountContext *)context;
-// Legacy shared keys have no owner; only an explicit, account-bound UI action imports them.
-- (BOOL)importLegacyForContext:(WCRAFAccountContext *)context;
 @end
 
 NS_ASSUME_NONNULL_END

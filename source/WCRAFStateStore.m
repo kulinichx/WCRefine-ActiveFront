@@ -2,11 +2,11 @@
 #import <math.h>
 
 static NSString * const WCRAFAccountKeyPrefix = @"com.local.wcrefine.activefront.account.v2.";
-static NSInteger const WCRAFDefaultExpiryDays = 7;
+static NSInteger const WCRAFDefaultExpiryDays = 3;
 
 BOOL WCRAFAllowsAutomaticActivity(NSUInteger scope, NSInteger muted, NSInteger folded) {
     if (folded == 1) return NO;
-    return scope == 1 || (scope == 2 && muted == 0);
+    return (scope == 1 && muted != 1) || (scope == 2 && muted == 0);
 }
 
 static BOOL WCRAFValidTime(id value) {
@@ -30,10 +30,71 @@ static BOOL WCRAFValidDays(id value, NSInteger *result) {
 @implementation WCRAFAccountContext
 @end
 
+@interface WCRAFOutgoingTicket ()
+@property(nonatomic, strong, readwrite) WCRAFAccountContext *context;
+@property(nonatomic, copy, readwrite) NSString *username;
+@property(nonatomic, assign, readwrite) NSTimeInterval messageTime;
+@property(nonatomic, weak) id token;
+@property(nonatomic, assign) uint64_t localID;
+@end
+@implementation WCRAFOutgoingTicket
+@end
+
+@implementation WCRAFOutgoingLedger {
+    NSMutableArray<WCRAFOutgoingTicket *> *_pendingSends;
+}
+- (instancetype)init {
+    self = [super init];
+    if (self) _pendingSends = [NSMutableArray array];
+    return self;
+}
+- (WCRAFOutgoingTicket *)stageUsername:(NSString *)username
+    context:(WCRAFAccountContext *)context token:(id)token messageTime:(NSTimeInterval)time {
+    if (username.length == 0 || !context || !token || !isfinite(time) || time <= 0) return nil;
+    NSIndexSet *obsolete = [_pendingSends indexesOfObjectsPassingTest:
+        ^BOOL(WCRAFOutgoingTicket *entry, __unused NSUInteger index, __unused BOOL *stop) {
+            return entry.context != context || entry.token == token;
+        }];
+    [_pendingSends removeObjectsAtIndexes:obsolete];
+    if (_pendingSends.count >= 128) [_pendingSends removeObjectAtIndex:0];
+    WCRAFOutgoingTicket *ticket = [WCRAFOutgoingTicket new];
+    ticket.username = username;
+    ticket.context = context;
+    ticket.token = token;
+    ticket.messageTime = time;
+    [_pendingSends addObject:ticket];
+    return ticket;
+}
+- (void)bindLocalID:(uint64_t)localID ticket:(WCRAFOutgoingTicket *)ticket {
+    if (ticket && [_pendingSends containsObject:ticket]) ticket.localID = localID;
+}
+- (WCRAFOutgoingTicket *)acknowledgeUsername:(NSString *)username
+    context:(WCRAFAccountContext *)context token:(id)token localID:(uint64_t)localID
+    serverID:(uint64_t)serverID messageTime:(NSTimeInterval)time {
+    if (serverID == 0 || !context || username.length == 0 || !isfinite(time) || time <= 0) return nil;
+    for (WCRAFOutgoingTicket *ticket in [_pendingSends copy]) {
+        if (ticket.context != context || ![ticket.username isEqualToString:username] ||
+            ticket.messageTime != time) continue;
+        if ((token && ticket.token == token) || (localID != 0 && ticket.localID == localID)) {
+            [_pendingSends removeObject:ticket];
+            return ticket;
+        }
+    }
+    return nil;
+}
+- (void)invalidateUsername:(NSString *)username context:(WCRAFAccountContext *)context {
+    NSIndexSet *obsolete = [_pendingSends indexesOfObjectsPassingTest:
+        ^BOOL(WCRAFOutgoingTicket *entry, __unused NSUInteger index, __unused BOOL *stop) {
+            return entry.context != context || [entry.username isEqualToString:username];
+        }];
+    [_pendingSends removeObjectsAtIndexes:obsolete];
+}
+@end
+
 double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
     if (!isfinite(rowWidth) || !isfinite(actionWidth) || actionWidth <= 0 ||
         rowWidth <= actionWidth * 2.0) return INFINITY;
-    return MAX(actionWidth * 2.0, rowWidth * 0.56);
+    return MIN(rowWidth - 16.0, MAX(actionWidth * 2.35, rowWidth * 0.64));
 }
 
 @implementation WCRAFSwipeIntent {
@@ -89,9 +150,9 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
     NSMutableDictionary<NSString *, NSNumber *> *_since;
     NSTimeInterval _activitySince;
     NSMutableDictionary<NSString *, NSNumber *> *_returned;
+    NSMutableDictionary<NSString *, NSNumber *> *_holdDays;
     NSMutableDictionary<NSString *, NSDictionary *> *_activity;
     NSInteger _days;
-    BOOL _recordExists;
     BOOL _writable;
     BOOL _saving;
     BOOL _timestampsNeedReconcile;
@@ -151,10 +212,10 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
             _since = [NSMutableDictionary dictionary];
             _activitySince = 0;
             _returned = [NSMutableDictionary dictionary];
+            _holdDays = [NSMutableDictionary dictionary];
             _activity = [NSMutableDictionary dictionary];
             _days = WCRAFDefaultExpiryDays;
             _writable = YES;
-            _recordExists = NO;
             _timestampsNeedReconcile = NO;
             if (account) {
                 _context = [WCRAFAccountContext new];
@@ -176,7 +237,6 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
                         !WCRAFValidDays(raw[@"days"], NULL)) {
                         _writable = NO;
                     } else {
-                        _recordExists = YES;
                         id names = raw[@"held"];
                         for (id name in names) {
                             if (![name isKindOfClass:[NSString class]] || [name length] == 0) {
@@ -201,6 +261,20 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
                             }
                         }
                         WCRAFValidDays(raw[@"days"], &_days);
+                        if (raw[@"holdDays"]) {
+                            if (![raw[@"holdDays"] isKindOfClass:[NSDictionary class]]) {
+                                _writable = NO;
+                            } else {
+                                for (id name in raw[@"holdDays"]) {
+                                    if (![name isKindOfClass:[NSString class]] || [name length] == 0 ||
+                                        !WCRAFValidDays(raw[@"holdDays"][name], NULL)) {
+                                        _writable = NO;
+                                        break;
+                                    }
+                                    _holdDays[name] = raw[@"holdDays"][name];
+                                }
+                            }
+                        }
                         if (raw[@"activitySince"] || raw[@"returned"]) {
                             if (!WCRAFValidTime(raw[@"activitySince"]) ||
                                 ![raw[@"returned"] isKindOfClass:[NSDictionary class]]) {
@@ -230,7 +304,10 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
                                         !WCRAFValidTime(entry[@"message"]) ||
                                         ![entry[@"readAt"] isKindOfClass:[NSNumber class]] ||
                                         !isfinite([entry[@"readAt"] doubleValue]) ||
-                                        [entry[@"readAt"] doubleValue] < 0) {
+                                        [entry[@"readAt"] doubleValue] < 0 ||
+                                        (entry[@"awaitingVisit"] &&
+                                         (![entry[@"awaitingVisit"] isKindOfClass:[NSNumber class]] ||
+                                          ![@[@0, @1] containsObject:entry[@"awaitingVisit"]]))) {
                                         _writable = NO;
                                         break;
                                     }
@@ -270,13 +347,14 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
   activitySince:(NSTimeInterval)activitySince
        returned:(NSDictionary<NSString *, NSNumber *> *)returned
        activity:(NSDictionary<NSString *, NSDictionary *> *)activity
+       holdDays:(NSDictionary<NSString *, NSNumber *> *)holdDays
         context:(WCRAFAccountContext *)context {
     if (_saving || ![self isCurrentContext:context]) return NO;
     NSMutableDictionary *record = [@{
         @"schema": @2,
         @"held": [[held allObjects] sortedArrayUsingSelector:@selector(compare:)],
         @"since": [since copy],
-        @"days": @(days)
+        @"days": @(days), @"holdDays": [holdDays copy]
     } mutableCopy];
     if (activitySince > 0) {
         record[@"activitySince"] = @(activitySince);
@@ -303,11 +381,18 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
     _since = [since mutableCopy];
     _activitySince = activitySince;
     _returned = [returned mutableCopy];
+    _holdDays = [holdDays mutableCopy];
     _activity = [activity mutableCopy];
     _days = days;
-    _recordExists = YES;
     _timestampsNeedReconcile = NO;
     return YES;
+}
+
+- (BOOL)saveHeld:(NSSet<NSString *> *)held since:(NSDictionary *)since days:(NSInteger)days
+  activitySince:(NSTimeInterval)activitySince returned:(NSDictionary *)returned
+       activity:(NSDictionary *)activity context:(WCRAFAccountContext *)context {
+    return [self saveHeld:held since:since days:days activitySince:activitySince
+        returned:returned activity:activity holdDays:_holdDays context:context];
 }
 
 - (BOOL)saveHeld:(NSSet<NSString *> *)held
@@ -374,9 +459,12 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
         if (lastMessageTime < _activitySince && !entry && unreadCount <= 0) return NO;
         NSTimeInterval recorded = [entry[@"message"] doubleValue];
         if (lastMessageTime < recorded) return NO;
-        BOOL returnNow = grouped && unreadCount == 0 && homeVisible;
+        BOOL awaitingVisit = [entry[@"awaitingVisit"] boolValue];
+        BOOL returnNow = grouped && unreadCount == 0 && homeVisible && !awaitingVisit;
         // Keep schema-2 records readable by older builds; readAt is retired.
-        NSDictionary *updated = @{@"message": @(lastMessageTime), @"readAt": @0};
+        NSDictionary *updated = awaitingVisit ?
+            @{@"message": @(lastMessageTime), @"readAt": @0, @"awaitingVisit": @YES} :
+            @{@"message": @(lastMessageTime), @"readAt": @0};
         if (!returnNow && [entry isEqual:updated]) return NO;
         NSMutableDictionary *activity = [_activity mutableCopy];
         NSMutableDictionary *returned = [_returned mutableCopy];
@@ -432,7 +520,7 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
         NSTimeInterval recorded = [entry[@"message"] doubleValue];
         if (lastMessageTime < recorded) return NO;
         if (!entry || lastMessageTime > recorded) return YES;
-        return (grouped && unreadCount == 0 && homeVisible) ||
+        return (grouped && unreadCount == 0 && homeVisible && ![entry[@"awaitingVisit"] boolValue]) ||
             [entry[@"readAt"] doubleValue] != 0;
     }
 }
@@ -529,6 +617,57 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
     }
 }
 
+- (NSInteger)expiryDaysForUsername:(NSString *)username context:(WCRAFAccountContext *)context {
+    @synchronized (self) {
+        if (![self isCurrentContext:context]) return WCRAFDefaultExpiryDays;
+        return username.length > 0 && _holdDays[username] ? [_holdDays[username] integerValue] : _days;
+    }
+}
+
+- (BOOL)setExpiryDays:(NSInteger)days username:(NSString *)username
+             context:(WCRAFAccountContext *)context {
+    @synchronized (self) {
+        if (_saving || username.length == 0 || ![@[@0, @1, @3, @5] containsObject:@(days)] ||
+            ![self isCurrentContext:context]) return NO;
+        NSMutableDictionary *holdDays = [_holdDays mutableCopy];
+        holdDays[username] = @(days);
+        [self cancelPendingForContext:context];
+        return [self saveHeld:_held since:_since days:_days activitySince:_activitySince
+            returned:_returned activity:_activity holdDays:holdDays context:context];
+    }
+}
+
+- (BOOL)noteOutgoingMessage:(NSString *)username context:(WCRAFAccountContext *)context
+           lastMessageTime:(NSTimeInterval)lastMessageTime {
+    @synchronized (self) {
+        if (_saving || username.length == 0 || ![self isCurrentContext:context]) return NO;
+        NSTimeInterval now = [self readClock];
+        if (now <= 0 || !isfinite(lastMessageTime) || lastMessageTime <= 0 ||
+            lastMessageTime > now || lastMessageTime < [_returned[username] doubleValue] ||
+            lastMessageTime < [_activity[username][@"message"] doubleValue]) return NO;
+        NSMutableDictionary *activity = [_activity mutableCopy];
+        NSMutableDictionary *returned = [_returned mutableCopy];
+        NSDictionary *entry = @{@"message": @(lastMessageTime), @"readAt": @0, @"awaitingVisit": @YES};
+        if ([_activity[username] isEqual:entry] && !returned[username]) return YES;
+        activity[username] = entry;
+        [returned removeObjectForKey:username];
+        return [self saveHeld:_held since:_since days:_days
+            activitySince:_activitySince > 0 ? _activitySince : floor(now)
+            returned:returned activity:activity context:context];
+    }
+}
+
+- (BOOL)markHomeConversationOpened:(NSString *)username context:(WCRAFAccountContext *)context {
+    @synchronized (self) {
+        if (_saving || username.length == 0 || ![self isCurrentContext:context] ||
+            ![_activity[username][@"awaitingVisit"] boolValue]) return NO;
+        NSMutableDictionary *activity = [_activity mutableCopy];
+        activity[username] = @{@"message": _activity[username][@"message"], @"readAt": @0};
+        return [self saveHeld:_held since:_since days:_days activitySince:_activitySince
+            returned:_returned activity:activity context:context];
+    }
+}
+
 - (BOOL)setExpiryDays:(NSInteger)days context:(WCRAFAccountContext *)context {
     @synchronized (self) {
         if (_saving || ![self isCurrentContext:context]) return NO;
@@ -542,11 +681,13 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
   lastMessageTime:(NSTimeInterval)lastMessageTime {
     @synchronized (self) {
         if (![self isCurrentContext:context] || ![_held containsObject:username] ||
-            _days <= 0 || !isfinite(lastMessageTime) || lastMessageTime <= 0) return NO;
+            !isfinite(lastMessageTime) || lastMessageTime <= 0) return NO;
+        NSInteger days = [self expiryDaysForUsername:username context:context];
+        if (days <= 0) return NO;
         NSTimeInterval since = [_since[username] doubleValue];
         NSTimeInterval now = [self readClock];
         return isfinite(since) && since > 0 && isfinite(now) && now > 0 &&
-               now - MAX(since, lastMessageTime) >= (NSTimeInterval)_days * 86400.0;
+               now - MAX(since, lastMessageTime) >= (NSTimeInterval)days * 86400.0;
     }
 }
 
@@ -564,7 +705,7 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
         candidate.usernameRevision = [_usernameRevisions[username] unsignedLongLongValue];
         candidate.batch = _batch;
         candidate.since = [_since[username] doubleValue];
-        candidate.days = _days;
+        candidate.days = [self expiryDaysForUsername:username context:context];
         _pending[username] = candidate;
         return first ? candidate : nil;
     }
@@ -585,7 +726,8 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
     @synchronized (self) {
         if (![self isCurrentContext:candidate.context] || candidate.revision != _revision ||
             candidate.usernameRevision != [_usernameRevisions[candidate.username] unsignedLongLongValue] ||
-            candidate.days != _days || candidate.since != [_since[candidate.username] doubleValue] ||
+            candidate.days != [self expiryDaysForUsername:candidate.username context:candidate.context] ||
+            candidate.since != [_since[candidate.username] doubleValue] ||
             ![self isExpired:candidate.username context:candidate.context
                 lastMessageTime:lastMessageTime]) return NO;
         NSMutableSet *names = [_held mutableCopy];
@@ -611,38 +753,4 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
     }
 }
 
-- (BOOL)importLegacyForContext:(WCRAFAccountContext *)context {
-    @synchronized (self) {
-        if (_saving || ![self isCurrentContext:context]) return NO;
-        id legacy = nil;
-        id oldDays = nil;
-        @try {
-            legacy = [_defaults objectForKey:@"com.local.wcrefine.activefront.heldUsernames.v1"];
-            if (!_recordExists) {
-                oldDays = [_defaults objectForKey:@"com.local.wcrefine.activefront.holdExpiryDays.v1"];
-            }
-        } @catch (__unused NSException *exception) {
-            return NO;
-        }
-        if (![legacy isKindOfClass:[NSArray class]]) return NO;
-        NSTimeInterval now = [self readClock];
-        if (!isfinite(now) || now <= 0) return NO;
-        NSMutableSet *names = [_held mutableCopy];
-        NSMutableDictionary *times = [_since mutableCopy];
-        for (id name in legacy) {
-            if ([name isKindOfClass:[NSString class]] && [name length] > 0 &&
-                ![names containsObject:name]) {
-                [names addObject:name];
-                times[name] = @(now);
-            }
-        }
-        NSInteger days = _days;
-        if (!_recordExists) {
-            WCRAFValidDays(oldDays, &days);
-        }
-        [self cancelPendingForContext:context];
-        // The shared legacy keys are intentionally left untouched.
-        return [self saveHeld:names since:times days:days context:context];
-    }
-}
 @end

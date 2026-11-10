@@ -102,7 +102,7 @@ static void NoAutomaticLegacyMigration(Fixture *f) {
     [f.defaults setInteger:3 forKey:LegacyDays];
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK(![f.store isHeld:@"alice" context:context]);
-    CHECK([f.store expiryDaysForContext:context] == 7);
+    CHECK([f.store expiryDaysForContext:context] == 3);
     CHECK([f.defaults objectForKey:[Prefix stringByAppendingString:f.account]] == nil);
     CHECK([[f.defaults objectForKey:LegacyNames] isEqual:@[@"alice"]]);
 }
@@ -113,7 +113,7 @@ static void AccountIsolation(Fixture *f) {
     f.account = @"account-B";
     WCRAFAccountContext *b = [f.store currentContext];
     CHECK(![f.store isHeld:@"same-contact" context:b]);
-    CHECK([f.store expiryDaysForContext:b] == 7);
+    CHECK([f.store expiryDaysForContext:b] == 3);
     CHECK(![f.store setHeld:NO username:@"same-contact" context:a]);
     [f keep:@"bob"];
     f.account = @"account-A";
@@ -133,7 +133,6 @@ static void NilAccount(Fixture *f) {
     CHECK([f.store currentContext] == nil);
     CHECK(![f.store setHeld:NO username:@"alice" context:a]);
     CHECK(![f.store setExpiryDays:0 context:a]);
-    CHECK(![f.store importLegacyForContext:a]);
     CHECK([[f.defaults persistentDomainForName:f.suite] isEqual:before]);
     f.account = @"account-A";
     CHECK(![f.store isCurrentContext:a]);
@@ -313,37 +312,6 @@ static void MissingTimestampRepairedConservatively(Fixture *f) {
     CHECK([record[@"since"][@"alice"] doubleValue] == f.now);
     CHECK(record[@"since"][@"orphan"] == nil);
     CHECK(![f.store isExpired:@"alice" context:context lastMessageTime:1000]);
-}
-
-static void LegacyImportRequiresCurrentAccount(Fixture *f) {
-    [f.defaults setObject:@[@"alice", @"bob", @1, @""] forKey:LegacyNames];
-    [f.defaults setInteger:3 forKey:LegacyDays];
-    NSDictionary *before = [f.defaults persistentDomainForName:f.suite];
-    WCRAFAccountContext *a = [f.store currentContext];
-    CHECK([f.store importLegacyForContext:a]);
-    CHECK([f.store isHeld:@"alice" context:a]);
-    CHECK([f.store isHeld:@"bob" context:a]);
-    CHECK([f.store expiryDaysForContext:a] == 3);
-    CHECK(![f.store isExpired:@"alice" context:a lastMessageTime:1000]);
-    CHECK([[f.defaults objectForKey:LegacyNames] isEqual:before[LegacyNames]]);
-    CHECK([[f.defaults objectForKey:LegacyDays] isEqual:before[LegacyDays]]);
-    f.account = @"account-B";
-    CHECK(![f.store importLegacyForContext:a]);
-    CHECK(![f.store hasAnyHeldForContext:[f.store currentContext]]);
-}
-
-static void ImportDoesNotRenewExistingHoldOrChangeSettings(Fixture *f) {
-    WCRAFAccountContext *a = [f keep:@"alice"];
-    NSTimeInterval since = f.now;
-    CHECK([f.store setExpiryDays:14 context:a]);
-    [f.defaults setObject:@[@"alice", @"bob"] forKey:LegacyNames];
-    [f.defaults setInteger:3 forKey:LegacyDays];
-    f.now += Day;
-    CHECK([f.store importLegacyForContext:a]);
-    NSDictionary *record = [f.defaults objectForKey:[Prefix stringByAppendingString:f.account]];
-    CHECK([record[@"since"][@"alice"] doubleValue] == since);
-    CHECK([record[@"since"][@"bob"] doubleValue] == f.now);
-    CHECK([f.store expiryDaysForContext:a] == 14);
 }
 
 static void InvalidClockDoesNotWrite(Fixture *f) {
@@ -835,7 +803,7 @@ static void UnreadTransitionCannotReturnWithoutHome(Fixture *f) {
 static void AutomaticActivityPolicyHonorsMuteAndFold(Fixture *f) {
     (void)f;
     CHECK(WCRAFAllowsAutomaticActivity(1, -1, 0));
-    CHECK(WCRAFAllowsAutomaticActivity(1, 1, -1)); // Only rooms are mute-filtered.
+    CHECK(!WCRAFAllowsAutomaticActivity(1, 1, -1));
     CHECK(WCRAFAllowsAutomaticActivity(2, 0, 0));
     CHECK(!WCRAFAllowsAutomaticActivity(2, 1, 0));
     CHECK(!WCRAFAllowsAutomaticActivity(2, -1, 0));
@@ -1002,7 +970,7 @@ static void SwipeThresholdCommitsDuringDrag(Fixture *f) {
     NSUInteger commits = 0;
     for (NSNumber *sample in @[@20, @81, @82, @83, @160, @210, @220, @250]) {
         if ([intent consumeReturnAtDistance:sample.doubleValue rowWidth:390 actionWidth:82 cancelled:NO]) {
-            CHECK(sample.doubleValue == 220);
+            CHECK(sample.doubleValue == 250);
             commits++;
         }
     }
@@ -1119,6 +1087,257 @@ static void HeldSkipsReadObservationAndWrites(Fixture *f) {
     CHECK(f.defaults.writeCount == writes);
 }
 
+static void OutgoingWaitsForHomeVisit(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    CHECK([f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:f.now]);
+    CHECK(Activity(f, @"alice", c, f.now, 0, YES));
+    CHECK(!Observe(f, @"alice", c, f.now, 0, YES, YES));
+    CHECK([f.store markHomeConversationOpened:@"alice" context:c]);
+    CHECK(!Observe(f, @"alice", c, f.now, 0, YES, NO));
+    CHECK(Observe(f, @"alice", c, f.now, 0, YES, YES));
+    CHECK(!Activity(f, @"alice", c, f.now, 0, YES));
+}
+
+static void OutgoingVisitSurvivesRestart(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    CHECK([f.store noteOutgoingMessage:@"room" context:c lastMessageTime:f.now]);
+    f.store = [f newStore];
+    c = [f.store currentContext];
+    CHECK(![f.store needsMessageActivityObservation:@"room" context:c
+        lastMessageTime:f.now unreadCount:0 grouped:YES homeVisible:YES]);
+    CHECK(Activity(f, @"room", c, f.now, 0, YES));
+    CHECK([f.store markHomeConversationOpened:@"room" context:c]);
+    CHECK(Observe(f, @"room", c, f.now, 0, YES, YES));
+}
+
+static void OutgoingStableQueriesDoNotWrite(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    CHECK([f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:f.now]);
+    NSUInteger writes = f.defaults.writeCount;
+    for (NSUInteger i = 0; i < 1000; i++) {
+        CHECK([f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:f.now]);
+        CHECK(![f.store needsMessageActivityObservation:@"alice" context:c
+            lastMessageTime:f.now unreadCount:0 grouped:YES homeVisible:YES]);
+        CHECK(!Observe(f, @"alice", c, f.now, 0, YES, YES));
+    }
+    CHECK(f.defaults.writeCount == writes);
+}
+
+static void OutgoingNewMessagePreservesAwaitingVisit(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    CHECK([f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:f.now]);
+    f.now++;
+    CHECK(Observe(f, @"alice", c, f.now, 1, YES, YES));
+    CHECK(!Observe(f, @"alice", c, f.now, 0, YES, YES));
+    CHECK([f.store markHomeConversationOpened:@"alice" context:c]);
+    CHECK(Observe(f, @"alice", c, f.now, 0, YES, YES));
+}
+
+static void OutgoingManualReturnAndNewSend(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    CHECK([f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:f.now]);
+    CHECK([f.store setHeld:NO username:@"alice" context:c]);
+    CHECK(!Activity(f, @"alice", c, f.now, 3, YES));
+    CHECK(![f.store markHomeConversationOpened:@"alice" context:c]);
+    // A separately proven local send can re-open even in the same second.
+    CHECK([f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:f.now]);
+    CHECK(Activity(f, @"alice", c, f.now, 0, YES));
+}
+
+static void OutgoingRejectsStaleAndInvalid(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    CHECK([f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:f.now]);
+    for (NSNumber *time in @[@0, @(-1), @(NAN), @(INFINITY), @(f.now + 1), @(f.now - 1)]) {
+        CHECK(![f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:time.doubleValue]);
+    }
+    CHECK(![f.store noteOutgoingMessage:@"" context:c lastMessageTime:f.now]);
+    CHECK(![f.store markHomeConversationOpened:@"" context:c]);
+    CHECK([f.store setHeld:NO username:@"alice" context:c]);
+    CHECK(![f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:f.now - 1]);
+}
+
+static void OutgoingPreservesHold(Fixture *f) {
+    WCRAFAccountContext *c = [f keep:@"alice"];
+    CHECK([f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:f.now]);
+    CHECK([f.store markHomeConversationOpened:@"alice" context:c]);
+    CHECK(!Observe(f, @"alice", c, f.now, 0, YES, YES));
+    CHECK([f.store isHeld:@"alice" context:c]);
+}
+
+static void OutgoingWriteFailureDoesNotInstall(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:c]);
+    NSDictionary *before = [f.defaults persistentDomainForName:f.suite];
+    f.defaults.failWrite = YES;
+    CHECK(![f.store noteOutgoingMessage:@"alice" context:c lastMessageTime:f.now]);
+    f.defaults.failWrite = NO;
+    CHECK([[f.defaults persistentDomainForName:f.suite] isEqual:before]);
+    f.store = [f newStore];
+    CHECK(![f.store hasTrackedMessageActivity:@"alice" context:[f.store currentContext]]);
+}
+
+static void OutgoingSwitchDuringWrite(Fixture *f) {
+    WCRAFAccountContext *a = [f.store currentContext];
+    __weak Fixture *weak = f;
+    f.defaults.afterWrite = ^{
+        weak.account = @"account-B";
+        CHECK([weak.store currentContext] != nil);
+    };
+    CHECK(![f.store noteOutgoingMessage:@"alice" context:a lastMessageTime:f.now]);
+    WCRAFAccountContext *b = [f.store currentContext];
+    CHECK(![f.store hasTrackedMessageActivity:@"alice" context:b]);
+    CHECK(![f.store markHomeConversationOpened:@"alice" context:a]);
+}
+
+static void PerConversationExpiryBoundaries(Fixture *f) {
+    WCRAFAccountContext *c = [f keep:@"one"];
+    [f keep:@"three"]; [f keep:@"five"]; [f keep:@"forever"];
+    NSTimeInterval start = f.now;
+    CHECK([f.store setExpiryDays:1 username:@"one" context:c]);
+    CHECK([f.store setExpiryDays:3 username:@"three" context:c]);
+    CHECK([f.store setExpiryDays:5 username:@"five" context:c]);
+    CHECK([f.store setExpiryDays:0 username:@"forever" context:c]);
+    for (NSInteger day = 0; day <= 6; day++) {
+        f.now = start + day * Day;
+        CHECK([f.store isExpired:@"one" context:c lastMessageTime:start] == (day >= 1));
+        CHECK([f.store isExpired:@"three" context:c lastMessageTime:start] == (day >= 3));
+        CHECK([f.store isExpired:@"five" context:c lastMessageTime:start] == (day >= 5));
+        CHECK(![f.store isExpired:@"forever" context:c lastMessageTime:start]);
+    }
+    CHECK([f.store expiryDaysForUsername:@"unknown" context:c] == 3);
+}
+
+static void PerConversationExpiryPersistsAndIsolates(Fixture *f) {
+    WCRAFAccountContext *a = [f keep:@"alice"];
+    CHECK([f.store setExpiryDays:14 context:a]); // Preserve an existing account choice.
+    CHECK([f.store setExpiryDays:1 username:@"alice" context:a]);
+    f.store = [f newStore];
+    a = [f.store currentContext];
+    CHECK([f.store expiryDaysForUsername:@"alice" context:a] == 1);
+    CHECK([f.store expiryDaysForUsername:@"bob" context:a] == 14);
+    f.account = @"account-B";
+    WCRAFAccountContext *b = [f.store currentContext];
+    CHECK([f.store expiryDaysForUsername:@"alice" context:b] == 3);
+    CHECK(![f.store setExpiryDays:5 username:@"alice" context:a]);
+    CHECK([f.store setExpiryDays:5 username:@"alice" context:b]);
+    f.account = @"account-A";
+    CHECK([f.store expiryDaysForUsername:@"alice" context:[f.store currentContext]] == 1);
+}
+
+static void PerConversationSettingRevokesDetachedExpiry(Fixture *f) {
+    WCRAFExpiryCandidate *ticket = [f expiredTicket:@"alice"];
+    NSArray *batch = [f.store takeBatch:ticket];
+    CHECK([f.store setExpiryDays:0 username:@"alice" context:ticket.context]);
+    CHECK(![f.store commitExpiry:batch[0] lastMessageTime:f.now - 10 * Day]);
+    CHECK([f.store isHeld:@"alice" context:ticket.context]);
+}
+
+static void PerConversationSettingsRejectInvalidAndFailedWrites(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    for (NSNumber *days in @[@(-1), @2, @7, @14]) {
+        CHECK(![f.store setExpiryDays:days.integerValue username:@"alice" context:c]);
+    }
+    CHECK(![f.store setExpiryDays:1 username:@"" context:c]);
+    CHECK([f.store setExpiryDays:5 username:@"alice" context:c]);
+    f.defaults.failWrite = YES;
+    CHECK(![f.store setExpiryDays:1 username:@"alice" context:c]);
+    f.defaults.failWrite = NO;
+    f.store = [f newStore];
+    CHECK([f.store expiryDaysForUsername:@"alice" context:[f.store currentContext]] == 5);
+}
+
+static void NewFieldsMalformedRemainUntouched(Fixture *f) {
+    NSString *key = [Prefix stringByAppendingString:f.account];
+    for (id days in @[@[], @{@"alice": @(-1)}, @{@"alice": @"1"}, @{@"": @1}]) {
+        NSDictionary *record = @{@"schema": @2, @"held": @[], @"since": @{}, @"days": @3, @"holdDays": days};
+        [f.defaults setObject:record forKey:key];
+        f.store = [f newStore];
+        CHECK([f.store currentContext] == nil);
+        CHECK([[f.defaults objectForKey:key] isEqual:record]);
+    }
+    for (id flag in @[@"YES", @2, @[]]) {
+        NSDictionary *record = @{@"schema": @2, @"held": @[], @"since": @{}, @"days": @3,
+            @"activitySince": @(f.now), @"returned": @{}, @"activity":
+                @{@"alice": @{@"message": @(f.now), @"readAt": @0, @"awaitingVisit": flag}}};
+        [f.defaults setObject:record forKey:key];
+        f.store = [f newStore];
+        CHECK([f.store currentContext] == nil);
+        CHECK([[f.defaults objectForKey:key] isEqual:record]);
+    }
+}
+
+static void LedgerRequiresAcknowledgedLocalProvenance(Fixture *f) {
+    WCRAFOutgoingLedger *ledger = [WCRAFOutgoingLedger new];
+    WCRAFAccountContext *c = [f.store currentContext];
+    NSObject *token = [NSObject new];
+    CHECK(![ledger acknowledgeUsername:@"alice" context:c token:token localID:1 serverID:9 messageTime:f.now]);
+    CHECK([ledger stageUsername:@"alice" context:c token:token messageTime:f.now]);
+    CHECK(![ledger acknowledgeUsername:@"alice" context:c token:token localID:1 serverID:0 messageTime:f.now]);
+    CHECK([ledger acknowledgeUsername:@"alice" context:c token:token localID:1 serverID:9 messageTime:f.now]);
+    CHECK(![ledger acknowledgeUsername:@"alice" context:c token:token localID:1 serverID:9 messageTime:f.now]);
+}
+
+static void LedgerMatchesClonedAcknowledgment(Fixture *f) {
+    WCRAFOutgoingLedger *ledger = [WCRAFOutgoingLedger new];
+    WCRAFAccountContext *c = [f.store currentContext];
+    WCRAFOutgoingTicket *ticket = [ledger stageUsername:@"alice" context:c token:[NSObject new] messageTime:f.now];
+    [ledger bindLocalID:42 ticket:ticket];
+    CHECK(![ledger acknowledgeUsername:@"bob" context:c token:[NSObject new] localID:42 serverID:9 messageTime:f.now]);
+    CHECK(![ledger acknowledgeUsername:@"alice" context:c token:[NSObject new] localID:42 serverID:9 messageTime:f.now - 1]);
+    CHECK(![ledger acknowledgeUsername:@"alice" context:c token:[NSObject new] localID:41 serverID:9 messageTime:f.now]);
+    CHECK([ledger acknowledgeUsername:@"alice" context:c token:[NSObject new] localID:42 serverID:9 messageTime:f.now] == ticket);
+}
+
+static void LedgerManualActionCancelsLateAck(Fixture *f) {
+    WCRAFOutgoingLedger *ledger = [WCRAFOutgoingLedger new];
+    WCRAFAccountContext *c = [f.store currentContext];
+    NSObject *a = [NSObject new], *b = [NSObject new];
+    CHECK([ledger stageUsername:@"alice" context:c token:a messageTime:f.now]);
+    CHECK([ledger stageUsername:@"bob" context:c token:b messageTime:f.now]);
+    [ledger invalidateUsername:@"alice" context:c];
+    CHECK(![ledger acknowledgeUsername:@"alice" context:c token:a localID:1 serverID:9 messageTime:f.now]);
+    CHECK([ledger acknowledgeUsername:@"bob" context:c token:b localID:1 serverID:9 messageTime:f.now]);
+    CHECK([ledger stageUsername:@"alice" context:c token:a messageTime:f.now]);
+    CHECK([ledger acknowledgeUsername:@"alice" context:c token:a localID:1 serverID:10 messageTime:f.now]);
+}
+
+static void LedgerAccountEpochIsolatesAcknowledgments(Fixture *f) {
+    WCRAFOutgoingLedger *ledger = [WCRAFOutgoingLedger new];
+    WCRAFAccountContext *a = [f.store currentContext];
+    NSObject *token = [NSObject new];
+    CHECK([ledger stageUsername:@"alice" context:a token:token messageTime:f.now]);
+    f.account = @"account-B";
+    WCRAFAccountContext *b = [f.store currentContext];
+    CHECK(![ledger acknowledgeUsername:@"alice" context:b token:token localID:1 serverID:9 messageTime:f.now]);
+    CHECK([ledger stageUsername:@"bob" context:b token:[NSObject new] messageTime:f.now]);
+    f.account = @"account-A";
+    WCRAFAccountContext *again = [f.store currentContext];
+    CHECK(![ledger acknowledgeUsername:@"alice" context:again token:token localID:1 serverID:9 messageTime:f.now]);
+    CHECK(![ledger acknowledgeUsername:@"alice" context:a token:token localID:1 serverID:9 messageTime:f.now]);
+}
+
+static void LedgerBoundsPendingFailures(Fixture *f) {
+    WCRAFOutgoingLedger *ledger = [WCRAFOutgoingLedger new];
+    WCRAFAccountContext *c = [f.store currentContext];
+    NSObject *first = [NSObject new], *last = nil;
+    CHECK([ledger stageUsername:@"alice" context:c token:first messageTime:f.now]);
+    for (NSUInteger i = 0; i < 128; i++) {
+        last = [NSObject new];
+        CHECK([ledger stageUsername:@"alice" context:c token:last messageTime:f.now]);
+    }
+    CHECK(![ledger acknowledgeUsername:@"alice" context:c token:first localID:0 serverID:9 messageTime:f.now]);
+    CHECK([ledger acknowledgeUsername:@"alice" context:c token:last localID:0 serverID:10 messageTime:f.now]);
+}
+
+static void TwoActionsFitBeforeReturnThreshold(Fixture *f) {
+    (void)f;
+    for (NSNumber *width in @[@280, @320, @375, @390, @430, @768, @1024]) {
+        double threshold = WCRAFSwipeReturnThreshold(width.doubleValue, 82);
+        CHECK(threshold > 164 + 20);
+        CHECK(threshold < width.doubleValue);
+    }
+}
+
 int main(int argc, const char *argv[]) {
     if (argc > 2) return 2;
     struct Test { const char *name; void (*run)(Fixture *); } tests[] = {
@@ -1130,8 +1349,7 @@ int main(int argc, const char *argv[]) {
         TEST(CancelOnePreservesOtherCandidate), TEST(OldCallbackCannotDrainNewBatch),
         TEST(SwitchingRevokesQueuedAndDetached), TEST(FreshMessagePreventsCommit),
         TEST(PersistenceRoundtrip), TEST(InvalidRecordsRemainUntouched),
-        TEST(MissingTimestampRepairedConservatively), TEST(LegacyImportRequiresCurrentAccount),
-        TEST(ImportDoesNotRenewExistingHoldOrChangeSettings), TEST(InvalidClockDoesNotWrite),
+        TEST(MissingTimestampRepairedConservatively), TEST(InvalidClockDoesNotWrite),
         TEST(ReadFailureDoesNotReplaceRecord), TEST(WriteFailureQuarantinesCache),
         TEST(SwitchInsideSaveDoesNotInstallOldCache), TEST(NestedWriteCannotSplitCacheAndDefaults),
         TEST(ClockExceptionFailsClosed), TEST(OrphanOnlyTimestampIsReconciled),
@@ -1156,7 +1374,17 @@ int main(int argc, const char *argv[]) {
         TEST(UngroupedSwipeNeverReturns), TEST(SwipeRejectsInvalidGeometry), TEST(SwipeRejectsReusedRow),
         TEST(SwipeRejectsChangedGroupingOrHold), TEST(SwipeRejectsAccountSwitch),
         TEST(ReturnSuppressionUnknownTimeIsNotNewMessage), TEST(ManualReturnFailureDoesNotSuppressOnRestart),
-        TEST(ReadObservationAccountSwitchCannotInstallOldState), TEST(HeldSkipsReadObservationAndWrites)
+        TEST(ReadObservationAccountSwitchCannotInstallOldState), TEST(HeldSkipsReadObservationAndWrites),
+        TEST(OutgoingWaitsForHomeVisit), TEST(OutgoingVisitSurvivesRestart),
+        TEST(OutgoingStableQueriesDoNotWrite), TEST(OutgoingNewMessagePreservesAwaitingVisit),
+        TEST(OutgoingManualReturnAndNewSend), TEST(OutgoingRejectsStaleAndInvalid),
+        TEST(OutgoingPreservesHold), TEST(OutgoingWriteFailureDoesNotInstall),
+        TEST(OutgoingSwitchDuringWrite), TEST(PerConversationExpiryBoundaries),
+        TEST(PerConversationExpiryPersistsAndIsolates), TEST(PerConversationSettingRevokesDetachedExpiry),
+        TEST(PerConversationSettingsRejectInvalidAndFailedWrites), TEST(NewFieldsMalformedRemainUntouched),
+        TEST(LedgerRequiresAcknowledgedLocalProvenance), TEST(LedgerMatchesClonedAcknowledgment),
+        TEST(LedgerManualActionCancelsLateAck), TEST(LedgerAccountEpochIsolatesAcknowledgments),
+        TEST(LedgerBoundsPendingFailures), TEST(TwoActionsFitBeforeReturnThreshold)
 #undef TEST
     };
     int failed = 0;
