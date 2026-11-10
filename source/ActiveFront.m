@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.13 continuous full-row swipe (device validation pending).
+// WCRefine ActiveFront - v1.9.14 neutral return animation (device validation pending).
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -72,7 +72,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.13-source";
+static NSString * const kWCRAFVersion = @"1.9.14-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 7;
 
@@ -2130,7 +2130,7 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
         }
         band = [[UIView alloc] initWithFrame:CGRectMake(0, rowY,
             CGRectGetWidth(visible), removedHeight)];
-        band.backgroundColor = [UIColor systemGreenColor];
+        band.backgroundColor = WCRSwipeBackground(cell);
         [overlay addSubview:band];
         moving = objc_getAssociatedObject(cell, kWCRSwipeForegroundKey);
         CGRect movingFrame = [cell convertRect:moving.frame toView:table];
