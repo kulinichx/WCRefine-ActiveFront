@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.17 bounded deferred native reminder confirmation.
+// WCRefine ActiveFront - v1.9.18 event-confirmed, serialized reminder operations.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -75,7 +75,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.17-source";
+static NSString * const kWCRAFVersion = @"1.9.18-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -151,6 +151,8 @@ static void WCRInvalidateGroupIndex(void);
 static void WCRCancelReturnAnimation(void);
 static void WCRInvalidateOutgoing(NSString *username, WCRAFAccountContext *context);
 static void WCRInvalidateSendAcknowledgments(NSString *username, WCRAFAccountContext *context);
+static void WCRRefreshHomeGlobal(NSString *reason, WCRAFAccountContext *context);
+static void WCRReminderPendingNotice(void);
 static UIViewController *WCRTopVC(void);
 
 
@@ -183,7 +185,8 @@ typedef NS_ENUM(NSInteger, WCRRightActionKind) {
     WCRRightActionKeep,
     WCRRightActionReturn,
     WCRRightActionMute,
-    WCRRightActionRemind
+    WCRRightActionRemind,
+    WCRRightActionPending
 };
 
 #pragma mark - Helpers
@@ -384,6 +387,8 @@ static WCRAFNotifyCoordinator *WCRReminderCoordinator(void) {
                 return [NSThread isMainThread] &&
                     UIApplication.sharedApplication.applicationState == UIApplicationStateActive &&
                     [WCRAFStore() isCurrentContext:context];
+            } clock:^NSTimeInterval {
+                return NSProcessInfo.processInfo.systemUptime;
             } scheduler:^(void (^confirm)(void)) {
                 // One confirmation for a pending operation; never a recurring timer.
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
@@ -391,6 +396,28 @@ static WCRAFNotifyCoordinator *WCRReminderCoordinator(void) {
             }];
     });
     return coordinator;
+}
+
+// Defer until after native row rendering; coalesce each username per queue turn.
+static void WCRQueueReminderObservation(NSString *username, WCRAFAccountContext *context) {
+    if (![NSThread isMainThread] || ![username isKindOfClass:NSString.class] ||
+        username.length == 0 || !context ||
+        [WCRReminderCoordinator() pendingNotifyForUsername:username context:context] < 0) return;
+    static NSMutableDictionary<NSString *, WCRAFAccountContext *> *queued;
+    static BOOL scheduled;
+    if (!queued) queued = [NSMutableDictionary dictionary];
+    if (queued.count >= 128 && !queued[username]) return;
+    queued[username] = context;
+    if (scheduled) return;
+    scheduled = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSDictionary<NSString *, WCRAFAccountContext *> *batch = [queued copy];
+        [queued removeAllObjects];
+        scheduled = NO;
+        for (NSString *name in batch) {
+            [WCRReminderCoordinator() observeUsername:name context:batch[name]];
+        }
+    });
 }
 
 static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContext *context,
@@ -411,10 +438,18 @@ static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContex
                 }
                 return WCRAFInvokeNativeNotify(manager, contact, !muted);
             } @catch (__unused NSException *exception) { return WCRAFNativeNotifyUnavailable; }
+        } pending:^{
+            WCRRefreshHomeGlobal(@"active_front_reminder_pending", context);
         } completion:^(WCRAFNotifyOutcome outcome) {
             if (outcome == WCRAFNotifyConfirmed) {
                 WCRRememberReminder(username, muted, context);
                 completion(YES, nil);
+                return;
+            }
+            if (outcome == WCRAFNotifyUnconfirmed) {
+                WCRReminderPendingNotice();
+                WCRRefreshHomeGlobal(@"active_front_reminder_unconfirmed", context);
+                completion(NO, nil);
                 return;
             }
             NSString *failure = writeFailure;
@@ -423,8 +458,6 @@ static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContex
                     failure = @"未能读取微信消息提醒状态（N02）"; break;
                 case WCRAFNotifyRejected:
                     failure = @"微信接口返回失败，尚未确认提醒状态变化（N05）"; break;
-                case WCRAFNotifyUnconfirmed:
-                    failure = @"已调用微信提醒接口，稍后仍未确认状态变化（N06）"; break;
                 case WCRAFNotifyBusy:
                     failure = @"待确认操作较多，请稍后重试（N07）"; break;
                 default: break;
@@ -441,6 +474,14 @@ static void WCRReminderFailure(NSString *reason) {
     [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
     UIViewController *presenter = WCRTopVC();
     [presenter presentViewController:alert animated:YES completion:nil];
+}
+
+static void WCRReminderPendingNotice(void) {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提醒状态待确认"
+        message:@"暂未确认微信中的开关状态，请在聊天设置中核实后重试。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+    [WCRTopVC() presentViewController:alert animated:YES completion:nil];
 }
 
 static UIViewController *WCRTopVC(void) {
@@ -1642,11 +1683,16 @@ static WCRRightActionKind WCRActionKindForCell(UITableViewCell *cell,
     }
 
     WCRRightActionKind kind = WCRRightActionNone;
+    WCRAFAccountContext *context = [WCRAFStore() currentContext];
+    NSInteger pending = context ?
+        [WCRReminderCoordinator() pendingNotifyForUsername:username context:context] : -1;
+    if (pending >= 0) WCRQueueReminderObservation(username, context);
 
     if (WCRGroupControllerForTable(tableView)) {
-        NSInteger muted = WCRContactMuted(username);
-        kind = muted == 1 ? WCRRightActionRemind :
-            (muted == 0 ? WCRRightActionMute : WCRRightActionNone);
+        NSInteger muted = pending >= 0 ? -1 : WCRContactMuted(username);
+        kind = pending >= 0 ? WCRRightActionPending :
+            (muted == 1 ? WCRRightActionRemind :
+            (muted == 0 ? WCRRightActionMute : WCRRightActionNone));
     } else if (!grouped) {
         kind = WCRRightActionGroup;
     } else if (held) {
@@ -1683,6 +1729,8 @@ static NSString *WCRTitleForActionKind(WCRRightActionKind kind) {
             return @"免扰";
         case WCRRightActionRemind:
             return @"提醒";
+        case WCRRightActionPending:
+            return @"同步中";
         case WCRRightActionNone:
         default:
             return nil;
@@ -1702,6 +1750,7 @@ static UIColor *WCRColorForActionKind(WCRRightActionKind kind) {
             return [UIColor systemGreenColor];
         case WCRRightActionMute:
         case WCRRightActionRemind:
+        case WCRRightActionPending:
             return [UIColor secondaryLabelColor];
         case WCRRightActionNone:
         default:
@@ -1736,7 +1785,11 @@ static BOOL WCRApplyActionKindToCell(UITableViewCell *cell,
                  forState:UIControlStateNormal];
     UIButton *mute = objc_getAssociatedObject(cell, kWCRMuteButtonKey);
     mute.hidden = WCRGroupControllerForTable(WCRTableForCell(cell)) != nil;
-    [mute setTitle:@"免扰" forState:UIControlStateNormal];
+    NSString *username = objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey);
+    WCRAFAccountContext *context = objc_getAssociatedObject(cell, kWCRCanonicalAccountKey);
+    BOOL pending = username.length > 0 && context &&
+        [WCRReminderCoordinator() pendingNotifyForUsername:username context:context] >= 0;
+    [mute setTitle:pending ? @"同步中" : @"免扰" forState:UIControlStateNormal];
     return YES;
 }
 
@@ -2611,7 +2664,8 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
         return;
     }
     if (sender == objc_getAssociatedObject(cell, kWCRMuteButtonKey)) {
-        kind = WCRRightActionMute;
+        kind = [WCRReminderCoordinator() pendingNotifyForUsername:username context:context] >= 0 ?
+            WCRRightActionPending : WCRRightActionMute;
     } else if (![sender.currentTitle isEqualToString:WCRTitleForActionKind(kind)]) {
         WCRCloseCell(cell, YES);
         return;
@@ -2647,7 +2701,7 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
             __weak id weakHost = host;
             WCRSetNativeMuted(username, kind == WCRRightActionMute, context, ^(BOOL success, NSString *failure) {
                 if (!success) {
-                    WCRReminderFailure(failure);
+                    if (failure.length > 0) WCRReminderFailure(failure);
                     return;
                 }
                 if (kind == WCRRightActionMute && WCRIsInCustomGroup(username)) {
@@ -2659,6 +2713,9 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
             });
             break;
         }
+        case WCRRightActionPending:
+            WCRQueueReminderObservation(username, context);
+            break;
         case WCRRightActionNone:
         default:
             break;
@@ -2957,7 +3014,7 @@ static void WCRQueueSendAcknowledgment(NSString *username, id wrap) {
                 ![canonicalName isEqualToString:name] || ![WCRAFStore() isCurrentContext:context]) return;
             WCRSetNativeMuted(name, NO, context, ^(BOOL success, NSString *failure) {
                 if (!success) {
-                    WCRReminderFailure(failure);
+                    if (failure.length > 0) WCRReminderFailure(failure);
                     return;
                 }
                 @try {
@@ -2998,13 +3055,19 @@ static void hook_addMsg(id self, SEL cmd, id username, id wrap) {
 
 static void hook_sessionAddMsg(id self, SEL cmd, id username, id wrap) {
     if (orig_sessionAddMsg) orig_sessionAddMsg(self, cmd, username, wrap);
-    @try { WCRQueueSendAcknowledgment(username, wrap); }
+    @try {
+        WCRQueueSendAcknowledgment(username, wrap);
+        WCRQueueReminderObservation(username, [WCRAFStore() currentContext]);
+    }
     @catch (__unused NSException *exception) { }
 }
 
 static void hook_sessionModMsg(id self, SEL cmd, id username, id wrap) {
     if (orig_sessionModMsg) orig_sessionModMsg(self, cmd, username, wrap);
-    @try { WCRQueueSendAcknowledgment(username, wrap); }
+    @try {
+        WCRQueueSendAcknowledgment(username, wrap);
+        WCRQueueReminderObservation(username, [WCRAFStore() currentContext]);
+    }
     @catch (__unused NSException *exception) { }
 }
 

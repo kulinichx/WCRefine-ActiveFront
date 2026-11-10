@@ -98,23 +98,33 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
 @property(nonatomic, copy) NSString *username;
 @property(nonatomic, strong) WCRAFAccountContext *context;
 @property(nonatomic) BOOL notify;
+@property(nonatomic) NSTimeInterval started;
+@property(nonatomic) NSTimeInterval lastEventRead;
+@property(nonatomic) NSUInteger eventReads;
 @property(nonatomic, copy) NSInteger (^read)(void);
+@property(nonatomic, copy) WCRAFNativeNotifyResult (^write)(void);
+@property(nonatomic, copy) void (^pending)(void);
 @property(nonatomic, copy) void (^completion)(WCRAFNotifyOutcome);
+@property(nonatomic, strong) WCRAFNotifyRequest *next;
 @end
 @implementation WCRAFNotifyRequest
 @end
 
 @implementation WCRAFNotifyCoordinator {
     NSMutableDictionary<NSString *, WCRAFNotifyRequest *> *_requests;
+    WCRAFAccountContext *_context;
     BOOL (^_validator)(WCRAFAccountContext *);
+    NSTimeInterval (^_clock)(void);
     void (^_scheduler)(void (^)(void));
 }
 - (instancetype)initWithValidator:(BOOL (^)(WCRAFAccountContext *))validator
+                           clock:(NSTimeInterval (^)(void))clock
                        scheduler:(void (^)(void (^)(void)))scheduler {
     self = [super init];
     if (self) {
         _requests = [NSMutableDictionary dictionary];
         _validator = [validator copy];
+        _clock = [clock copy];
         _scheduler = [scheduler copy];
     }
     return self;
@@ -132,23 +142,60 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
 - (void)finish:(WCRAFNotifyRequest *)request outcome:(WCRAFNotifyOutcome)outcome {
     if (![self isCurrent:request]) return;
     [_requests removeObjectForKey:request.username];
+    if (request.next) {
+        if (outcome == WCRAFNotifyConfirmed) {
+            WCRAFNotifyRequest *next = request.next;
+            [self changeUsername:next.username context:next.context notify:next.notify
+                read:next.read write:next.write pending:next.pending completion:next.completion];
+        } else {
+            // An unconfirmed older write must not race a new opposite write.
+            request.next.completion(WCRAFNotifyUnconfirmed);
+        }
+        return;
+    }
     request.completion(outcome);
+}
+- (BOOL)expired:(WCRAFNotifyRequest *)request {
+    NSTimeInterval now = _clock();
+    return !isfinite(now) || now < request.started || now - request.started >= 30.0;
+}
+- (NSInteger)pendingNotifyForUsername:(NSString *)username context:(WCRAFAccountContext *)context {
+    WCRAFNotifyRequest *request = _requests[username];
+    if (!request || request.context != context) return -1;
+    return (request.next ?: request).notify ? 1 : 0;
+}
+- (void)observeUsername:(NSString *)username context:(WCRAFAccountContext *)context {
+    WCRAFNotifyRequest *request = _requests[username];
+    if (!request || request.context != context || ![self isCurrent:request]) return;
+    BOOL expired = [self expired:request];
+    NSTimeInterval now = _clock();
+    if (!expired && (request.eventReads >= 16 || now - request.lastEventRead < 0.5)) return;
+    request.eventReads++;
+    request.lastEventRead = now;
+    NSInteger current = [self read:request];
+    if (![self isCurrent:request]) return;
+    if (current == (request.notify ? 1 : 0)) {
+        [self finish:request outcome:WCRAFNotifyConfirmed];
+    } else if (expired) {
+        [self finish:request outcome:WCRAFNotifyUnconfirmed];
+    }
 }
 - (void)changeUsername:(NSString *)username context:(WCRAFAccountContext *)context
                 notify:(BOOL)notify read:(NSInteger (^)(void))read
                  write:(WCRAFNativeNotifyResult (^)(void))write
+               pending:(void (^)(void))pending
             completion:(void (^)(WCRAFNotifyOutcome))completion {
     if (username.length == 0 || !_validator(context)) return;
-    WCRAFNotifyRequest *previous = _requests[username];
-    if (previous && previous.context == context && previous.notify == notify) {
-        // Coalesce duplicate taps/sends without another write or scheduled wakeup.
-        previous.read = read;
-        previous.completion = completion;
-        return;
+    if (_context != context) {
+        [_requests removeAllObjects];
+        _context = context;
     }
-    BOOL superseding = previous && previous.context == context;
-    [_requests removeObjectForKey:username];
-    if (_requests.count >= 128) {
+    WCRAFNotifyRequest *previous = _requests[username];
+    if (previous && previous.context == context && [self expired:previous]) {
+        [self observeUsername:username context:context];
+        previous = _requests[username];
+    }
+    if (!previous && _requests.count >= 128) {
         completion(WCRAFNotifyBusy);
         return;
     }
@@ -157,7 +204,26 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
     request.context = context;
     request.notify = notify;
     request.read = read;
+    request.write = write;
+    request.pending = pending;
     request.completion = completion;
+    if (previous && previous.context == context) {
+        if (previous.notify == notify) {
+            previous.next = nil;
+            previous.read = read;
+            previous.pending = pending;
+            previous.completion = completion;
+        } else {
+            previous.next = request;
+        }
+        return;
+    }
+    request.started = _clock();
+    request.lastEventRead = request.started;
+    if (!isfinite(request.started)) {
+        completion(WCRAFNotifyUnconfirmed);
+        return;
+    }
     _requests[username] = request;
     NSInteger before = [self read:request];
     if (![self isCurrent:request]) return;
@@ -165,7 +231,7 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
         [self finish:request outcome:WCRAFNotifyReadUnavailable];
         return;
     }
-    if (before == (notify ? 1 : 0) && !superseding) {
+    if (before == (notify ? 1 : 0)) {
         [self finish:request outcome:WCRAFNotifyConfirmed];
         return;
     }
@@ -183,15 +249,19 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
         [self finish:request outcome:WCRAFNotifyConfirmed];
         return;
     }
+    pending();
+    if (![self isCurrent:request]) return;
     __weak WCRAFNotifyCoordinator *weakSelf = self;
     _scheduler(^{
         WCRAFNotifyCoordinator *coordinator = weakSelf;
         if (!coordinator || ![coordinator isCurrent:request]) return;
         NSInteger latest = [coordinator read:request];
-        WCRAFNotifyOutcome outcome = latest == (notify ? 1 : 0) ?
-            WCRAFNotifyConfirmed : (result == WCRAFNativeNotifyRejected ?
-                WCRAFNotifyRejected : WCRAFNotifyUnconfirmed);
-        [coordinator finish:request outcome:outcome];
+        request.lastEventRead = coordinator->_clock();
+        if (latest == (notify ? 1 : 0)) {
+            [coordinator finish:request outcome:WCRAFNotifyConfirmed];
+        }
+        // Unchanged at one second means pending, not failure. Host events can
+        // confirm later without another timer or another native write.
     });
 }
 - (void)invalidateUsername:(NSString *)username {

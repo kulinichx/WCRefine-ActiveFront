@@ -26,14 +26,18 @@ typedef NS_ENUM(NSInteger, WCRAFNotifyOutcome) {
 };
 
 @class WCRAFAccountContext;
-// Main-queue operations: one write, immediate readback, at most one deferred read.
+// Main queue: serialized writes, one deferred read, then bounded host-event reads.
 @interface WCRAFNotifyCoordinator : NSObject
 - (instancetype)initWithValidator:(BOOL (^)(WCRAFAccountContext *))validator
+                           clock:(NSTimeInterval (^)(void))clock
                        scheduler:(void (^)(void (^)(void)))scheduler;
 - (void)changeUsername:(NSString *)username context:(WCRAFAccountContext *)context
                 notify:(BOOL)notify read:(NSInteger (^)(void))read
                  write:(WCRAFNativeNotifyResult (^)(void))write
+               pending:(void (^)(void))pending
             completion:(void (^)(WCRAFNotifyOutcome))completion;
+- (NSInteger)pendingNotifyForUsername:(NSString *)username context:(WCRAFAccountContext *)context;
+- (void)observeUsername:(NSString *)username context:(WCRAFAccountContext *)context;
 - (void)invalidateUsername:(NSString *)username;
 - (void)cancelAll;
 @end
