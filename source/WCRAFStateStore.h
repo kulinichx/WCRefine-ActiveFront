@@ -2,10 +2,28 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// -1 means an unavailable native flag; rooms require a known unmuted state.
+FOUNDATION_EXPORT BOOL WCRAFAllowsAutomaticActivity(NSUInteger scope, NSInteger muted, NSInteger folded);
+
 @interface WCRAFAccountContext : NSObject
 @property(nonatomic, copy, readonly) NSString *account;
 @property(nonatomic, assign, readonly) uint64_t epoch;
 @end
+
+// A release belongs to the account/row/state captured at gesture begin.
+@interface WCRAFSwipeIntent : NSObject
+@property(nonatomic, strong, readonly) WCRAFAccountContext *context;
+@property(nonatomic, copy, readonly) NSString *username;
+@property(nonatomic, assign, readonly) BOOL grouped;
+@property(nonatomic, assign, readonly) BOOL held;
+- (instancetype)initWithUsername:(NSString *)username context:(WCRAFAccountContext *)context
+                         grouped:(BOOL)grouped held:(BOOL)held;
+- (BOOL)matchesUsername:(NSString *)username context:(WCRAFAccountContext *)context
+               grouped:(BOOL)grouped held:(BOOL)held;
+- (BOOL)shouldReturnAtDistance:(double)distance rowWidth:(double)width
+                  actionWidth:(double)actionWidth ended:(BOOL)ended;
+@end
+FOUNDATION_EXPORT double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth);
 
 @interface WCRAFExpiryCandidate : NSObject
 @property(nonatomic, strong, readonly) WCRAFAccountContext *context;
@@ -29,7 +47,7 @@ NS_ASSUME_NONNULL_BEGIN
         lastMessageTime:(NSTimeInterval)lastMessageTime
             unreadCount:(NSInteger)unreadCount
                 grouped:(BOOL)grouped;
-// Unknown unread counts use -1 and never start/complete a read countdown.
+// Unknown unread counts use -1 and never trigger an automatic return.
 - (BOOL)observeMessageActivity:(NSString *)username
                        context:(WCRAFAccountContext *)context
                lastMessageTime:(NSTimeInterval)lastMessageTime
@@ -38,9 +56,18 @@ NS_ASSUME_NONNULL_BEGIN
                    homeVisible:(BOOL)homeVisible;
 - (BOOL)hasMessageActivityForContext:(WCRAFAccountContext *)context;
 - (BOOL)hasTrackedMessageActivity:(NSString *)username context:(WCRAFAccountContext *)context;
-- (NSTimeInterval)nextMessageActivityDeadlineForContext:(WCRAFAccountContext *)context;
-- (NSInteger)readGraceMinutesForContext:(WCRAFAccountContext *)context;
-- (BOOL)setReadGraceMinutes:(NSInteger)minutes context:(WCRAFAccountContext *)context;
+- (NSArray<NSString *> *)trackedMessageActivityUsernamesForContext:(WCRAFAccountContext *)context;
+- (BOOL)needsMessageActivityObservation:(NSString *)username
+                               context:(WCRAFAccountContext *)context
+                       lastMessageTime:(NSTimeInterval)lastMessageTime
+                           unreadCount:(NSInteger)unreadCount
+                               grouped:(BOOL)grouped
+                           homeVisible:(BOOL)homeVisible;
+// Stop temporary tracking without modifying Held state or the return watermark.
+- (BOOL)discardMessageActivity:(NSString *)username context:(WCRAFAccountContext *)context;
+// Checked before the host's unread-policy fallback; never marks a message read.
+- (BOOL)isMessageReturnSuppressed:(NSString *)username context:(WCRAFAccountContext *)context
+                 lastMessageTime:(NSTimeInterval)lastMessageTime;
 - (NSInteger)expiryDaysForContext:(WCRAFAccountContext *)context;
 - (BOOL)setExpiryDays:(NSInteger)days context:(WCRAFAccountContext *)context;
 - (BOOL)isExpired:(NSString *)username

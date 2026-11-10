@@ -18,6 +18,7 @@ static void Require(BOOL condition, const char *expression, int line) {
 @interface FaultDefaults : NSUserDefaults
 @property(nonatomic) BOOL failRead;
 @property(nonatomic) BOOL failWrite;
+@property(nonatomic) NSUInteger writeCount;
 @property(nonatomic, copy) void (^afterWrite)(void);
 @end
 
@@ -29,6 +30,7 @@ static void Require(BOOL condition, const char *expression, int line) {
 - (void)setObject:(id)value forKey:(NSString *)key {
     if (self.failWrite) [NSException raise:@"WriteFailure" format:@"test"];
     [super setObject:value forKey:key];
+    self.writeCount++;
     void (^callback)(void) = self.afterWrite;
     self.afterWrite = nil;
     if (callback) callback();
@@ -475,39 +477,45 @@ static void ActivityCoversFirstAndSubsequentMessages(Fixture *f) {
     CHECK(Observe(f, @"sent-to-friend", context, f.now, 0, YES, NO));
     CHECK(Observe(f, @"received-from-room", context, f.now, 1, YES, YES));
     CHECK(![f.store hasAnyHeldForContext:context]);
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == 0);
+    CHECK([f.store hasTrackedMessageActivity:@"sent-to-friend" context:context]);
 }
 
 static void ActivityQueriesDoNotRenewOrWrite(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     NSTimeInterval message = f.now;
-    CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
+    CHECK(Observe(f, @"alice", context, message, 1, YES, YES));
     NSDictionary *before = [f.defaults persistentDomainForName:f.suite];
-    f.now += 899;
-    for (int i = 0; i < 50; i++) {
+    NSUInteger writes = f.defaults.writeCount;
+    f.now += 59;
+    for (int i = 0; i < 1000; i++) {
         CHECK([f.store enableMessageActivityForContext:context]);
-        CHECK(Activity(f, @"alice", context, message, 0, YES));
-        CHECK(!Observe(f, @"alice", context, message, 0, YES, YES));
+        CHECK(Activity(f, @"alice", context, message, 1, YES));
+        CHECK(![f.store needsMessageActivityObservation:@"alice" context:context
+            lastMessageTime:message unreadCount:1 grouped:YES homeVisible:YES]);
+        CHECK(!Observe(f, @"alice", context, message, 1, YES, YES));
     }
     CHECK([[f.defaults persistentDomainForName:f.suite] isEqual:before]);
+    CHECK(f.defaults.writeCount == writes);
     f.now++;
-    CHECK(!Activity(f, @"alice", context, message, 0, YES));
+    CHECK(Activity(f, @"alice", context, message, 1, YES));
 }
 
 static void ActivityPersistsAcrossRestart(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     NSTimeInterval message = f.now;
-    CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
-    f.now += 100;
+    CHECK(Observe(f, @"alice", context, message, 0, YES, NO));
+    f.now += 20;
     f.store = [f newStore];
     context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     CHECK(Activity(f, @"alice", context, message, 0, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == message + 900);
+    CHECK([f.store hasTrackedMessageActivity:@"alice" context:context]);
     CHECK(!Activity(f, @"bob", context, message - 1, 0, YES));
-    f.now = message + 900;
+    f.now = message + 60;
+    CHECK(Activity(f, @"alice", context, message, 0, YES));
+    CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
     CHECK(!Activity(f, @"alice", context, message, 0, YES));
 }
 
@@ -529,23 +537,20 @@ static void ActivityReturnWaitsForNewMessage(Fixture *f) {
     CHECK(Activity(f, @"alice", context, floor(f.now), 0, YES));
 }
 
-static void ReadGraceStartsAfterReturningHome(Fixture *f) {
+static void ReadReturnsImmediatelyAfterReturningHome(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     NSTimeInterval message = f.now;
     CHECK(Observe(f, @"alice", context, message, 0, YES, NO));
     f.now += Day;
     CHECK(Activity(f, @"alice", context, message, 0, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == 0);
+    CHECK([f.store hasTrackedMessageActivity:@"alice" context:context]);
     CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == f.now + 900);
-    f.now += 899;
-    CHECK(Activity(f, @"alice", context, message, 0, YES));
-    f.now++;
     CHECK(!Activity(f, @"alice", context, message, 0, YES));
+    CHECK(![f.store hasTrackedMessageActivity:@"alice" context:context]);
 }
 
-static void UnreadNeverStartsReturnCountdown(Fixture *f) {
+static void UnreadStaysUntilConfirmedRead(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     NSTimeInterval message = f.now - Day;
@@ -553,41 +558,40 @@ static void UnreadNeverStartsReturnCountdown(Fixture *f) {
     CHECK(Observe(f, @"room", context, message, 3, YES, YES));
     f.now += 100 * Day;
     CHECK(Activity(f, @"room", context, message, 3, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == 0);
+    CHECK(!Observe(f, @"room", context, message, 3, YES, YES));
     CHECK(Observe(f, @"room", context, message, 0, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == f.now + 900);
+    CHECK(!Activity(f, @"room", context, message, 0, YES));
 }
 
-static void NewMessageResetsReadGrace(Fixture *f) {
+static void NewMessageAfterReadReturnsToHome(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     NSTimeInterval first = f.now;
     CHECK(Observe(f, @"room", context, first, 0, YES, YES));
-    f.now += 899;
+    f.now += 59;
     NSTimeInterval second = f.now;
     CHECK(Activity(f, @"room", context, second, 1, YES));
     CHECK(Observe(f, @"room", context, second, 1, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == 0);
+    CHECK(![f.store isMessageReturnSuppressed:@"room" context:context lastMessageTime:second]);
     f.now += 1000;
     CHECK(Activity(f, @"room", context, second, 1, YES));
     CHECK(Observe(f, @"room", context, second, 0, YES, NO) == NO);
     CHECK(Observe(f, @"room", context, second, 0, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == f.now + 900);
+    CHECK(!Activity(f, @"room", context, second, 0, YES));
 }
 
 static void UnknownReadCountPreservesActivity(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     NSTimeInterval message = f.now;
-    CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
-    f.now += 900;
-    CHECK(Activity(f, @"alice", context, message, -1, YES));
     CHECK(Observe(f, @"alice", context, message, -1, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == 0);
+    f.now += 60;
+    CHECK(Activity(f, @"alice", context, message, -1, YES));
+    CHECK(!Observe(f, @"alice", context, message, -1, YES, YES));
     f.now += 1000;
     CHECK(Activity(f, @"alice", context, message, 0, YES));
     CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == f.now + 900);
+    CHECK(!Activity(f, @"alice", context, message, 0, YES));
 }
 
 static void UngroupedConversationsNeverAutoReturn(Fixture *f) {
@@ -597,20 +601,20 @@ static void UngroupedConversationsNeverAutoReturn(Fixture *f) {
     CHECK(Observe(f, @"alice", context, message, 0, NO, YES));
     f.now += 100 * Day;
     CHECK(Activity(f, @"alice", context, message, 0, NO));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == 0);
+    CHECK(!Observe(f, @"alice", context, message, 0, NO, YES));
     // Explicit assignment/return may still collect it into the selected group.
     CHECK([f.store setHeld:NO username:@"alice" context:context]);
     CHECK(!Activity(f, @"alice", context, message, 0, YES));
 }
 
-static void ManualHoldIsIndependentOfReadGrace(Fixture *f) {
+static void ManualHoldSurvivesConfirmedRead(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     NSTimeInterval message = f.now;
-    CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
+    CHECK(Observe(f, @"alice", context, message, 1, YES, YES));
     CHECK([f.store setHeld:YES username:@"alice" context:context]);
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == 0);
-    f.now += 900;
+    CHECK(!Observe(f, @"alice", context, message, 0, YES, YES));
+    f.now += 60;
     CHECK(!Activity(f, @"alice", context, message, 0, YES));
     CHECK([f.store isHeld:@"alice" context:context]);
     CHECK(![f.store isExpired:@"alice" context:context lastMessageTime:message]);
@@ -622,46 +626,46 @@ static void ManualHoldIsIndependentOfReadGrace(Fixture *f) {
     CHECK(!Activity(f, @"alice", context, message, 0, YES));
 }
 
-static void GraceSettingsPersistAndDoNotChangeHoldDays(Fixture *f) {
+static void ReturnedMessageSuppressionSurvivesRestart(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
-    CHECK([f.store readGraceMinutesForContext:context] == 15);
     CHECK([f.store setExpiryDays:14 context:context]);
-    CHECK([f.store setReadGraceMinutes:5 context:context]);
-    CHECK(Observe(f, @"alice", context, f.now, 0, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == f.now + 300);
-    CHECK([f.store expiryDaysForContext:context] == 14);
-    for (NSNumber *minutes in @[@(-1), @0, @1, @10, @60]) {
-        CHECK(![f.store setReadGraceMinutes:minutes.integerValue context:context]);
-    }
+    NSTimeInterval message = f.now;
+    CHECK(Observe(f, @"alice", context, message, 7, YES, YES));
+    CHECK([f.store setHeld:NO username:@"alice" context:context]);
     f.store = [f newStore];
     context = [f.store currentContext];
-    CHECK([f.store readGraceMinutesForContext:context] == 5);
-    CHECK([f.store setReadGraceMinutes:30 context:context]);
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == f.now + 1800);
+    CHECK([f.store expiryDaysForContext:context] == 14);
+    CHECK([f.store isMessageReturnSuppressed:@"alice" context:context lastMessageTime:message]);
+    CHECK(!Activity(f, @"alice", context, message, 7, YES));
+    CHECK(!Observe(f, @"alice", context, message, 7, YES, YES));
+    f.now++;
+    CHECK(![f.store isMessageReturnSuppressed:@"alice" context:context lastMessageTime:f.now]);
+    CHECK(Activity(f, @"alice", context, f.now, 8, YES));
 }
 
-static void DeadlineSelectsNearestNonHeldConversation(Fixture *f) {
+static void ReadReturnDoesNotChangeOtherConversation(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
-    CHECK(Observe(f, @"alice", context, f.now, 0, YES, YES));
-    NSTimeInterval firstDeadline = f.now + 900;
+    CHECK(Observe(f, @"alice", context, f.now, 1, YES, YES));
+    NSTimeInterval first = f.now;
     f.now += 10;
-    CHECK(Observe(f, @"bob", context, f.now, 0, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == firstDeadline);
-    CHECK([f.store setHeld:YES username:@"alice" context:context]);
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == firstDeadline + 10);
+    CHECK(Observe(f, @"bob", context, f.now, 1, YES, YES));
+    CHECK(Observe(f, @"alice", context, first, 0, YES, YES));
+    CHECK(!Activity(f, @"alice", context, first, 0, YES));
+    CHECK(Activity(f, @"bob", context, f.now, 1, YES));
     CHECK([f.store setHeld:YES username:@"bob" context:context]);
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == 0);
+    CHECK(!Observe(f, @"bob", context, f.now, 0, YES, YES));
+    CHECK([f.store isHeld:@"bob" context:context]);
 }
 
-static void ExpiredActivityDoesNotResurfaceOldMessage(Fixture *f) {
+static void ReadActivityDoesNotResurfaceOldMessage(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     NSTimeInterval message = f.now;
-    CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
-    f.now += 900;
-    CHECK(!Activity(f, @"alice", context, message, 0, YES));
+    CHECK(Observe(f, @"alice", context, message, 1, YES, YES));
+    f.now += 60;
+    CHECK(Activity(f, @"alice", context, message, 0, YES));
     CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
     CHECK(![f.store hasMessageActivityForContext:context]);
     CHECK(!Activity(f, @"alice", context, message, 0, YES));
@@ -673,11 +677,11 @@ static void StaleObservationCannotEraseNewerActivity(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     NSTimeInterval first = f.now;
-    CHECK(Observe(f, @"alice", context, first, 0, YES, YES));
+    CHECK(Observe(f, @"alice", context, first, 0, YES, NO));
     f.now += 10;
     CHECK(Observe(f, @"alice", context, f.now, 1, YES, YES));
     CHECK(!Observe(f, @"alice", context, first, 0, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == 0);
+    CHECK(Activity(f, @"alice", context, f.now, 1, YES));
 }
 
 static void ReturnRejectsQueuedOldObservation(Fixture *f) {
@@ -703,7 +707,7 @@ static void ActivityAccountIsolation(Fixture *f) {
     CHECK(![f.store enableMessageActivityForContext:a]);
     CHECK(!Activity(f, @"alice", a, f.now, 0, YES));
     CHECK(!Observe(f, @"alice", a, f.now, 0, YES, YES));
-    CHECK(![f.store setReadGraceMinutes:5 context:a]);
+    CHECK(![f.store isMessageReturnSuppressed:@"alice" context:a lastMessageTime:message]);
     CHECK(![f.store setHeld:NO username:@"alice" context:a]);
     f.account = @"account-A";
     WCRAFAccountContext *again = [f.store currentContext];
@@ -815,18 +819,282 @@ static void ActivityObservationFailureQuarantinesCache(Fixture *f) {
     CHECK([[f.defaults persistentDomainForName:f.suite] isEqual:before]);
 }
 
-static void ActivitySameMessageUnreadResetsCountdown(Fixture *f) {
+static void UnreadTransitionCannotReturnWithoutHome(Fixture *f) {
     WCRAFAccountContext *context = [f.store currentContext];
     CHECK([f.store enableMessageActivityForContext:context]);
     NSTimeInterval message = f.now;
-    CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
-    f.now += 800;
-    CHECK(Observe(f, @"alice", context, message, 1, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == 0);
+    CHECK(Observe(f, @"alice", context, message, 0, YES, NO));
+    f.now += 20;
+    CHECK(!Observe(f, @"alice", context, message, 1, YES, YES));
     f.now += 200;
     CHECK(Activity(f, @"alice", context, message, 1, YES));
     CHECK(Observe(f, @"alice", context, message, 0, YES, YES));
-    CHECK([f.store nextMessageActivityDeadlineForContext:context] == f.now + 900);
+    CHECK(!Activity(f, @"alice", context, message, 0, YES));
+}
+
+static void AutomaticActivityPolicyHonorsMuteAndFold(Fixture *f) {
+    (void)f;
+    CHECK(WCRAFAllowsAutomaticActivity(1, -1, 0));
+    CHECK(WCRAFAllowsAutomaticActivity(1, 1, -1)); // Only rooms are mute-filtered.
+    CHECK(WCRAFAllowsAutomaticActivity(2, 0, 0));
+    CHECK(!WCRAFAllowsAutomaticActivity(2, 1, 0));
+    CHECK(!WCRAFAllowsAutomaticActivity(2, -1, 0));
+    CHECK(!WCRAFAllowsAutomaticActivity(2, 0, 1));
+    CHECK(!WCRAFAllowsAutomaticActivity(1, 0, 1));
+    CHECK(!WCRAFAllowsAutomaticActivity(0, 0, 0));
+    CHECK(!WCRAFAllowsAutomaticActivity(3, 0, 0));
+}
+
+static void DirtyObservationTracksOnlyTransitions(Fixture *f) {
+    WCRAFAccountContext *context = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:context]);
+    NSTimeInterval message = f.now;
+    CHECK([f.store needsMessageActivityObservation:@"room" context:context
+        lastMessageTime:message unreadCount:1 grouped:YES homeVisible:YES]);
+    CHECK(Observe(f, @"room", context, message, 1, YES, YES));
+    CHECK(![f.store needsMessageActivityObservation:@"room" context:context
+        lastMessageTime:message unreadCount:2 grouped:YES homeVisible:YES]);
+    CHECK(![f.store needsMessageActivityObservation:@"room" context:context
+        lastMessageTime:message unreadCount:0 grouped:YES homeVisible:NO]);
+    CHECK([f.store needsMessageActivityObservation:@"room" context:context
+        lastMessageTime:message unreadCount:0 grouped:YES homeVisible:YES]);
+    CHECK(Observe(f, @"room", context, message, 0, YES, YES));
+    f.now += 60;
+    CHECK(!Observe(f, @"room", context, message, 0, YES, YES));
+    CHECK(![f.store needsMessageActivityObservation:@"room" context:context
+        lastMessageTime:message unreadCount:0 grouped:YES homeVisible:YES]);
+}
+
+static void LegacyGraceRecordsReturnWithoutCountdown(Fixture *f) {
+    NSString *key = [Prefix stringByAppendingString:f.account];
+    for (NSNumber *minutes in @[@1, @3, @5, @15, @30]) {
+        NSDictionary *record = @{@"schema": @2, @"held": @[@"alice"],
+            @"since": @{@"alice": @(f.now)}, @"days": @14,
+            @"graceMinutes": minutes, @"activitySince": @(f.now - 50),
+            @"returned": @{}, @"activity": @{
+                @"room": @{@"message": @(f.now - 40), @"readAt": @(f.now - 30)}}};
+        [f.defaults setObject:record forKey:key];
+        f.store = [f newStore];
+        WCRAFAccountContext *context = [f.store currentContext];
+        CHECK(context != nil);
+        CHECK([f.store isHeld:@"alice" context:context]);
+        CHECK([f.store expiryDaysForContext:context] == 14);
+        CHECK(Activity(f, @"room", context, f.now - 40, 0, YES));
+        CHECK([[f.defaults objectForKey:key] isEqual:record]); // Load is read-only.
+        CHECK([f.store enableMessageActivityForContext:context]);
+        CHECK(Observe(f, @"room", context, f.now - 40, 0, YES, YES));
+        CHECK(!Activity(f, @"room", context, f.now - 40, 0, YES));
+        CHECK([f.defaults objectForKey:key][@"graceMinutes"] == nil);
+        f.store = [f newStore];
+        context = [f.store currentContext];
+        CHECK([f.store isHeld:@"alice" context:context]);
+        CHECK([f.store expiryDaysForContext:context] == 14);
+        CHECK(!Activity(f, @"room", context, f.now - 40, 0, YES));
+    }
+}
+
+static void StableReturnedQueriesDoNotWrite(Fixture *f) {
+    WCRAFAccountContext *context = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:context]);
+    NSTimeInterval message = f.now;
+    CHECK([f.store setHeld:NO username:@"room" context:context]);
+    NSUInteger writes = f.defaults.writeCount;
+    f.now += Day;
+    for (int i = 0; i < 1000; i++) {
+        CHECK([f.store isMessageReturnSuppressed:@"room" context:context lastMessageTime:message]);
+        CHECK(!Activity(f, @"room", context, message, 3, YES));
+        CHECK(![f.store needsMessageActivityObservation:@"room" context:context
+            lastMessageTime:message unreadCount:3 grouped:YES homeVisible:YES]);
+        CHECK(!Observe(f, @"room", context, message, 3, YES, YES));
+    }
+    CHECK(f.defaults.writeCount == writes);
+}
+
+static void DiscardActivityPreservesHoldAndAllowsFutureMessages(Fixture *f) {
+    WCRAFAccountContext *context = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:context]);
+    CHECK(Observe(f, @"room", context, f.now, 1, YES, YES));
+    CHECK([f.store setHeld:YES username:@"room" context:context]);
+    CHECK([f.store discardMessageActivity:@"room" context:context]);
+    CHECK(![f.store hasTrackedMessageActivity:@"room" context:context]);
+    CHECK([f.store isHeld:@"room" context:context]);
+    CHECK(!Observe(f, @"room", context, f.now, 0, YES, YES));
+    NSUInteger writes = f.defaults.writeCount;
+    CHECK(![f.store discardMessageActivity:@"room" context:context]);
+    CHECK(f.defaults.writeCount == writes);
+    CHECK(!Activity(f, @"room", context, f.now, 1, YES));
+    CHECK([f.store setHeld:NO username:@"room" context:context]);
+    f.now++;
+    CHECK(Activity(f, @"room", context, f.now, 1, YES));
+}
+
+static void DiscardRejectsStaleAccount(Fixture *f) {
+    WCRAFAccountContext *a = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:a]);
+    CHECK(Observe(f, @"room", a, f.now, 1, YES, YES));
+    f.account = @"account-B";
+    WCRAFAccountContext *b = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:b]);
+    CHECK(Observe(f, @"room", b, f.now, 1, YES, YES));
+    CHECK(![f.store discardMessageActivity:@"room" context:a]);
+    CHECK([f.store hasTrackedMessageActivity:@"room" context:b]);
+    CHECK([f.store trackedMessageActivityUsernamesForContext:a].count == 0);
+}
+
+static void DirtyObservationRejectsStaleAndInvalidInput(Fixture *f) {
+    WCRAFAccountContext *context = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:context]);
+    CHECK(Observe(f, @"room", context, f.now, 1, YES, YES));
+    for (NSNumber *message in @[@0, @(-1), @(NAN), @(INFINITY), @(f.now + 1), @(f.now - 1)]) {
+        CHECK(![f.store needsMessageActivityObservation:@"room" context:context
+            lastMessageTime:message.doubleValue unreadCount:1 grouped:YES homeVisible:YES]);
+    }
+    CHECK(![f.store needsMessageActivityObservation:@"room" context:context
+        lastMessageTime:f.now unreadCount:-1 grouped:YES homeVisible:YES]);
+    CHECK(!Observe(f, @"room", context, f.now, -1, YES, YES));
+    CHECK(![f.store needsMessageActivityObservation:@"room" context:context
+        lastMessageTime:f.now unreadCount:-1 grouped:YES homeVisible:YES]);
+    f.clockThrows = YES;
+    CHECK(![f.store needsMessageActivityObservation:@"room" context:context
+        lastMessageTime:f.now unreadCount:0 grouped:YES homeVisible:YES]);
+}
+
+static void TrackedEnumerationOmitsHeldAndDiscarded(Fixture *f) {
+    WCRAFAccountContext *context = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:context]);
+    CHECK(Observe(f, @"alice", context, f.now, 0, YES, NO));
+    CHECK(Observe(f, @"bob", context, f.now, 1, YES, YES));
+    CHECK([f.store setHeld:YES username:@"bob" context:context]);
+    NSArray *names = [f.store trackedMessageActivityUsernamesForContext:context];
+    CHECK(names.count == 1 && [names containsObject:@"alice"]);
+    CHECK([f.store discardMessageActivity:@"alice" context:context]);
+    CHECK([f.store trackedMessageActivityUsernamesForContext:context].count == 0);
+}
+
+static void SwipeDistanceBoundary(Fixture *f) {
+    WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"room"
+        context:[f.store currentContext] grouped:YES held:NO];
+    double threshold = WCRAFSwipeReturnThreshold(390, 82);
+    CHECK(threshold > 82 * 2);
+    CHECK(![intent shouldReturnAtDistance:threshold - 0.01 rowWidth:390 actionWidth:82 ended:YES]);
+    CHECK([intent shouldReturnAtDistance:threshold rowWidth:390 actionWidth:82 ended:YES]);
+    CHECK([intent shouldReturnAtDistance:390 rowWidth:390 actionWidth:82 ended:YES]);
+}
+
+static void SwipePullbackCancels(Fixture *f) {
+    WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"room"
+        context:[f.store currentContext] grouped:YES held:YES];
+    CHECK([intent shouldReturnAtDistance:300 rowWidth:390 actionWidth:82 ended:YES]);
+    CHECK(![intent shouldReturnAtDistance:120 rowWidth:390 actionWidth:82 ended:YES]);
+    CHECK(![f.store isMessageReturnSuppressed:@"room" context:intent.context lastMessageTime:f.now]);
+}
+
+static void SwipeCancellationNeverReturns(Fixture *f) {
+    WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"room"
+        context:[f.store currentContext] grouped:YES held:NO];
+    CHECK(![intent shouldReturnAtDistance:390 rowWidth:390 actionWidth:82 ended:NO]);
+    CHECK([f.defaults persistentDomainForName:f.suite].count == 0);
+}
+
+static void UngroupedSwipeNeverReturns(Fixture *f) {
+    WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"alice"
+        context:[f.store currentContext] grouped:NO held:NO];
+    CHECK(![intent shouldReturnAtDistance:10000 rowWidth:390 actionWidth:82 ended:YES]);
+}
+
+static void SwipeRejectsInvalidGeometry(Fixture *f) {
+    WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"room"
+        context:[f.store currentContext] grouped:YES held:NO];
+    for (NSNumber *value in @[@(-1), @0, @(NAN), @(INFINITY)]) {
+        CHECK(![intent shouldReturnAtDistance:value.doubleValue rowWidth:390 actionWidth:82 ended:YES]);
+        CHECK(![intent shouldReturnAtDistance:390 rowWidth:value.doubleValue actionWidth:82 ended:YES]);
+        CHECK(![intent shouldReturnAtDistance:390 rowWidth:390 actionWidth:value.doubleValue ended:YES]);
+    }
+    CHECK(![intent shouldReturnAtDistance:200 rowWidth:160 actionWidth:82 ended:YES]);
+    CHECK(WCRAFSwipeReturnThreshold(320, 82) > 82);
+    CHECK(WCRAFSwipeReturnThreshold(1024, 82) < 1024);
+}
+
+static void SwipeRejectsReusedRow(Fixture *f) {
+    WCRAFAccountContext *context = [f.store currentContext];
+    WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"alice"
+        context:context grouped:YES held:NO];
+    CHECK([intent matchesUsername:@"alice" context:context grouped:YES held:NO]);
+    CHECK(![intent matchesUsername:@"bob" context:context grouped:YES held:NO]);
+    CHECK(![intent matchesUsername:@"" context:context grouped:YES held:NO]);
+}
+
+static void SwipeRejectsChangedGroupingOrHold(Fixture *f) {
+    WCRAFAccountContext *context = [f.store currentContext];
+    WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"alice"
+        context:context grouped:YES held:NO];
+    CHECK(![intent matchesUsername:@"alice" context:context grouped:NO held:NO]);
+    CHECK(![intent matchesUsername:@"alice" context:context grouped:YES held:YES]);
+}
+
+static void SwipeRejectsAccountSwitch(Fixture *f) {
+    WCRAFAccountContext *a = [f.store currentContext];
+    WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:@"alice"
+        context:a grouped:YES held:NO];
+    f.account = @"account-B";
+    CHECK(![intent matchesUsername:@"alice" context:[f.store currentContext] grouped:YES held:NO]);
+    f.account = @"account-A";
+    WCRAFAccountContext *again = [f.store currentContext];
+    CHECK(![intent matchesUsername:@"alice" context:again grouped:YES held:NO]);
+    CHECK(![f.store isCurrentContext:a]);
+}
+
+static void ReturnSuppressionUnknownTimeIsNotNewMessage(Fixture *f) {
+    WCRAFAccountContext *context = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:context]);
+    CHECK([f.store setHeld:NO username:@"room" context:context]);
+    for (NSNumber *time in @[@0, @(-1), @(NAN), @(INFINITY), @(f.now + 60)]) {
+        CHECK([f.store isMessageReturnSuppressed:@"room" context:context lastMessageTime:time.doubleValue]);
+    }
+    CHECK(![f.store isMessageReturnSuppressed:@"other" context:context lastMessageTime:0]);
+    f.account = @"account-B";
+    CHECK(![f.store isMessageReturnSuppressed:@"room" context:context lastMessageTime:0]);
+    WCRAFAccountContext *b = [f.store currentContext];
+    CHECK(![f.store isMessageReturnSuppressed:@"room" context:b lastMessageTime:0]);
+}
+
+static void ManualReturnFailureDoesNotSuppressOnRestart(Fixture *f) {
+    WCRAFAccountContext *context = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:context]);
+    CHECK(Observe(f, @"room", context, f.now, 2, YES, YES));
+    f.defaults.failWrite = YES;
+    CHECK(![f.store setHeld:NO username:@"room" context:context]);
+    f.defaults.failWrite = NO;
+    f.store = [f newStore];
+    context = [f.store currentContext];
+    CHECK(![f.store isMessageReturnSuppressed:@"room" context:context lastMessageTime:f.now]);
+    CHECK(Activity(f, @"room", context, f.now, 2, YES));
+}
+
+static void ReadObservationAccountSwitchCannotInstallOldState(Fixture *f) {
+    WCRAFAccountContext *a = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:a]);
+    CHECK(Observe(f, @"room", a, f.now, 1, YES, YES));
+    __weak Fixture *weak = f;
+    f.defaults.afterWrite = ^{
+        weak.account = @"account-B";
+        CHECK([weak.store currentContext] != nil);
+    };
+    CHECK(!Observe(f, @"room", a, f.now, 0, YES, YES));
+    WCRAFAccountContext *b = [f.store currentContext];
+    CHECK(![f.store isMessageReturnSuppressed:@"room" context:b lastMessageTime:f.now]);
+    CHECK(![f.store setHeld:NO username:@"room" context:a]);
+}
+
+static void HeldSkipsReadObservationAndWrites(Fixture *f) {
+    WCRAFAccountContext *context = [f keep:@"alice"];
+    CHECK([f.store enableMessageActivityForContext:context]);
+    NSUInteger writes = f.defaults.writeCount;
+    CHECK(![f.store needsMessageActivityObservation:@"alice" context:context
+        lastMessageTime:f.now unreadCount:0 grouped:YES homeVisible:YES]);
+    CHECK(!Observe(f, @"alice", context, f.now, 0, YES, YES));
+    CHECK([f.store isHeld:@"alice" context:context]);
+    CHECK(f.defaults.writeCount == writes);
 }
 
 int main(int argc, const char *argv[]) {
@@ -847,16 +1115,25 @@ int main(int argc, const char *argv[]) {
         TEST(ClockExceptionFailsClosed), TEST(OrphanOnlyTimestampIsReconciled),
         TEST(ActivityDoesNotSurfaceOldHistory), TEST(ActivityCoversFirstAndSubsequentMessages),
         TEST(ActivityQueriesDoNotRenewOrWrite), TEST(ActivityPersistsAcrossRestart),
-        TEST(ActivityReturnWaitsForNewMessage), TEST(ReadGraceStartsAfterReturningHome),
-        TEST(UnreadNeverStartsReturnCountdown), TEST(NewMessageResetsReadGrace),
+        TEST(ActivityReturnWaitsForNewMessage), TEST(ReadReturnsImmediatelyAfterReturningHome),
+        TEST(UnreadStaysUntilConfirmedRead), TEST(NewMessageAfterReadReturnsToHome),
         TEST(UnknownReadCountPreservesActivity), TEST(UngroupedConversationsNeverAutoReturn),
-        TEST(ManualHoldIsIndependentOfReadGrace), TEST(GraceSettingsPersistAndDoNotChangeHoldDays),
-        TEST(DeadlineSelectsNearestNonHeldConversation), TEST(ExpiredActivityDoesNotResurfaceOldMessage),
+        TEST(ManualHoldSurvivesConfirmedRead), TEST(ReturnedMessageSuppressionSurvivesRestart),
+        TEST(ReadReturnDoesNotChangeOtherConversation), TEST(ReadActivityDoesNotResurfaceOldMessage),
         TEST(StaleObservationCannotEraseNewerActivity), TEST(ReturnRejectsQueuedOldObservation),
         TEST(ActivityAccountIsolation), TEST(ActivityRejectsUnknownFutureAndInvalidClock),
         TEST(ActivityEnableFailurePreservesDefaults), TEST(ActivityEnableDoesNotLoseManualState),
         TEST(ActivityInvalidRecordsRemainUntouched), TEST(ActivityEnableSwitchAndNestedWrite),
-        TEST(ActivityObservationFailureQuarantinesCache), TEST(ActivitySameMessageUnreadResetsCountdown)
+        TEST(ActivityObservationFailureQuarantinesCache), TEST(UnreadTransitionCannotReturnWithoutHome),
+        TEST(AutomaticActivityPolicyHonorsMuteAndFold), TEST(DirtyObservationTracksOnlyTransitions),
+        TEST(LegacyGraceRecordsReturnWithoutCountdown), TEST(StableReturnedQueriesDoNotWrite),
+        TEST(DiscardActivityPreservesHoldAndAllowsFutureMessages), TEST(DiscardRejectsStaleAccount),
+        TEST(DirtyObservationRejectsStaleAndInvalidInput), TEST(TrackedEnumerationOmitsHeldAndDiscarded),
+        TEST(SwipeDistanceBoundary), TEST(SwipePullbackCancels), TEST(SwipeCancellationNeverReturns),
+        TEST(UngroupedSwipeNeverReturns), TEST(SwipeRejectsInvalidGeometry), TEST(SwipeRejectsReusedRow),
+        TEST(SwipeRejectsChangedGroupingOrHold), TEST(SwipeRejectsAccountSwitch),
+        TEST(ReturnSuppressionUnknownTimeIsNotNewMessage), TEST(ManualReturnFailureDoesNotSuppressOnRestart),
+        TEST(ReadObservationAccountSwitchCannotInstallOldState), TEST(HeldSkipsReadObservationAndWrites)
 #undef TEST
     };
     int failed = 0;

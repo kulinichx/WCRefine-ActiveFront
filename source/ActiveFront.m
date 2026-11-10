@@ -1,9 +1,8 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.10 message activity (device validation pending).
+// WCRefine ActiveFront - v1.9.12 release-to-return (device validation pending).
 // Friend/chat-room messages surface temporarily without changing membership.
-// Unread sessions stay visible. After reading and returning home, a 15-minute
-// grace window offers "保持"; only explicit Held state uses the days setting.
-// One foreground-only deadline timer, no periodic polling or message swizzles.
+// Unread sessions stay visible until read or explicitly returned by a long swipe.
+// Read + home-visible returns immediately unless Held. No activity timers.
 // v1.9.7: Held sessions return to their group automatically after N days
 // without a new message (N = never/3/7/14/30, default 7). Choose N by
 // long-pressing the right-swipe 保持/回组 button. No timers: expiry is
@@ -65,9 +64,11 @@ static const void *kWCRCanonicalUsernameKey = &kWCRCanonicalUsernameKey;
 static const void *kWCRCanonicalScopeKey = &kWCRCanonicalScopeKey;
 static const void *kWCRNativeCloseLatchKey = &kWCRNativeCloseLatchKey;
 static const void *kWCRCanonicalAccountKey = &kWCRCanonicalAccountKey;
+static const void *kWCRSwipeIntentKey = &kWCRSwipeIntentKey;
+static const void *kWCRReturnArmedKey = &kWCRReturnArmedKey;
 
 
-static NSString * const kWCRAFVersion = @"1.9.10-source";
+static NSString * const kWCRAFVersion = @"1.9.12-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 7;
 
@@ -140,8 +141,7 @@ static void WCRAFLog(NSString *format, ...) {
 
 static WCRAFStateStore *WCRAFStore(void);
 static void WCRInvalidateGroupIndex(void);
-static void WCRUpdateActivityTimer(WCRAFAccountContext *context);
-static void WCRCancelActivityTimer(void);
+static void WCRCancelReturnAnimation(void);
 
 
 @interface NewMainFrameViewController : UIViewController
@@ -465,8 +465,12 @@ static void WCRLayoutAction(UITableViewCell *cell) {
         h = CGRectGetHeight(cell.contentView.bounds);
     }
 
-    actionView.frame = CGRectMake(0.0, 0.0, kWCRActionWidth, h);
-    button.frame = actionView.bounds;
+    CGFloat offset = MAX(0.0, cell.contentView.transform.tx - WCRBaseTransform(cell).tx);
+    CGFloat width = WCRBool(cell, kWCRTrackingKey) ? MAX(kWCRActionWidth, offset) : kWCRActionWidth;
+    actionView.frame = CGRectMake(0.0, 0.0, width, h);
+    button.frame = CGRectMake(0.0, 0.0, MIN(width, kWCRActionWidth), h);
+    actionView.backgroundColor = WCRBool(cell, kWCRReturnArmedKey) ?
+        [UIColor systemGreenColor] : [UIColor clearColor];
 }
 
 static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
@@ -478,6 +482,9 @@ static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
     WCRSetBool(cell, kWCROpenKey, NO);
     WCRSetBool(cell, kWCRTrackingKey, NO);
     WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
+    WCRSetBool(cell, kWCRReturnArmedKey, NO);
+    objc_setAssociatedObject(cell, kWCRSwipeIntentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    actionView.backgroundColor = [UIColor clearColor];
 
     // Hide the action immediately instead of waiting for the spring
     // completion. The old completion could be interrupted by a new gesture /
@@ -492,7 +499,7 @@ static void WCRCloseCell(UITableViewCell *cell, BOOL animated) {
     void (^finish)(BOOL) = ^(BOOL finished) {
         (void)finished;
 
-        if (!WCRBool(cell, kWCROpenKey) &&
+        if (finished && !WCRBool(cell, kWCROpenKey) &&
             !WCRBool(cell, kWCRTrackingKey)) {
             actionView.hidden = YES;
             [button setTitle:@"" forState:UIControlStateNormal];
@@ -543,6 +550,9 @@ static void WCRHardResetCellVisual(UITableViewCell *cell,
     WCRSetBool(cell, kWCROpenKey, NO);
     WCRSetBool(cell, kWCRTrackingKey, NO);
     WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
+    WCRSetBool(cell, kWCRReturnArmedKey, NO);
+    objc_setAssociatedObject(cell, kWCRSwipeIntentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    actionView.backgroundColor = [UIColor clearColor];
 
     // The next row/session that occupies this reusable cell must establish a
     // fresh baseline. Keeping a transform captured for the previous row is
@@ -571,6 +581,9 @@ static void WCROpenCell(UITableViewCell *cell) {
     WCRSetBool(cell, kWCROpenKey, YES);
     WCRSetBool(cell, kWCRTrackingKey, NO);
     WCRSetFloat(cell, kWCRStartOffsetKey, kWCRActionWidth);
+    WCRSetBool(cell, kWCRReturnArmedKey, NO);
+    actionView.backgroundColor = [UIColor clearColor];
+    WCRLayoutAction(cell);
 
     [UIView animateWithDuration:0.24
                           delay:0.0
@@ -753,17 +766,13 @@ static NSArray<WCRefineGroup *> *WCRAvailableGroupsForScope(NSUInteger scope) {
     return groups;
 }
 
-static void WCRRefreshHome(id host, NSString *reason, WCRAFAccountContext *context) {
+static void WCRRefreshHome(__unused id host, __unused NSString *reason, WCRAFAccountContext *context) {
     if (![WCRAFStore() isCurrentContext:context]) return;
     [[NSNotificationCenter defaultCenter]
         postNotificationName:kWCRHomeGroupsDidChangeNotification
                       object:nil];
 
-    if ([WCRAFStore() isCurrentContext:context] &&
-        [host respondsToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)]) {
-        [(NewMainFrameViewController *)host
-            wcrGrouping_scheduleRefreshForTrigger:(reason ?: @"active_front")];
-    }
+    // The host notification already schedules a refresh. Do not request it twice.
 }
 
 static void WCRRefreshHomeDeferred(id host, NSString *reason, WCRAFAccountContext *context) {
@@ -785,8 +794,7 @@ static void WCRRefreshHomeGlobal(__unused NSString *reason, WCRAFAccountContext 
 #pragma mark - Hold expiry (v1.9.7)
 
 // Hold expiry never uses timers. It is evaluated lazily for Held sessions
-// inside WCRefine's own refresh pass (which ActiveFront already triggers on
-// every home appearance), so the cost is a few date comparisons per refresh.
+// inside WCRefine's own refresh pass.
 
 // Time of the session's latest message (seconds since 1970), 0 if unknown.
 static NSTimeInterval WCRSessionLastMessageTime(id session) {
@@ -826,6 +834,25 @@ static NSInteger WCRSessionUnreadCount(id native) {
     } @catch (__unused NSException *exception) {
         return -1;
     }
+}
+
+static NSInteger WCRSessionBooleanFlag(id native, NSString *key) {
+    @try {
+        id value = [native valueForKey:key];
+        if (![value isKindOfClass:[NSNumber class]]) return -1;
+        double flag = [value doubleValue];
+        return flag == 0 ? 0 : (flag == 1 ? 1 : -1);
+    } @catch (__unused NSException *exception) {
+        return -1;
+    }
+}
+
+static BOOL WCRSessionAllowsAutomaticActivity(id native, NSUInteger scope) {
+    // These are the supplied host's own unread-policy/folded-session flags.
+    // Do not fetch every room's contact or maintain a stale mute cache.
+    return WCRAFAllowsAutomaticActivity(scope,
+        scope == 2 ? WCRSessionBooleanFlag(native, @"m_bShowUnReadAsRedDot") : -1,
+        WCRSessionBooleanFlag(native, @"m_isFolding"));
 }
 
 // Expired = no new message for N days since max(保持 time, last message).
@@ -938,74 +965,33 @@ static NewMainFrameViewController *WCRActivityHomeController(void) {
     return homeClass && [top isKindOfClass:homeClass] ? (id)top : nil;
 }
 
-static NSTimer *gWCRActivityTimer;
-static NSTimeInterval gWCRActivityTimerDeadline;
-static WCRAFAccountContext *gWCRActivityTimerContext;
-
-static void WCRCancelActivityTimer(void) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ WCRCancelActivityTimer(); });
-        return;
-    }
-    [gWCRActivityTimer invalidate];
-    gWCRActivityTimer = nil;
-    gWCRActivityTimerDeadline = 0;
-    gWCRActivityTimerContext = nil;
-}
-
-static void WCRUpdateActivityTimer(WCRAFAccountContext *context) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ WCRUpdateActivityTimer(context); });
-        return;
-    }
-    if (![WCRAFStore() isCurrentContext:context] || !WCRActivityHomeController()) {
-        WCRCancelActivityTimer();
-        return;
-    }
-    NSTimeInterval deadline = [WCRAFStore() nextMessageActivityDeadlineForContext:context];
-    if (gWCRActivityTimer && gWCRActivityTimerDeadline == deadline &&
-        gWCRActivityTimerContext == context) return;
-    WCRCancelActivityTimer();
-    if (deadline <= 0) return;
-    gWCRActivityTimerDeadline = deadline;
-    gWCRActivityTimerContext = context;
-    gWCRActivityTimer = [NSTimer timerWithTimeInterval:
-        MAX(0.1, deadline - [[NSDate date] timeIntervalSince1970])
-        repeats:NO block:^(__unused NSTimer *timer) {
-        WCRCancelActivityTimer();
-        if (![WCRAFStore() isCurrentContext:context]) return;
-        NewMainFrameViewController *home = WCRActivityHomeController();
-        if (home) WCRRefreshHome(home, @"active_front_read_grace_expired", context);
-    }];
-    gWCRActivityTimer.tolerance = 0.5;
-    [[NSRunLoop mainRunLoop] addTimer:gWCRActivityTimer forMode:NSRunLoopCommonModes];
-}
-
 // Coalesce a complete grouping pass, then resolve the latest session again.
 // The predicate must not persist state or recurse into a home refresh.
-static NSMutableDictionary<NSString *, WCRAFAccountContext *> *gWCRActivityObservations;
+static NSMutableDictionary<NSString *, NSDictionary *> *gWCRActivityObservations;
 static BOOL gWCRActivityObservationScheduled;
 
-static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountContext *context) {
+static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountContext *context,
+                                           BOOL projectedActive) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            WCRScheduleActivityObservation(username, context);
+            WCRScheduleActivityObservation(username, context, projectedActive);
         });
         return;
     }
     if (username.length == 0 || ![WCRAFStore() isCurrentContext:context]) return;
     if (!gWCRActivityObservations) gWCRActivityObservations = [NSMutableDictionary dictionary];
-    gWCRActivityObservations[username] = context;
+    gWCRActivityObservations[username] = @{@"context": context, @"active": @(projectedActive)};
     if (gWCRActivityObservationScheduled) return;
     gWCRActivityObservationScheduled = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
         NSDictionary *observations = [gWCRActivityObservations copy];
         [gWCRActivityObservations removeAllObjects];
         gWCRActivityObservationScheduled = NO;
-        BOOL changed = NO;
+        BOOL projectionChanged = NO;
         WCRAFAccountContext *current = [WCRAFStore() currentContext];
         for (NSString *name in observations) {
-            WCRAFAccountContext *captured = observations[name];
+            NSDictionary *observation = observations[name];
+            WCRAFAccountContext *captured = observation[@"context"];
             if (![WCRAFStore() isCurrentContext:captured]) continue;
             @try {
                 WCRefineGroupDataProvider *provider = WCRDataProvider();
@@ -1014,19 +1000,43 @@ static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountConte
                 id native = [provider nativeSessionFromObject:latest] ?: latest;
                 if (!native || ![[provider usernameForNativeObject:native] isEqualToString:name]) continue;
                 NSUInteger scope = [provider groupScopeForNativeSession:native];
-                if (scope != 1 && scope != 2) continue;
-                changed |= [WCRAFStore() observeMessageActivity:name context:captured
-                    lastMessageTime:WCRSessionLastMessageTime(native)
-                    unreadCount:WCRSessionUnreadCount(native)
-                    grouped:WCRIsInCustomGroup(name)
-                    homeVisible:WCRActivityHomeController() != nil];
+                BOOL grouped = WCRIsInCustomGroup(name);
+                BOOL held = [WCRAFStore() isHeld:name context:captured];
+                BOOL allowed = WCRSessionAllowsAutomaticActivity(native, scope);
+                NSTimeInterval message = WCRSessionLastMessageTime(native);
+                NSInteger unread = WCRSessionUnreadCount(native);
+                if (!allowed || !grouped || held) {
+                    [WCRAFStore() discardMessageActivity:name context:captured];
+                } else {
+                    [WCRAFStore() observeMessageActivity:name context:captured
+                        lastMessageTime:message unreadCount:unread grouped:grouped
+                        homeVisible:WCRActivityHomeController() != nil];
+                }
+                BOOL active = allowed && grouped &&
+                    [WCRAFStore() isMessageActive:name context:captured
+                        lastMessageTime:message unreadCount:unread grouped:grouped];
+                if (!held && grouped && active != [observation[@"active"] boolValue]) {
+                    projectionChanged = YES;
+                }
             } @catch (__unused NSException *exception) {
                 // Unknown session/read state never initiates a return.
             }
         }
-        if (changed) WCRRefreshHomeGlobal(@"active_front_message_activity", current);
-        WCRUpdateActivityTimer(current);
+        // Persisting new-message state alone does not change the projection.
+        // Only a visibility transition requests the host's structural refresh.
+        NewMainFrameViewController *home = WCRActivityHomeController();
+        if (projectionChanged && home && [WCRAFStore() isCurrentContext:current] &&
+            [home respondsToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)]) {
+            [home wcrGrouping_scheduleRefreshForTrigger:@"groupsChanged"];
+        }
     });
+}
+
+static void WCRReconcileTrackedActivity(WCRAFAccountContext *context) {
+    // Home return/foreground events inspect only tracked conversations, not history.
+    for (NSString *name in [WCRAFStore() trackedMessageActivityUsernamesForContext:context]) {
+        WCRScheduleActivityObservation(name, context, YES);
+    }
 }
 
 static BOOL WCRIsMessageActiveSession(id session, NSString *username,
@@ -1039,12 +1049,21 @@ static BOOL WCRIsMessageActiveSession(id session, NSString *username,
         if (!provider) return NO;
         NSUInteger scope = [provider groupScopeForNativeSession:native];
         if (scope != 1 && scope != 2) return NO;
+        BOOL grouped = WCRIsInCustomGroup(username);
+        BOOL tracked = [WCRAFStore() hasTrackedMessageActivity:username context:context];
+        if (!WCRSessionAllowsAutomaticActivity(native, scope) || !grouped ||
+            [WCRAFStore() isHeld:username context:context]) {
+            if (tracked) WCRScheduleActivityObservation(username, context, NO);
+            return NO;
+        }
+        NSTimeInterval message = WCRSessionLastMessageTime(native);
+        NSInteger unread = WCRSessionUnreadCount(native);
         BOOL active = [WCRAFStore() isMessageActive:username context:context
-                            lastMessageTime:WCRSessionLastMessageTime(native)
-                            unreadCount:WCRSessionUnreadCount(native)
-                            grouped:WCRIsInCustomGroup(username)];
-        if (active || [WCRAFStore() hasTrackedMessageActivity:username context:context]) {
-            WCRScheduleActivityObservation(username, context);
+                            lastMessageTime:message unreadCount:unread grouped:grouped];
+        if ([WCRAFStore() needsMessageActivityObservation:username context:context
+                lastMessageTime:message unreadCount:unread grouped:grouped
+                homeVisible:WCRActivityHomeController() != nil]) {
+            WCRScheduleActivityObservation(username, context, active);
         }
         return active;
     } @catch (__unused NSException *exception) {
@@ -1818,6 +1837,9 @@ static void WCRSuppressOurActionForLeftMenu(UITableViewCell *cell) {
     WCRSetBool(cell, kWCROpenKey, NO);
     WCRSetBool(cell, kWCRTrackingKey, NO);
     WCRSetFloat(cell, kWCRStartOffsetKey, 0.0);
+    WCRSetBool(cell, kWCRReturnArmedKey, NO);
+    objc_setAssociatedObject(cell, kWCRSwipeIntentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    actionView.backgroundColor = [UIColor clearColor];
 }
 
 
@@ -1883,36 +1905,6 @@ static BOOL WCRPanLatchedForNativeClose(UIGestureRecognizer *gestureRecognizer) 
 
 #pragma mark - Hold expiry picker (v1.9.7)
 
-static void WCRPresentReadGracePicker(id host, UITableView *tableView,
-                                      NSIndexPath *indexPath, WCRAFAccountContext *context) {
-    if (![WCRAFStore() isCurrentContext:context]) return;
-    UIViewController *presenter = WCRPresenterForHost(host);
-    if (!presenter) return;
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"阅读后缓冲"
-        message:@"好友和群聊有新消息会临时显示在主页。未读时不回组；已读并返回主页后开始缓冲，期间可右滑保持。未分组的会话不自动收回。"
-        preferredStyle:UIAlertControllerStyleActionSheet];
-    NSInteger current = [WCRAFStore() readGraceMinutesForContext:context];
-    __weak id weakHost = host;
-    for (NSNumber *option in @[@5, @15, @30]) {
-        NSInteger minutes = option.integerValue;
-        NSString *label = [NSString stringWithFormat:@"%@%ld 分钟%@",
-            minutes == current ? @"✓ " : @"", (long)minutes, minutes == 15 ? @"（默认）" : @""];
-        [sheet addAction:[UIAlertAction actionWithTitle:label style:UIAlertActionStyleDefault
-            handler:^(__unused UIAlertAction *action) {
-            if (![WCRAFStore() setReadGraceMinutes:minutes context:context]) return;
-            WCRRefreshHomeDeferred(weakHost, @"active_front_read_grace_changed", context);
-        }]];
-    }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    if (sheet.popoverPresentationController) {
-        UITableViewCell *cell = indexPath ? [tableView cellForRowAtIndexPath:indexPath] : nil;
-        sheet.popoverPresentationController.sourceView = cell ?: presenter.view;
-        sheet.popoverPresentationController.sourceRect = cell ? cell.bounds : presenter.view.bounds;
-    }
-    if (![WCRAFStore() isCurrentContext:context]) return;
-    [presenter presentViewController:sheet animated:YES completion:nil];
-}
-
 // Long-press on 保持 / 回组. The chosen period applies to all Held sessions.
 // From 保持, choosing a period also keeps this session.
 static void WCRPresentHoldExpiryPicker(id host,
@@ -1925,8 +1917,8 @@ static void WCRPresentHoldExpiryPicker(id host,
     if (!presenter) return;
 
     NSString *message = keepUsername.length > 0 ?
-        @"手动保持的会话超过所选天数没有新消息，会自动回到原分组；不影响阅读后缓冲。仅对当前账号生效。\n选择后同时保持此会话。" :
-        @"手动保持的会话超过所选天数没有新消息，会自动回到原分组；不影响阅读后缓冲。仅对当前账号生效。";
+        @"手动保持的会话超过所选天数没有新消息，会自动回到原分组。仅对当前账号生效。\n选择后同时保持此会话。" :
+        @"手动保持的会话超过所选天数没有新消息，会自动回到原分组。仅对当前账号生效。";
 
     UIAlertController *sheet =
         [UIAlertController alertControllerWithTitle:@"保持期限"
@@ -1965,15 +1957,6 @@ static void WCRPresentHoldExpiryPicker(id host,
     }
 
     __weak UIAlertController *weakSheet = sheet;
-    NSString *graceLabel = [NSString stringWithFormat:@"阅读后缓冲：%ld 分钟…",
-        (long)[WCRAFStore() readGraceMinutesForContext:context]];
-    [sheet addAction:[UIAlertAction actionWithTitle:graceLabel style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *action) {
-        [weakSheet dismissViewControllerAnimated:YES completion:^{
-            WCRPresentReadGracePicker(weakHost, tableView, indexPath, context);
-        }];
-    }]];
-
     [sheet addAction:
         [UIAlertAction actionWithTitle:@"导入旧版保持记录…"
                                  style:UIAlertActionStyleDefault
@@ -2024,6 +2007,168 @@ static void WCRPresentHoldExpiryPicker(id host,
 
 #pragma mark - Controller
 
+// Animate disposable pictures, never change WeChat's row counts or row heights.
+// The host may reuse/reorder real cells while this short visual transition runs.
+static UIView *gWCRReturnOverlay;
+static WCRAFAccountContext *gWCRReturnAnimationContext;
+
+static void WCRCancelReturnAnimation(void) {
+    UIView *overlay = gWCRReturnOverlay;
+    gWCRReturnOverlay = nil;
+    gWCRReturnAnimationContext = nil;
+    [overlay.layer removeAllAnimations];
+    [overlay removeFromSuperview];
+}
+
+static BOOL WCRSwipeStillMatches(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
+    if (!intent || ![WCRAFStore() isCurrentContext:intent.context]) return NO;
+    NSString *username = nil;
+    WCRRightActionKind kind = WCRActionKindForCell(cell, NULL, NULL, NULL, NULL, &username);
+    WCRAFAccountContext *context = objc_getAssociatedObject(cell, kWCRCanonicalAccountKey);
+    return kind != WCRRightActionNone &&
+        [intent matchesUsername:username context:context
+            grouped:kind != WCRRightActionGroup held:kind == WCRRightActionReturn] &&
+        [WCRAFStore() isCurrentContext:context];
+}
+
+static void WCRUpdateSwipeAppearance(UITableViewCell *cell, WCRAFSwipeIntent *intent,
+                                     CGFloat distance) {
+    BOOL armed = [intent shouldReturnAtDistance:distance rowWidth:CGRectGetWidth(cell.bounds)
+        actionWidth:kWCRActionWidth ended:YES];
+    BOOL previouslyArmed = WCRBool(cell, kWCRReturnArmedKey);
+    WCRSetBool(cell, kWCRReturnArmedKey, armed);
+    UIButton *button = objc_getAssociatedObject(cell, kWCRButtonKey);
+    if (armed) {
+        [button setTitle:@"松手回组" forState:UIControlStateNormal];
+        [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    } else {
+        WCRApplyActionKindToCell(cell, intent.grouped ?
+            (intent.held ? WCRRightActionReturn : WCRRightActionKeep) : WCRRightActionGroup);
+    }
+    WCRLayoutAction(cell);
+    if (armed && !previouslyArmed) {
+        UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc]
+            initWithStyle:UIImpactFeedbackStyleLight];
+        [feedback impactOccurred];
+    }
+}
+
+static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
+    if (!WCRSwipeStillMatches(cell, intent) || !intent.grouped) {
+        WCRCloseCell(cell, YES);
+        return;
+    }
+    UITableView *table = WCRTableForCell(cell);
+    UIView *container = table.superview;
+    id host = WCRHomeControllerForTable(table);
+    if (!container || !cell.window || !WCRActivityHomeController()) {
+        WCRCloseCell(cell, YES);
+        return;
+    }
+    // Re-fetch native data before mutation; a captured row alone is not authority.
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    id latest = nil;
+    @try {
+        latest = [provider fulfilledSessionForUsername:intent.username fallback:nil];
+        latest = [provider nativeSessionFromObject:latest] ?: latest;
+        NSString *name = nil;
+        BOOL grouped = NO, held = NO;
+        if (!WCRResolveSessionState(latest, &name, &grouped, &held) ||
+            ![intent matchesUsername:name context:[WCRAFStore() currentContext]
+                grouped:grouped held:held] || !WCRSwipeStillMatches(cell, intent)) {
+            WCRCloseCell(cell, YES);
+            return;
+        }
+    } @catch (__unused NSException *exception) {
+        WCRCloseCell(cell, YES);
+        return;
+    }
+
+    BOOL reduceMotion = UIAccessibilityIsReduceMotionEnabled();
+    UIView *overlay = nil, *upper = nil, *lower = nil, *moving = nil, *band = nil;
+    CGRect visible = table.bounds;
+    CGRect row = [cell convertRect:cell.bounds toView:table];
+    CGFloat cutTop = MAX(CGRectGetMinY(visible), CGRectGetMinY(row));
+    CGFloat cutBottom = MIN(CGRectGetMaxY(visible), CGRectGetMaxY(row));
+    CGFloat removedHeight = cutBottom - cutTop;
+    CGFloat rowY = cutTop - CGRectGetMinY(visible);
+    if (!reduceMotion && removedHeight > 1.0) {
+        overlay = [[UIView alloc] initWithFrame:[table convertRect:visible toView:container]];
+        overlay.clipsToBounds = YES;
+        overlay.backgroundColor = table.backgroundColor ?: [UIColor systemBackgroundColor];
+        // Keep this brief transition stationary and avoid touches on stale pictures.
+        overlay.userInteractionEnabled = YES;
+        CGRect upperRect = CGRectMake(CGRectGetMinX(visible), CGRectGetMinY(visible),
+            CGRectGetWidth(visible), rowY);
+        CGRect lowerRect = CGRectMake(CGRectGetMinX(visible), cutBottom,
+            CGRectGetWidth(visible), CGRectGetMaxY(visible) - cutBottom);
+        if (upperRect.size.height > 0) {
+            upper = [table resizableSnapshotViewFromRect:upperRect afterScreenUpdates:NO
+                withCapInsets:UIEdgeInsetsZero];
+            upper.frame = CGRectMake(0, 0, upperRect.size.width, upperRect.size.height);
+            if (upper) [overlay addSubview:upper];
+        }
+        if (lowerRect.size.height > 0) {
+            lower = [table resizableSnapshotViewFromRect:lowerRect afterScreenUpdates:NO
+                withCapInsets:UIEdgeInsetsZero];
+            lower.frame = CGRectMake(0, rowY + removedHeight,
+                lowerRect.size.width, lowerRect.size.height);
+            if (lower) [overlay addSubview:lower];
+        }
+        band = [[UIView alloc] initWithFrame:CGRectMake(0, rowY,
+            CGRectGetWidth(visible), removedHeight)];
+        band.backgroundColor = [UIColor systemGreenColor];
+        [overlay addSubview:band];
+        moving = [cell.contentView snapshotViewAfterScreenUpdates:NO];
+        moving.frame = [cell.contentView convertRect:cell.contentView.bounds toView:table];
+        CGRect movingFrame = moving.frame;
+        movingFrame.origin.x -= visible.origin.x;
+        movingFrame.origin.y -= visible.origin.y;
+        moving.frame = movingFrame;
+        if (moving) [overlay addSubview:moving];
+        // Missing pictures should degrade to the normal host refresh.
+        if (!moving || (upperRect.size.height > 0 && !upper) ||
+            (lowerRect.size.height > 0 && !lower)) overlay = nil;
+    }
+    WCRCancelReturnAnimation();
+    // Commit once, on release. No animation callback is allowed to change state.
+    if (![WCRAFStore() setHeld:NO username:intent.username context:intent.context]) {
+        WCRCloseCell(cell, YES);
+        return;
+    }
+    if (overlay) {
+        gWCRReturnOverlay = overlay;
+        gWCRReturnAnimationContext = intent.context;
+        [container addSubview:overlay];
+    }
+    WCRCloseCell(cell, NO);
+    WCRRefreshHome(host, @"active_front_swipe_return", intent.context);
+    if (!overlay || gWCRReturnOverlay != overlay) return;
+    [UIView animateWithDuration:0.16 delay:0 options:UIViewAnimationOptionCurveEaseOut
+        animations:^{
+        CGRect frame = moving.frame;
+        frame.origin.x = CGRectGetWidth(overlay.bounds);
+        moving.frame = frame;
+    } completion:^(BOOL finished) {
+        if (gWCRReturnOverlay != overlay) return;
+        if (!finished || ![WCRAFStore() isCurrentContext:intent.context] ||
+            !WCRActivityHomeController()) {
+            WCRCancelReturnAnimation();
+            return;
+        }
+        [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionCurveEaseInOut
+            animations:^{
+            CGRect frame = lower.frame;
+            frame.origin.y -= removedHeight;
+            lower.frame = frame;
+            CGRect bandFrame = band.frame;
+            bandFrame.size.height = 0;
+            band.frame = bandFrame;
+        } completion:^(__unused BOOL collapsed) {
+            if (gWCRReturnOverlay == overlay) WCRCancelReturnAnimation();
+        }];
+    }];
+}
 
 
 
@@ -2060,6 +2205,7 @@ static void WCRPresentHoldExpiryPicker(id host,
 
     UITableView *tableView = WCRTableForCell(cell);
     if (!WCRIsActiveFrontHomeTable(tableView)) return NO;
+    if (gWCRReturnOverlay) return NO;
 
     CGPoint velocity = [pan velocityInView:cell];
 
@@ -2150,10 +2296,17 @@ static void WCRPresentHoldExpiryPicker(id host,
                 break;
             }
 
-            if (!WCRPrepareActionForCell(cell)) {
+            NSString *username = nil;
+            WCRRightActionKind kind = WCRActionKindForCell(cell, NULL, NULL, NULL, NULL, &username);
+            WCRAFAccountContext *context = objc_getAssociatedObject(cell, kWCRCanonicalAccountKey);
+            if (kind == WCRRightActionNone || ![WCRAFStore() isCurrentContext:context] ||
+                !WCRApplyActionKindToCell(cell, kind)) {
                 WCRCloseCell(cell, NO);
                 break;
             }
+            WCRAFSwipeIntent *intent = [[WCRAFSwipeIntent alloc] initWithUsername:username
+                context:context grouped:kind != WCRRightActionGroup held:kind == WCRRightActionReturn];
+            objc_setAssociatedObject(cell, kWCRSwipeIntentKey, intent, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
             WCRCloseOtherCells(cell);
             WCRLayoutAction(cell);
@@ -2177,20 +2330,22 @@ static void WCRPresentHoldExpiryPicker(id host,
         }
 
         case UIGestureRecognizerStateChanged: {
+            WCRAFSwipeIntent *intent = objc_getAssociatedObject(cell, kWCRSwipeIntentKey);
+            if (!WCRBool(cell, kWCRTrackingKey) || !WCRSwipeStillMatches(cell, intent)) {
+                WCRCloseCell(cell, NO);
+                break;
+            }
             CGFloat x = WCRFloat(cell, kWCRStartOffsetKey) + translation.x;
 
             if (x < 0.0) {
                 x = 0.0;
             }
 
-            // Fixed-width action. Beyond the action width only a small
-            // rubber-band movement is permitted.
-            if (x > kWCRActionWidth) {
-                CGFloat extra = (x - kWCRActionWidth) * 0.16;
-                x = kWCRActionWidth + MIN(extra, 12.0);
-            }
+            // Ungrouped rows stop exactly at their sole, valid action.
+            x = MIN(x, intent.grouped ? CGRectGetWidth(cell.bounds) : kWCRActionWidth);
 
             WCRSetContentOffset(cell, x);
+            WCRUpdateSwipeAppearance(cell, intent, x);
             break;
         }
 
@@ -2200,12 +2355,24 @@ static void WCRPresentHoldExpiryPicker(id host,
             // Our translation is relative to WeChat's captured baseline.
             // Using the absolute tx can misclassify the gesture when WeChat
             // already applies its own transform to the cell content view.
-            CGFloat currentX =
-                cell.contentView.transform.tx - WCRBaseTransform(cell).tx;
+            WCRAFSwipeIntent *intent = objc_getAssociatedObject(cell, kWCRSwipeIntentKey);
+            CGFloat currentX = MAX(0, WCRFloat(cell, kWCRStartOffsetKey) + translation.x);
             BOOL cancelled =
                 (pan.state == UIGestureRecognizerStateCancelled ||
                  pan.state == UIGestureRecognizerStateFailed);
 
+            if (!WCRBool(cell, kWCRTrackingKey) || !WCRSwipeStillMatches(cell, intent)) {
+                WCRCloseCell(cell, NO);
+                break;
+            }
+            if ([intent shouldReturnAtDistance:currentX rowWidth:CGRectGetWidth(cell.bounds)
+                    actionWidth:kWCRActionWidth ended:!cancelled]) {
+                WCRAnimateReturn(cell, intent);
+                break;
+            }
+            objc_setAssociatedObject(cell, kWCRSwipeIntentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            WCRApplyActionKindToCell(cell, intent.grouped ?
+                (intent.held ? WCRRightActionReturn : WCRRightActionKeep) : WCRRightActionGroup);
             BOOL shouldOpen = NO;
             if (!cancelled) {
                 shouldOpen =
@@ -2489,7 +2656,13 @@ static void WCRAttachToCell(UITableViewCell *cell) {
     }
 
     WCRLayoutAction(cell);
-    WCRApplyActionKindToCell(cell, currentKind);
+    WCRAFSwipeIntent *intent = objc_getAssociatedObject(cell, kWCRSwipeIntentKey);
+    if (WCRBool(cell, kWCRTrackingKey) && WCRSwipeStillMatches(cell, intent)) {
+        CGFloat distance = cell.contentView.transform.tx - WCRBaseTransform(cell).tx;
+        WCRUpdateSwipeAppearance(cell, intent, distance);
+    } else {
+        WCRApplyActionKindToCell(cell, currentKind);
+    }
 
     // Reconcile the visual state on every scan. A valid action title does not
     // mean its view should be visible: closed rows must always keep the action
@@ -2600,6 +2773,13 @@ static BOOL hook_shouldExclude(id self, SEL _cmd, id session) {
         }
     }
 
+    // Explicit return must override the host's old unread fallback too.
+    // It changes only projection, never the unread count or group membership.
+    if (username.length > 0 && !WCRIsSyntheticGroupEntryUsername(username) &&
+        WCRIsInCustomGroup(username) &&
+        [WCRAFStore() isMessageReturnSuppressed:username context:context
+            lastMessageTime:WCRSessionLastMessageTime(session)]) return NO;
+
     if (!WCRRealExcludeUnreadEnabled()) {
         return NO;
     }
@@ -2629,19 +2809,14 @@ static void hook_activeViewDidAppear(id self,
         orig_activeViewDidAppear(self, _cmd, animated);
     }
 
-    BOOL stateChanged = WCRPruneStaleActiveFrontState();
-
-    // Re-evaluate read state after returning from chat. This starts the grace
-    // window here, not while the user is still in the conversation.
-    if (stateChanged || context || WCRHasAnyHeld()) {
-        WCRRefreshHomeDeferred(self,
-                               @"active_front_home_appear", [WCRAFStore() currentContext]);
-    }
-    WCRUpdateActivityTimer([WCRAFStore() currentContext]);
+    WCRPruneStaleActiveFrontState();
+    // The original host owns discovery/refresh. Only reconcile tracked rows
+    // here so a fresh cached host snapshot cannot delay an observed read return.
+    WCRReconcileTrackedActivity([WCRAFStore() currentContext]);
 }
 
 static void hook_activeViewWillDisappear(id self, SEL _cmd, BOOL animated) {
-    WCRCancelActivityTimer();
+    WCRCancelReturnAnimation();
     if (orig_activeViewWillDisappear) orig_activeViewWillDisappear(self, _cmd, animated);
 }
 
@@ -2900,14 +3075,19 @@ static void WCRRightGroupUIInit(void) {
             WCRInvalidateGroupIndex();
             WCRAFAccountContext *context = [WCRAFStore() currentContext];
             if (context) [WCRAFStore() cancelPendingForContext:context];
-            WCRUpdateActivityTimer(context);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (gWCRReturnAnimationContext &&
+                    ![WCRAFStore() isCurrentContext:gWCRReturnAnimationContext]) {
+                    WCRCancelReturnAnimation();
+                }
+            });
         }];
 
         static id resignObserver __attribute__((unused));
         resignObserver = [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationWillResignActiveNotification object:nil
             queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *notification) {
-            WCRCancelActivityTimer();
+            WCRCancelReturnAnimation();
         }];
         static id activeObserver __attribute__((unused));
         activeObserver = [[NSNotificationCenter defaultCenter]
@@ -2917,8 +3097,7 @@ static void WCRRightGroupUIInit(void) {
             WCRAFAccountContext *context = [WCRAFStore() currentContext];
             if (home && context) {
                 [WCRAFStore() enableMessageActivityForContext:context];
-                WCRRefreshHomeDeferred(home, @"active_front_app_active", context);
-                WCRUpdateActivityTimer(context);
+                WCRReconcileTrackedActivity(context);
             }
         }];
 
