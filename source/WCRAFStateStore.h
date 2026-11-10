@@ -5,6 +5,17 @@ NS_ASSUME_NONNULL_BEGIN
 // -1 means an unavailable native flag; rooms require a known unmuted state.
 FOUNDATION_EXPORT BOOL WCRAFAllowsAutomaticActivity(NSUInteger scope, NSInteger muted, NSInteger folded);
 
+typedef NS_ENUM(NSInteger, WCRAFNativeNotifyResult) {
+    WCRAFNativeNotifyUnavailable = 0,
+    WCRAFNativeNotifyInvoked,
+    WCRAFNativeNotifyRejected
+};
+
+// -1 is unknown. Invoked means the native method ran, not that state is confirmed.
+FOUNDATION_EXPORT NSInteger WCRAFReadNativeNotifyOpen(id _Nullable contact);
+FOUNDATION_EXPORT WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(
+    id _Nullable manager, id _Nullable contact, BOOL notify);
+
 @interface WCRAFAccountContext : NSObject
 @property(nonatomic, copy, readonly) NSString *account;
 @property(nonatomic, assign, readonly) uint64_t epoch;

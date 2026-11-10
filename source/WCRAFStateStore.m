@@ -1,8 +1,98 @@
 #import "WCRAFStateStore.h"
 #import <math.h>
+#import <string.h>
 
 static NSString * const WCRAFAccountKeyPrefix = @"com.local.wcrefine.activefront.account.v2.";
 static NSInteger const WCRAFDefaultExpiryDays = 3;
+
+static const char *WCRAFNativeType(const char *type) {
+    if (!type) return "";
+    while (*type && strchr("rnNoORV", *type)) type++;
+    return type;
+}
+
+static BOOL WCRAFNativeInteger(const char *type) {
+    type = WCRAFNativeType(type);
+    return *type && strchr("BcCsSiIlLqQ", *type) != NULL;
+}
+
+static uint64_t WCRAFNativeIntegerResult(NSInvocation *call) {
+    switch (*WCRAFNativeType(call.methodSignature.methodReturnType)) {
+#define WCRAF_READ_RESULT(code, nativeType) \
+        case code: { nativeType value = 0; [call getReturnValue:&value]; return (uint64_t)value; }
+        WCRAF_READ_RESULT('B', BOOL)
+        WCRAF_READ_RESULT('c', signed char)
+        WCRAF_READ_RESULT('C', unsigned char)
+        WCRAF_READ_RESULT('s', short)
+        WCRAF_READ_RESULT('S', unsigned short)
+        WCRAF_READ_RESULT('i', int)
+        WCRAF_READ_RESULT('I', unsigned int)
+        WCRAF_READ_RESULT('l', long)
+        WCRAF_READ_RESULT('L', unsigned long)
+        WCRAF_READ_RESULT('q', long long)
+        WCRAF_READ_RESULT('Q', unsigned long long)
+#undef WCRAF_READ_RESULT
+        default: return UINT64_MAX;
+    }
+}
+
+static void WCRAFSetNativeFlag(NSInvocation *call, NSUInteger index, BOOL flag) {
+    switch (*WCRAFNativeType([call.methodSignature getArgumentTypeAtIndex:index])) {
+#define WCRAF_SET_FLAG(code, nativeType) \
+        case code: { nativeType value = flag ? 1 : 0; [call setArgument:&value atIndex:index]; break; }
+        WCRAF_SET_FLAG('B', BOOL)
+        WCRAF_SET_FLAG('c', signed char)
+        WCRAF_SET_FLAG('C', unsigned char)
+        WCRAF_SET_FLAG('s', short)
+        WCRAF_SET_FLAG('S', unsigned short)
+        WCRAF_SET_FLAG('i', int)
+        WCRAF_SET_FLAG('I', unsigned int)
+        WCRAF_SET_FLAG('l', long)
+        WCRAF_SET_FLAG('L', unsigned long)
+        WCRAF_SET_FLAG('q', long long)
+        WCRAF_SET_FLAG('Q', unsigned long long)
+#undef WCRAF_SET_FLAG
+    }
+}
+
+NSInteger WCRAFReadNativeNotifyOpen(id contact) {
+    if (!contact) return -1;
+    @try {
+        SEL read = NSSelectorFromString(@"isChatStatusNotifyOpen");
+        NSMethodSignature *signature = [contact methodSignatureForSelector:read];
+        if (!signature || signature.numberOfArguments != 2 ||
+            !WCRAFNativeInteger(signature.methodReturnType)) return -1;
+        NSInvocation *call = [NSInvocation invocationWithMethodSignature:signature];
+        call.target = contact;
+        call.selector = read;
+        [call invoke];
+        uint64_t value = WCRAFNativeIntegerResult(call);
+        return value <= 1 ? (NSInteger)value : -1;
+    } @catch (__unused NSException *exception) { return -1; }
+}
+
+WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL notify) {
+    if (!manager || !contact) return WCRAFNativeNotifyUnavailable;
+    @try {
+        SEL change = NSSelectorFromString(@"ChangeNotifyStatus:withStatus:sync:");
+        NSMethodSignature *signature = [manager methodSignatureForSelector:change];
+        if (!signature || signature.numberOfArguments != 5 ||
+            *WCRAFNativeType([signature getArgumentTypeAtIndex:2]) != '@' ||
+            !WCRAFNativeInteger([signature getArgumentTypeAtIndex:3]) ||
+            !WCRAFNativeInteger([signature getArgumentTypeAtIndex:4])) return WCRAFNativeNotifyUnavailable;
+        BOOL voidResult = *WCRAFNativeType(signature.methodReturnType) == 'v';
+        if (!voidResult && !WCRAFNativeInteger(signature.methodReturnType)) return WCRAFNativeNotifyUnavailable;
+        NSInvocation *call = [NSInvocation invocationWithMethodSignature:signature];
+        call.target = manager;
+        call.selector = change;
+        [call setArgument:&contact atIndex:2];
+        WCRAFSetNativeFlag(call, 3, notify);
+        WCRAFSetNativeFlag(call, 4, YES);
+        [call invoke];
+        return !voidResult && WCRAFNativeIntegerResult(call) == 0 ?
+            WCRAFNativeNotifyRejected : WCRAFNativeNotifyInvoked;
+    } @catch (__unused NSException *exception) { return WCRAFNativeNotifyUnavailable; }
+}
 
 BOOL WCRAFAllowsAutomaticActivity(NSUInteger scope, NSInteger muted, NSInteger folded) {
     if (folded == 1) return NO;

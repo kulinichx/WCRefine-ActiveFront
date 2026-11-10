@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <math.h>
+#import <objc/runtime.h>
 #import "../WCRAFStateStore.h"
 
 static NSString * const Prefix = @"com.local.wcrefine.activefront.account.v2.";
@@ -13,6 +14,102 @@ static void Require(BOOL condition, const char *expression, int line) {
     }
 }
 #define CHECK(condition) Require((condition), #condition, __LINE__)
+
+@interface NativeNotifyState : NSObject
+@property(nonatomic) NSInteger value;
+@property(nonatomic) BOOL throwRead;
+@end
+@implementation NativeNotifyState
+@end
+
+// Real typed Objective-C methods exercise NSInvocation's native result widths.
+#define NATIVE_NOTIFY_READER(className, nativeType) \
+@interface className : NativeNotifyState \
+- (nativeType)isChatStatusNotifyOpen; \
+@end \
+@implementation className \
+- (nativeType)isChatStatusNotifyOpen { \
+    if (self.throwRead) [NSException raise:@"ReadFailure" format:@"fixture"]; \
+    return (nativeType)self.value; \
+} \
+@end
+NATIVE_NOTIFY_READER(NotifyBoolReader, BOOL)
+NATIVE_NOTIFY_READER(NotifyCharReader, signed char)
+NATIVE_NOTIFY_READER(NotifyUCharReader, unsigned char)
+NATIVE_NOTIFY_READER(NotifyShortReader, short)
+NATIVE_NOTIFY_READER(NotifyUShortReader, unsigned short)
+NATIVE_NOTIFY_READER(NotifyIntReader, int)
+NATIVE_NOTIFY_READER(NotifyUIntReader, unsigned int)
+NATIVE_NOTIFY_READER(NotifyLongReader, long)
+NATIVE_NOTIFY_READER(NotifyULongReader, unsigned long)
+NATIVE_NOTIFY_READER(NotifyLongLongReader, long long)
+NATIVE_NOTIFY_READER(NotifyULongLongReader, unsigned long long)
+NATIVE_NOTIFY_READER(NotifyFloatReader, double)
+#undef NATIVE_NOTIFY_READER
+
+@interface NativeNotifyManager : NSObject
+@property(nonatomic) NSUInteger calls;
+@property(nonatomic) long long response;
+@property(nonatomic) BOOL updatesState;
+@property(nonatomic) BOOL throwWrite;
+@property(nonatomic) BOOL notify;
+@property(nonatomic) BOOL sync;
+@property(nonatomic, strong) id receivedContact;
+- (void)recordContact:(NativeNotifyState *)contact notify:(BOOL)notify sync:(BOOL)sync;
+@end
+@implementation NativeNotifyManager
+- (instancetype)init {
+    self = [super init];
+    if (self) { _response = 1; _updatesState = YES; }
+    return self;
+}
+- (void)recordContact:(NativeNotifyState *)contact notify:(BOOL)notify sync:(BOOL)sync {
+    self.calls++;
+    self.receivedContact = contact;
+    self.notify = notify;
+    self.sync = sync;
+    if (self.throwWrite) [NSException raise:@"WriteFailure" format:@"fixture"];
+    if (self.updatesState) contact.value = notify ? 1 : 0;
+}
+@end
+
+#define NATIVE_NOTIFY_WRITER(className, resultType, statusType, syncType) \
+@interface className : NativeNotifyManager \
+- (resultType)ChangeNotifyStatus:(id)contact withStatus:(statusType)notify sync:(syncType)sync; \
+@end \
+@implementation className \
+- (resultType)ChangeNotifyStatus:(id)contact withStatus:(statusType)notify sync:(syncType)sync { \
+    [self recordContact:contact notify:notify != 0 sync:sync != 0]; \
+    return (resultType)self.response; \
+} \
+@end
+NATIVE_NOTIFY_WRITER(NotifyBoolWriter, BOOL, BOOL, BOOL)
+NATIVE_NOTIFY_WRITER(NotifyCharWriter, signed char, signed char, unsigned char)
+NATIVE_NOTIFY_WRITER(NotifyShortWriter, short, short, unsigned short)
+NATIVE_NOTIFY_WRITER(NotifyIntWriter, int, int, unsigned int)
+NATIVE_NOTIFY_WRITER(NotifyLongWriter, long, long, unsigned long)
+NATIVE_NOTIFY_WRITER(NotifyLongLongWriter, long long, long long, unsigned long long)
+NATIVE_NOTIFY_WRITER(NotifyUnsignedWriter, unsigned long long, unsigned char, unsigned long long)
+NATIVE_NOTIFY_WRITER(NotifyFloatResultWriter, double, BOOL, BOOL)
+NATIVE_NOTIFY_WRITER(NotifyFloatFlagWriter, int, double, BOOL)
+#undef NATIVE_NOTIFY_WRITER
+
+@interface NotifyVoidWriter : NativeNotifyManager
+- (void)ChangeNotifyStatus:(id)contact withStatus:(int)notify sync:(long long)sync;
+@end
+@implementation NotifyVoidWriter
+- (void)ChangeNotifyStatus:(id)contact withStatus:(int)notify sync:(long long)sync {
+    [self recordContact:contact notify:notify != 0 sync:sync != 0];
+}
+@end
+
+static int QualifiedNotifyRead(id self, __unused SEL cmd) {
+    return (int)[(NativeNotifyState *)self value];
+}
+static int QualifiedNotifyWrite(id self, __unused SEL cmd, id contact, int notify, unsigned long long sync) {
+    [(NativeNotifyManager *)self recordContact:contact notify:notify != 0 sync:sync != 0];
+    return (int)[(NativeNotifyManager *)self response];
+}
 
 // Real defaults storage with deterministic failures/reentrant callbacks.
 @interface FaultDefaults : NSUserDefaults
@@ -1338,6 +1435,143 @@ static void TwoActionsFitBeforeReturnThreshold(Fixture *f) {
     }
 }
 
+static void NativeNotifyReadsBooleanAndIntegerStates(Fixture *f) {
+    (void)f;
+    NSArray<NativeNotifyState *> *contacts = @[
+        [NotifyBoolReader new], [NotifyCharReader new], [NotifyUCharReader new],
+        [NotifyShortReader new], [NotifyUShortReader new], [NotifyIntReader new],
+        [NotifyUIntReader new], [NotifyLongReader new], [NotifyULongReader new],
+        [NotifyLongLongReader new], [NotifyULongLongReader new]];
+    for (NativeNotifyState *contact in contacts) {
+        contact.value = 0;
+        CHECK(WCRAFReadNativeNotifyOpen(contact) == 0);
+        contact.value = 1;
+        CHECK(WCRAFReadNativeNotifyOpen(contact) == 1);
+    }
+}
+
+static void NativeNotifyRejectsUnknownReadStates(Fixture *f) {
+    (void)f;
+    CHECK(WCRAFReadNativeNotifyOpen(nil) == -1);
+    CHECK(WCRAFReadNativeNotifyOpen([NSObject new]) == -1);
+    CHECK(WCRAFReadNativeNotifyOpen([NotifyFloatReader new]) == -1);
+    NotifyIntReader *contact = [NotifyIntReader new];
+    for (NSNumber *value in @[@(-1), @2, @255, @(NSIntegerMax)]) {
+        contact.value = value.integerValue;
+        CHECK(WCRAFReadNativeNotifyOpen(contact) == -1);
+    }
+    contact.throwRead = YES;
+    CHECK(WCRAFReadNativeNotifyOpen(contact) == -1);
+}
+
+static void NativeNotifyWritesIntegerReturnAndFlagWidths(Fixture *f) {
+    (void)f;
+    NSArray<NativeNotifyManager *> *managers = @[
+        [NotifyBoolWriter new], [NotifyCharWriter new], [NotifyShortWriter new],
+        [NotifyIntWriter new], [NotifyLongWriter new], [NotifyLongLongWriter new],
+        [NotifyUnsignedWriter new], [NotifyVoidWriter new]];
+    NotifyIntReader *contact = [NotifyIntReader new];
+    for (NativeNotifyManager *manager in managers) {
+        contact.value = 1;
+        CHECK(WCRAFInvokeNativeNotify(manager, contact, NO) == WCRAFNativeNotifyInvoked);
+        CHECK(manager.calls == 1 && manager.receivedContact == contact);
+        CHECK(!manager.notify && manager.sync);
+        CHECK(WCRAFReadNativeNotifyOpen(contact) == 0);
+        CHECK(WCRAFInvokeNativeNotify(manager, contact, YES) == WCRAFNativeNotifyInvoked);
+        CHECK(manager.calls == 2 && manager.notify && manager.sync);
+        CHECK(WCRAFReadNativeNotifyOpen(contact) == 1);
+    }
+}
+
+static void NativeNotifyPreservesWideReturnValues(Fixture *f) {
+    (void)f;
+    NotifyLongLongWriter *manager = [NotifyLongLongWriter new];
+    NotifyIntReader *contact = [NotifyIntReader new];
+    manager.response = 1LL << 40; // Low byte is zero; reading BOOL would misreport rejection.
+    CHECK(WCRAFInvokeNativeNotify(manager, contact, NO) == WCRAFNativeNotifyInvoked);
+    CHECK(manager.calls == 1);
+}
+
+static void NativeNotifyRejectsUnsupportedSignaturesBeforeWrite(Fixture *f) {
+    (void)f;
+    NotifyIntReader *contact = [NotifyIntReader new];
+    for (NativeNotifyManager *manager in @[[NotifyFloatResultWriter new], [NotifyFloatFlagWriter new]]) {
+        CHECK(WCRAFInvokeNativeNotify(manager, contact, NO) == WCRAFNativeNotifyUnavailable);
+        CHECK(manager.calls == 0);
+    }
+    CHECK(WCRAFInvokeNativeNotify([NSObject new], contact, NO) == WCRAFNativeNotifyUnavailable);
+    CHECK(WCRAFInvokeNativeNotify(nil, contact, NO) == WCRAFNativeNotifyUnavailable);
+    CHECK(WCRAFInvokeNativeNotify([NotifyIntWriter new], nil, NO) == WCRAFNativeNotifyUnavailable);
+}
+
+static void NativeNotifyRejectedCallDoesNotClaimSuccess(Fixture *f) {
+    (void)f;
+    NotifyIntWriter *manager = [NotifyIntWriter new];
+    NotifyIntReader *contact = [NotifyIntReader new];
+    manager.response = 0;
+    manager.updatesState = NO;
+    contact.value = 1;
+    CHECK(WCRAFInvokeNativeNotify(manager, contact, NO) == WCRAFNativeNotifyRejected);
+    CHECK(manager.calls == 1 && manager.sync);
+    CHECK(WCRAFReadNativeNotifyOpen(contact) == 1);
+}
+
+static void NativeNotifySubmissionStillRequiresStateConfirmation(Fixture *f) {
+    (void)f;
+    NotifyIntWriter *manager = [NotifyIntWriter new];
+    NotifyIntReader *contact = [NotifyIntReader new];
+    manager.updatesState = NO;
+    contact.value = 1;
+    CHECK(WCRAFInvokeNativeNotify(manager, contact, NO) == WCRAFNativeNotifyInvoked);
+    CHECK(WCRAFReadNativeNotifyOpen(contact) == 1);
+    contact.value = 0; // A later native event, without a plugin timer.
+    CHECK(WCRAFReadNativeNotifyOpen(contact) == 0);
+}
+
+static void NativeNotifyExceptionsPreserveNativeState(Fixture *f) {
+    (void)f;
+    NotifyIntWriter *manager = [NotifyIntWriter new];
+    NotifyIntReader *contact = [NotifyIntReader new];
+    manager.throwWrite = YES;
+    contact.value = 1;
+    CHECK(WCRAFInvokeNativeNotify(manager, contact, NO) == WCRAFNativeNotifyUnavailable);
+    CHECK(WCRAFReadNativeNotifyOpen(contact) == 1);
+}
+
+static void NativeNotifySupportsQualifiedIntegerEncodings(Fixture *f) {
+    (void)f;
+    Class reader = objc_allocateClassPair(NativeNotifyState.class, "WCRTestQualifiedNotifyReader", 0);
+    CHECK(reader != Nil);
+    CHECK(class_addMethod(reader, NSSelectorFromString(@"isChatStatusNotifyOpen"),
+        (IMP)QualifiedNotifyRead, "ri@:"));
+    objc_registerClassPair(reader);
+    NativeNotifyState *contact = [reader new];
+    contact.value = 1;
+    CHECK(WCRAFReadNativeNotifyOpen(contact) == 1);
+    Class writer = objc_allocateClassPair(NativeNotifyManager.class, "WCRTestQualifiedNotifyWriter", 0);
+    CHECK(writer != Nil);
+    CHECK(class_addMethod(writer, NSSelectorFromString(@"ChangeNotifyStatus:withStatus:sync:"),
+        (IMP)QualifiedNotifyWrite, "ri@:@rirQ"));
+    objc_registerClassPair(writer);
+    NativeNotifyManager *manager = [writer new];
+    CHECK(WCRAFInvokeNativeNotify(manager, contact, NO) == WCRAFNativeNotifyInvoked);
+    CHECK(manager.calls == 1 && !manager.notify && manager.sync);
+    CHECK(WCRAFReadNativeNotifyOpen(contact) == 0);
+}
+
+static void NativeNotifyVoidReturnStillRequiresReadback(Fixture *f) {
+    (void)f;
+    NotifyVoidWriter *manager = [NotifyVoidWriter new];
+    NotifyBoolReader *contact = [NotifyBoolReader new];
+    manager.updatesState = NO;
+    contact.value = 1;
+    CHECK(WCRAFInvokeNativeNotify(manager, contact, NO) == WCRAFNativeNotifyInvoked);
+    CHECK(WCRAFReadNativeNotifyOpen(contact) == 1);
+    manager.updatesState = YES;
+    CHECK(WCRAFInvokeNativeNotify(manager, contact, NO) == WCRAFNativeNotifyInvoked);
+    CHECK(WCRAFReadNativeNotifyOpen(contact) == 0);
+}
+
 int main(int argc, const char *argv[]) {
     if (argc > 2) return 2;
     struct Test { const char *name; void (*run)(Fixture *); } tests[] = {
@@ -1384,7 +1618,12 @@ int main(int argc, const char *argv[]) {
         TEST(PerConversationSettingsRejectInvalidAndFailedWrites), TEST(NewFieldsMalformedRemainUntouched),
         TEST(LedgerRequiresAcknowledgedLocalProvenance), TEST(LedgerMatchesClonedAcknowledgment),
         TEST(LedgerManualActionCancelsLateAck), TEST(LedgerAccountEpochIsolatesAcknowledgments),
-        TEST(LedgerBoundsPendingFailures), TEST(TwoActionsFitBeforeReturnThreshold)
+        TEST(LedgerBoundsPendingFailures), TEST(TwoActionsFitBeforeReturnThreshold),
+        TEST(NativeNotifyReadsBooleanAndIntegerStates), TEST(NativeNotifyRejectsUnknownReadStates),
+        TEST(NativeNotifyWritesIntegerReturnAndFlagWidths), TEST(NativeNotifyPreservesWideReturnValues),
+        TEST(NativeNotifyRejectsUnsupportedSignaturesBeforeWrite), TEST(NativeNotifyRejectedCallDoesNotClaimSuccess),
+        TEST(NativeNotifySubmissionStillRequiresStateConfirmation), TEST(NativeNotifyExceptionsPreserveNativeState),
+        TEST(NativeNotifySupportsQualifiedIntegerEncodings), TEST(NativeNotifyVoidReturnStillRequiresReadback)
 #undef TEST
     };
     int failed = 0;

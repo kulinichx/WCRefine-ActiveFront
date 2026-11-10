@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.15 native reminders and acknowledged outgoing activity.
+// WCRefine ActiveFront - v1.9.16 compact swipe actions and native reminder ABI repair.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -49,7 +49,8 @@
 #import <stdarg.h>
 #import <string.h>
 
-static const CGFloat kWCRActionWidth = 82.0;
+static const CGFloat kWCRActionWidth = 60.0;
+static const CGFloat kWCRReturnActionWidth = 82.0;
 
 static const void *kWCRPanKey          = &kWCRPanKey;
 static const void *kWCRActionViewKey   = &kWCRActionViewKey;
@@ -74,7 +75,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.15-source";
+static NSString * const kWCRAFVersion = @"1.9.16-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -346,21 +347,20 @@ static id WCRObjectResult(id receiver, NSString *selectorName) {
     return ((id (*)(id, SEL))[receiver methodForSelector:selector])(receiver, selector);
 }
 
-static NSInteger WCRContactMuted(NSString *username) {
+static id WCRContactForUsername(NSString *username) {
     @try {
         Class helper = NSClassFromString(@"WCRefineChatRoomMuteHelper");
         SEL lookup = NSSelectorFromString(@"wcr_contactForName:");
         NSMethodSignature *sig = [helper methodSignatureForSelector:lookup];
         if (sig.numberOfArguments != 3 || sig.methodReturnType[0] != '@' ||
-            [sig getArgumentTypeAtIndex:2][0] != '@') return -1;
-        id contact = ((id (*)(id, SEL, id))[helper methodForSelector:lookup])(helper, lookup, username);
-        SEL read = NSSelectorFromString(@"isChatStatusNotifyOpen");
-        sig = [contact methodSignatureForSelector:read];
-        if (sig.numberOfArguments != 2 ||
-            (sig.methodReturnType[0] != 'B' && sig.methodReturnType[0] != 'c')) return -1;
-        BOOL open = ((BOOL (*)(id, SEL))[contact methodForSelector:read])(contact, read);
-        return open ? 0 : 1;
-    } @catch (__unused NSException *exception) { return -1; }
+            [sig getArgumentTypeAtIndex:2][0] != '@') return nil;
+        return ((id (*)(id, SEL, id))[helper methodForSelector:lookup])(helper, lookup, username);
+    } @catch (__unused NSException *exception) { return nil; }
+}
+
+static NSInteger WCRContactMuted(NSString *username) {
+    NSInteger open = WCRAFReadNativeNotifyOpen(WCRContactForUsername(username));
+    return open < 0 ? -1 : (open == 0 ? 1 : 0);
 }
 
 static NSMutableDictionary<NSString *, NSDictionary *> *gWCRReminderChanges;
@@ -374,49 +374,43 @@ static void WCRRememberReminder(NSString *username, BOOL muted, WCRAFAccountCont
     }
 }
 
-static BOOL WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContext *context) {
+static BOOL WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContext *context,
+                              NSString **failureOut) {
+    if (failureOut) *failureOut = @"当前账号或会话已变化（N01）";
     if (username.length == 0 || ![WCRAFStore() isCurrentContext:context]) return NO;
     @try {
-        NSInteger before = WCRContactMuted(username);
+        if (failureOut) *failureOut = @"未能读取微信消息提醒状态（N02）";
+        id contact = WCRContactForUsername(username);
+        NSInteger open = WCRAFReadNativeNotifyOpen(contact);
+        NSInteger before = open < 0 ? -1 : (open == 0 ? 1 : 0);
         if (before < 0) return NO;
         if (before == (muted ? 1 : 0)) {
             WCRRememberReminder(username, muted, context);
             return YES;
         }
         Class helper = NSClassFromString(@"WCRefineChatRoomMuteHelper");
-        SEL lookup = NSSelectorFromString(@"wcr_contactForName:");
-        id contact = ((id (*)(id, SEL, id))[helper methodForSelector:lookup])(helper, lookup, username);
         id manager = WCRObjectResult(helper, @"wcr_contactMgr");
-        SEL change = NSSelectorFromString(@"ChangeNotifyStatus:withStatus:sync:");
-        NSMethodSignature *sig = [manager methodSignatureForSelector:change];
-        if (!contact || sig.numberOfArguments != 5 ||
-            [sig getArgumentTypeAtIndex:2][0] != '@') return NO;
-        for (NSUInteger index = 3; index < 5; index++) {
-            const char type = [sig getArgumentTypeAtIndex:index][0];
-            if (!strchr("BcCiIsSlLqQ", type)) return NO;
-        }
-        const char result = sig.methodReturnType[0];
-        if (result != 'v' && result != 'B' && result != 'c') return NO;
+        if (failureOut) *failureOut = @"微信联系人服务不可用（N03）";
+        if (!manager) return NO;
         if (![WCRAFStore() isCurrentContext:context]) return NO;
-        NSInvocation *call = [NSInvocation invocationWithMethodSignature:sig];
-        call.target = manager;
-        call.selector = change;
-        // NSInvocation copies the argument's native width (1/2/4/8 bytes).
-        uint64_t notify = muted ? 0 : 1, sync = 1;
-        [call setArgument:&contact atIndex:2];
-        [call setArgument:&notify atIndex:3];
-        [call setArgument:&sync atIndex:4];
-        [call invoke];
+        WCRAFNativeNotifyResult result = WCRAFInvokeNativeNotify(manager, contact, !muted);
+        if (failureOut) *failureOut = @"当前微信版本的提醒接口不可用（N04）";
+        if (result == WCRAFNativeNotifyUnavailable) return NO;
         BOOL success = [WCRAFStore() isCurrentContext:context] &&
             WCRContactMuted(username) == (muted ? 1 : 0);
         if (success) WCRRememberReminder(username, muted, context);
+        if (!success && failureOut) *failureOut = result == WCRAFNativeNotifyRejected ?
+            @"微信未接受提醒设置，当前状态未改变（N05）" :
+            @"微信已收到设置请求，但尚未确认状态变化（N06）";
         return success;
     } @catch (__unused NSException *exception) { return NO; }
 }
 
-static void WCRReminderFailure(void) {
+static void WCRReminderFailure(NSString *reason) {
+    NSString *message = [NSString stringWithFormat:@"%@\n请在微信聊天设置中确认消息免打扰状态。",
+        reason ?: @"未能确认设置结果"];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"未能修改消息提醒"
-        message:@"请在微信聊天设置中确认消息免打扰状态。" preferredStyle:UIAlertControllerStyleAlert];
+        message:message preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
     UIViewController *presenter = WCRTopVC();
     [presenter presentViewController:alert animated:YES completion:nil];
@@ -2495,7 +2489,7 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
             WCRSetContentOffset(cell, x);
             WCRLayoutAction(cell);
             if (home && [intent consumeReturnAtDistance:x rowWidth:CGRectGetWidth(cell.bounds)
-                    actionWidth:kWCRActionWidth cancelled:NO]) {
+                    actionWidth:kWCRReturnActionWidth cancelled:NO]) {
                 WCRSetBool(pan, kWCRPanConsumedKey, YES);
                 WCRAnimateReturn(cell, intent);
             }
@@ -2519,7 +2513,7 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
             }
             if (WCRIsActiveFrontHomeTable(WCRTableForCell(cell)) &&
                 [intent consumeReturnAtDistance:currentX rowWidth:CGRectGetWidth(cell.bounds)
-                    actionWidth:kWCRActionWidth cancelled:cancelled]) {
+                    actionWidth:kWCRReturnActionWidth cancelled:cancelled]) {
                 WCRSetBool(pan, kWCRPanConsumedKey, YES);
                 WCRAnimateReturn(cell, intent);
                 break;
@@ -2623,13 +2617,14 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
         case WCRRightActionMute:
         case WCRRightActionRemind: {
             WCRInvalidateOutgoing(username, context);
-            if (!WCRSetNativeMuted(username, kind == WCRRightActionMute, context)) {
-                WCRReminderFailure();
+            NSString *failure = nil;
+            if (!WCRSetNativeMuted(username, kind == WCRRightActionMute, context, &failure)) {
+                WCRReminderFailure(failure);
                 break;
             }
             if (kind == WCRRightActionMute && WCRIsInCustomGroup(username)) {
                 if (![WCRAFStore() setHeld:NO username:username context:context]) {
-                    WCRReminderFailure();
+                    WCRReminderFailure(@"消息免打扰已开启，但回组状态保存失败（S01）");
                 }
             }
             WCRRefreshHomeDeferred(host, @"active_front_reminder_changed", context);
@@ -2925,8 +2920,9 @@ static void WCRQueueSendAcknowledgment(NSString *username, id wrap) {
             NSString *canonicalName = nil;
             if (!WCRConversationFromCandidate(latest, NULL, &canonicalName, NULL) ||
                 ![canonicalName isEqualToString:name] || ![WCRAFStore() isCurrentContext:context]) return;
-            if (!WCRSetNativeMuted(name, NO, context)) {
-                if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) WCRReminderFailure();
+            NSString *failure = nil;
+            if (!WCRSetNativeMuted(name, NO, context, &failure)) {
+                if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) WCRReminderFailure(failure);
                 return;
             }
             NSTimeInterval latestTime = MAX(ticket.messageTime, WCRSessionLastMessageTime(latest));
