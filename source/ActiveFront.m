@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.18 event-confirmed, serialized reminder operations.
+// WCRefine ActiveFront - v1.9.19 iPad grouping swipe compatibility.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -75,7 +75,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.18-source";
+static NSString * const kWCRAFVersion = @"1.9.19-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -327,11 +327,17 @@ static BOOL WCRIsActiveFrontHomeTable(UITableView *tableView) {
 }
 
 static WCRGroupingSessionListViewController *WCRGroupControllerForTable(UITableView *table) {
+    if (!table) return nil;
     id owner = WCRViewControllerForView(table);
     if (!WCRIsGroupingSessionListController(owner)) owner = table.delegate;
     if (!WCRIsGroupingSessionListController(owner)) return nil;
     @try {
-        return [owner tableView] == table ? owner : nil;
+        UITableView *declaredTable = [owner tableView];
+        if (declaredTable == table) return owner;
+        // iPad split-view layouts may expose a proxy or nested table while
+        // retaining the same grouping controller. Accept only its descendants.
+        UIView *ownerView = [owner view];
+        return ownerView && [table isDescendantOfView:ownerView] ? owner : nil;
     } @catch (__unused NSException *exception) { return nil; }
 }
 
