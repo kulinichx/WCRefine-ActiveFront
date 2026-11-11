@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.19 iPad grouping swipe compatibility.
+// WCRefine ActiveFront - v1.9.20 grouping-cell and native swipe compatibility.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -75,7 +75,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.19-source";
+static NSString * const kWCRAFVersion = @"1.9.20-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -343,6 +343,14 @@ static WCRGroupingSessionListViewController *WCRGroupControllerForTable(UITableV
 
 static BOOL WCRIsSupportedSwipeTable(UITableView *table) {
     return WCRIsActiveFrontHomeTable(table) || WCRGroupControllerForTable(table) != nil;
+}
+
+static BOOL WCRIsSupportedSwipeCell(UITableViewCell *cell) {
+    if (!cell) return NO;
+    if (WCRIsMainFrameCell(cell)) return YES;
+    // iPad grouping rows can use a different cell subclass. Their table is
+    // still accepted only when it belongs to the verified grouping controller.
+    return WCRGroupControllerForTable(WCRTableForCell(cell)) != nil;
 }
 
 static CGFloat WCRActionExtent(UITableViewCell *cell) {
@@ -2425,10 +2433,8 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
     }
 
     UITableViewCell *cell = (UITableViewCell *)pan.view;
-    if (!WCRIsMainFrameCell(cell)) return NO;
-
     UITableView *tableView = WCRTableForCell(cell);
-    if (!WCRIsSupportedSwipeTable(tableView)) return NO;
+    if (!WCRIsSupportedSwipeCell(cell) || !WCRIsSupportedSwipeTable(tableView)) return NO;
     if (gWCRReturnOverlay) return NO;
 
     CGPoint velocity = [pan velocityInView:cell];
@@ -2504,7 +2510,7 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
     }
 
     UITableViewCell *cell = (UITableViewCell *)pan.view;
-    if (!WCRIsMainFrameCell(cell)) return;
+    if (!WCRIsSupportedSwipeCell(cell)) return;
 
     UIView *actionView = objc_getAssociatedObject(cell, kWCRActionViewKey);
     if (!actionView) return;
@@ -2799,10 +2805,8 @@ static void WCRWirePanPriority(UIView *view,
 }
 
 static void WCRAttachToCell(UITableViewCell *cell) {
-    if (!WCRIsMainFrameCell(cell)) return;
-
     UITableView *tableView = WCRTableForCell(cell);
-    if (!WCRIsSupportedSwipeTable(tableView)) return;
+    if (!WCRIsSupportedSwipeCell(cell) || !WCRIsSupportedSwipeTable(tableView)) return;
 
     NSString *currentUsername = nil;
     WCRRightActionKind currentKind =

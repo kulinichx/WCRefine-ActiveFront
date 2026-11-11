@@ -1,10 +1,18 @@
 # WCRefineGroup 源码修复候选
 
 日期：2026-11-11  
-源码标识：`1.9.19-source`  
+源码标识：`1.9.20-source`  
 最终产品文件名：**`WCRefineGroup.dylib`**
 
-## 本轮：iPad 分组页右滑兼容
+## 本轮：分组 cell 与原生滑动兼容
+
+确认 WCRefine 分组页使用 `WCRGroupingNativeSessionCell`，不是首页的
+`NewMainFrameCell`。右滑入口现在同时支持已确认的分组控制器表格和普通
+`UITableViewCell` 分组行；首页仍只接受 `NewMainFrameCell`。
+
+WCRefine 在分组控制器上接管 `trailingSwipeActionsConfigurationForRowAtIndexPath:`
+这一 UIKit 表格接口，因此它负责分组页的动作入口，系统负责收拢和回弹动画。
+后续可以沿用该原生容器改善动画，但不会让右滑依赖首页 cell 类。
 
 修复 iPad 分栏布局中分组表格没有被识别为分组页，导致右滑手势未安装。
 分组控制器仍是唯一判断依据；现在同时接受控制器视图层级内的嵌套或代理
