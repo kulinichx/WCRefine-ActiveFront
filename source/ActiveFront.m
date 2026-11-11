@@ -329,20 +329,29 @@ static id WCRRememberedGroupingController(UITableView *table) {
     }
 }
 
-static void WCRRefreshVisibleGroupingLists(void) {
+static void WCRRefreshVisibleGroupingRow(NSString *username, WCRAFAccountContext *context) {
+    if (username.length == 0 || !context) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSMutableArray<UITableView *> *tables = [NSMutableArray array];
+        NSMutableArray<NSDictionary *> *matches = [NSMutableArray array];
         @synchronized([NSMapTable class]) {
             for (UITableView *table in gWCRGroupingTableOwners.keyEnumerator) {
                 id controller = [gWCRGroupingTableOwners objectForKey:table];
                 if (!table.window || !WCRIsGroupingSessionListController(controller)) continue;
                 UIViewController *owner = (UIViewController *)controller;
                 if (!owner.isViewLoaded || owner.view.window != table.window) continue;
-                [tables addObject:table];
+                for (UITableViewCell *cell in table.visibleCells) {
+                    if (![objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey) isEqualToString:username] ||
+                        objc_getAssociatedObject(cell, kWCRCanonicalAccountKey) != context) continue;
+                    NSIndexPath *indexPath = [table indexPathForCell:cell];
+                    if (indexPath) [matches addObject:@{@"table": table, @"indexPath": indexPath}];
+                }
             }
         }
-        for (UITableView *table in tables) {
-            if (table.window) [table reloadData];
+        for (NSDictionary *match in matches) {
+            UITableView *table = match[@"table"];
+            NSIndexPath *indexPath = match[@"indexPath"];
+            if (!table.window || ![table cellForRowAtIndexPath:indexPath]) continue;
+            [table reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
         }
     });
 }
@@ -532,28 +541,34 @@ static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContex
                               void (^completion)(BOOL, NSString *)) {
     if (username.length == 0 || ![WCRAFStore() isCurrentContext:context]) return;
     __block NSString *writeFailure = @"当前微信版本的提醒接口不可用（N04）";
+    __block id contact = nil;
+    __block BOOL contactResolved = NO;
+    id (^resolvedContact)(void) = ^id{
+        if (!contactResolved) {
+            contact = WCRContactForUsername(username);
+            contactResolved = YES;
+        }
+        return contact;
+    };
     [WCRReminderCoordinator() changeUsername:username context:context notify:!muted
         read:^NSInteger {
-            return WCRAFReadNativeNotifyOpen(WCRContactForUsername(username));
+            return WCRAFReadNativeNotifyOpen(resolvedContact());
         } write:^WCRAFNativeNotifyResult {
             @try {
-                id contact = WCRContactForUsername(username);
                 id manager = WCRContactManager();
                 if (!manager) {
                     writeFailure = @"微信联系人管理器不可用（N03-M）";
                     return WCRAFNativeNotifyUnavailable;
                 }
-                if (!contact) {
+                id targetContact = resolvedContact();
+                if (!targetContact) {
                     writeFailure = @"未能找到该微信联系人（N03-C）";
                     return WCRAFNativeNotifyUnavailable;
                 }
-                return WCRAFInvokeNativeNotify(manager, contact, !muted);
+                return WCRAFInvokeNativeNotify(manager, targetContact, !muted);
             } @catch (__unused NSException *exception) { return WCRAFNativeNotifyUnavailable; }
-        } pending:^{
-            WCRRefreshVisibleGroupingLists();
-            WCRRefreshHomeGlobal(@"active_front_reminder_pending", context);
-        } completion:^(WCRAFNotifyOutcome outcome) {
-            WCRRefreshVisibleGroupingLists();
+        } pending:^{} completion:^(WCRAFNotifyOutcome outcome) {
+            WCRRefreshVisibleGroupingRow(username, context);
             if (outcome == WCRAFNotifyConfirmed) {
                 WCRRememberReminder(username, muted, context);
                 completion(YES, nil);
