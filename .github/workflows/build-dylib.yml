@@ -51,6 +51,8 @@ jobs:
             source/build/ui/ui-tests.json
             source/build/ui/iphone/*.json
             source/build/ui/ipad/*.json
+            source/build/ui/iphone/*.log
+            source/build/ui/ipad/*.log
             source/build/ui/iphone/*.png
             source/build/ui/ipad/*.png
 
@@ -66,3 +68,5 @@ jobs:
             source/build/ui-tests.log
             source/build/ui/iphone/*.json
             source/build/ui/ipad/*.json
+            source/build/ui/iphone/*.log
+            source/build/ui/ipad/*.log

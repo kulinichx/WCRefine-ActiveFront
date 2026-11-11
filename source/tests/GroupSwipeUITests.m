@@ -184,7 +184,8 @@ static BOOL HasRenderedContent(UIImage *image) {
     [data writeToFile:[folder stringByAppendingPathComponent:@"ui-tests.json"] atomically:YES];
     printf("%s\n", passed ? "WCR_UI_TESTS_PASS" : failure.UTF8String);
     fflush(stdout);
-    exit(passed ? 0 : 1);
+    // Keep the app alive until the runner collects the report and shuts down
+    // the device. Exiting during simctl's launch handshake can stall its CLI.
 }
 @end
 

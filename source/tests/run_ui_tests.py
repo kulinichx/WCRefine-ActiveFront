@@ -16,6 +16,36 @@ def run(*args, timeout=180):
         raise
 
 
+def launch_and_collect(device, container, destination):
+    destination.mkdir(parents=True, exist_ok=True)
+    report_path = container / "Documents/ui-tests.json"
+    with (destination / "launch.log").open("w") as log:
+        process = subprocess.Popen(
+            ["xcrun", "simctl", "launch", device, "local.wcrefine.swipetests"],
+            stdout=log, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + 90
+            while not report_path.is_file():
+                status = process.poll()
+                if status is not None and status != 0:
+                    raise RuntimeError(f"UIKit launcher failed ({status}); see {destination / 'launch.log'}")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"No UIKit terminal report for {destination.name}")
+                time.sleep(0.25)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+            documents = container / "Documents"
+            if documents.is_dir():
+                shutil.copytree(documents, destination, dirs_exist_ok=True)
+    return json.loads((destination / "ui-tests.json").read_text())
+
+
 def main():
     out = Path(sys.argv[1]).resolve()
     runtimes = json.loads(run("xcrun", "simctl", "list", "runtimes", "-j"))["runtimes"]
@@ -37,24 +67,15 @@ def main():
         device = run("xcrun", "simctl", "create", "WCR-Swipe-" + family,
                      device_type["identifier"], runtime["identifier"])
         try:
+            print(f"Booting {family}: {device_type['name']} / {runtime['identifier']}", flush=True)
             run("xcrun", "simctl", "boot", device)
             run("xcrun", "simctl", "bootstatus", device, "-b", timeout=240)
             run("xcrun", "simctl", "install", device, str(out / "SwipeTests.app"))
             container = Path(run("xcrun", "simctl", "get_app_container", device,
                                  "local.wcrefine.swipetests", "data"))
-            report_path = container / "Documents/ui-tests.json"
-            # simctl's console attachment can outlive an exited simulator app.
-            # The app writes its terminal report atomically before exiting.
-            print(run("xcrun", "simctl", "launch", device,
-                      "local.wcrefine.swipetests"), flush=True)
-            deadline = time.monotonic() + 90
-            while not report_path.is_file():
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"No UIKit terminal report for {family}")
-                time.sleep(0.25)
             destination = out / family
-            shutil.copytree(container / "Documents", destination)
-            report = json.loads((destination / "ui-tests.json").read_text())
+            # Gate on the app's atomic report, independently of simctl's lifetime.
+            report = launch_and_collect(device, container, destination)
             print(json.dumps({"device": family, **report}), flush=True)
             if report.get("passed") is not True or report.get("checks_run", 0) < 900:
                 raise RuntimeError(report)
