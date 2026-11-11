@@ -12,24 +12,24 @@
 
 WCRefine 在分组控制器上接管 `trailingSwipeActionsConfigurationForRowAtIndexPath:`
 这一 UIKit 表格接口，因此它负责分组页的动作入口，系统负责收拢和回弹动画。
-后续可以沿用该原生容器改善动画，但不会让右滑依赖首页 cell 类。
+可以借用同类原生 swipe-actions 容器的揭示、收拢和回弹观感。
+这与直接复用左滑动作本身不同，避免左右滑语义相互覆盖。
 
-修复 iPad 分栏布局中分组表格没有被识别为分组页，导致右滑手势未安装。
-分组控制器仍是唯一判断依据；现在同时接受控制器视图层级内的嵌套或代理
-表格，避免依赖 `tableView` 属性必须与触摸表格对象完全相同。
-首页表格和其它未知表格仍不会进入分组右滑路径。
+修复分组 cell 类型不是 `NewMainFrameCell` 时右滑入口被拒绝的问题。
+只要表格属于已验证的分组控制器，分组行可用其实际 `UITableViewCell` 子类；
+首页仍只接受 `NewMainFrameCell`，其它未知表格仍 fail closed。
 
 本轮已完成 Apple 工具链构建：35 项本地源码契约检查、18 项构建验收器测试、
 **123 项原生 Foundation 核心测试全部通过，iOS ARM64 编译零警告。**
 Apple 签名、下载压缩包哈希、CodeDirectory 页哈希及编译输入快照验证通过。
-当前 `build/WCRefineGroup.dylib` 为 **1.9.19**，大小 280,768 字节，SHA-256：
-`a092cbcbfeba29e5472f6c37ba492842ef7870b527e2df69bcf7d6500f62541b`。
-源码提交：`45eef53b77bbb00130fde952023f896f406614f6`；
-GitHub Actions run：`42937347765`；产物 ID：`13818583084`。
-旧 1.9.18 库与验收记录保存在
-`../audit/backups/source-build-1.9.18-680fd48ed317/`，根目录旧库未替换。
-构建证据见 `../audit/source_build_acceptance.json` 与 `../audit/ci/42937347765/`。
-iPad 实机上的实际手势仍需验证。
+当前 `build/WCRefineGroup.dylib` 为 **1.9.20**，大小 280,848 字节，SHA-256：
+`8976f0a43b83b5e4122767235cba6f72b5b8f78b8ea23ac6d241d51768682df5`。
+源码提交：`66000c4ca474bb1e71eaba88021e65249ffae26c`；
+GitHub Actions run：`42941481310`；产物 ID：`13820314054`。
+旧 1.9.19 库与验收记录保存在
+`../audit/backups/source-build-1.9.19-a092cbcbfeba/`，根目录旧库未替换。
+构建证据见 `../audit/source_build_acceptance.json` 与 `../audit/ci/42941481310/`。
+iPad 实机右滑和系统回弹效果仍需验证。
 
 ## 1.9.18：等待真实状态，串行处理提醒设置
 
@@ -170,7 +170,7 @@ UIKit 手势、微信设置同步、换号和主插件兼容性仍需真机验�
 
 ## 历史记录
 
-以下均为过往版本的规则和构建证据；当前行为以 1.9.18 修复及其沿用规则为准。
+以下均为过往版本的规则和构建证据；当前行为以 1.9.20 修复及其沿用规则为准。
 
 ### 1.9.14：回组动画背景调整
 
