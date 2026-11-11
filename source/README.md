@@ -11,6 +11,18 @@
 表格，避免依赖 `tableView` 属性必须与触摸表格对象完全相同。
 首页表格和其它未知表格仍不会进入分组右滑路径。
 
+本轮已完成 Apple 工具链构建：35 项本地源码契约检查、18 项构建验收器测试、
+**123 项原生 Foundation 核心测试全部通过，iOS ARM64 编译零警告。**
+Apple 签名、下载压缩包哈希、CodeDirectory 页哈希及编译输入快照验证通过。
+当前 `build/WCRefineGroup.dylib` 为 **1.9.19**，大小 280,768 字节，SHA-256：
+`a092cbcbfeba29e5472f6c37ba492842ef7870b527e2df69bcf7d6500f62541b`。
+源码提交：`45eef53b77bbb00130fde952023f896f406614f6`；
+GitHub Actions run：`42937347765`；产物 ID：`13818583084`。
+旧 1.9.18 库与验收记录保存在
+`../audit/backups/source-build-1.9.18-680fd48ed317/`，根目录旧库未替换。
+构建证据见 `../audit/source_build_acceptance.json` 与 `../audit/ci/42937347765/`。
+iPad 实机上的实际手势仍需验证。
+
 ## 1.9.18：等待真实状态，串行处理提醒设置
 
 修复 1.9.17 在 1 秒读回未变化时直接结束确认的问题。
