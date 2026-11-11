@@ -294,6 +294,26 @@ static BOOL WCRIsGroupingSessionListController(id controller) {
         isEqualToString:@"WCRGroupingSessionListViewController"];
 }
 
+static NSMapTable *gWCRGroupingTableOwners;
+
+static void WCRRememberGroupingTable(UITableView *table, id controller) {
+    if (!table || !WCRIsGroupingSessionListController(controller)) return;
+    @synchronized([NSMapTable class]) {
+        if (!gWCRGroupingTableOwners) {
+            gWCRGroupingTableOwners = [NSMapTable weakToWeakObjectsMapTable];
+        }
+        [gWCRGroupingTableOwners setObject:controller forKey:table];
+    }
+}
+
+static id WCRRememberedGroupingController(UITableView *table) {
+    if (!table) return nil;
+    @synchronized([NSMapTable class]) {
+        id controller = [gWCRGroupingTableOwners objectForKey:table];
+        return WCRIsGroupingSessionListController(controller) ? controller : nil;
+    }
+}
+
 static BOOL WCRIsActiveFrontHomeTable(UITableView *tableView) {
     if (!WCRIsMainFrameTable(tableView)) return NO;
 
@@ -328,6 +348,10 @@ static BOOL WCRIsActiveFrontHomeTable(UITableView *tableView) {
 
 static WCRGroupingSessionListViewController *WCRGroupControllerForTable(UITableView *table) {
     if (!table) return nil;
+    WCRGroupingSessionListViewController *remembered =
+        WCRRememberedGroupingController(table);
+    if (remembered) return remembered;
+
     id owner = WCRViewControllerForView(table);
     if (!WCRIsGroupingSessionListController(owner)) owner = table.delegate;
     if (!WCRIsGroupingSessionListController(owner)) return nil;
@@ -3152,12 +3176,11 @@ static void hook_sessionModMsg(id self, SEL cmd, id username, id wrap) {
 static UITableViewCell *hook_groupCell(id self, SEL cmd, UITableView *table, NSIndexPath *path) {
     UITableViewCell *cell = orig_groupCell ? orig_groupCell(self, cmd, table, path) : nil;
     @try {
-        WCRGroupingSessionListViewController *controller =
-            WCRGroupControllerForTable(table);
-        if (cell && controller) {
+        if (WCRIsGroupingSessionListController(self) && table) {
+            WCRRememberGroupingTable(table, self);
             WCRInstallGroupLeadingSwipeForClass(object_getClass(self));
             WCRInstallGroupLeadingSwipeForClass(object_getClass(table.delegate));
-            WCRBindCanonicalHomeRow(cell, controller, table, path);
+            if (cell) WCRBindCanonicalHomeRow(cell, self, table, path);
         }
     } @catch (__unused NSException *exception) {
         WCRHardResetCellVisual(cell, YES);
