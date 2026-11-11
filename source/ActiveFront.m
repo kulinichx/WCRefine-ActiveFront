@@ -51,6 +51,7 @@
 
 static const CGFloat kWCRActionWidth = 60.0;
 static const CGFloat kWCRReturnActionWidth = 82.0;
+static __weak id gWCRAppearedHomeController;
 
 static const void *kWCRPanKey          = &kWCRPanKey;
 static const void *kWCRActionViewKey   = &kWCRActionViewKey;
@@ -1221,7 +1222,15 @@ static NewMainFrameViewController *WCRActivityHomeController(void) {
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return nil;
     UIViewController *top = WCRTopVC();
     Class homeClass = NSClassFromString(@"NewMainFrameViewController");
-    return homeClass && [top isKindOfClass:homeClass] ? (id)top : nil;
+    if (homeClass && [top isKindOfClass:homeClass]) return (id)top;
+
+    // iPad split-view containers can keep the visible home controller below
+    // WCRTopVC(), so also consult the controller observed in viewDidAppear.
+    id appeared = gWCRAppearedHomeController;
+    if (homeClass && [appeared isKindOfClass:homeClass] &&
+        [(UIViewController *)appeared isViewLoaded] &&
+        [(UIViewController *)appeared view].window) return appeared;
+    return nil;
 }
 
 // Coalesce a complete grouping pass, then resolve the latest session again.
@@ -2830,7 +2839,7 @@ static void WCRWirePanPriority(UIView *view,
 
 static void WCRAttachToCell(UITableViewCell *cell) {
     UITableView *tableView = WCRTableForCell(cell);
-    if (!WCRIsActiveFrontHomeTable(tableView) ||
+    if (!WCRIsSupportedSwipeTable(tableView) ||
         !WCRIsSupportedSwipeCell(cell)) return;
 
     NSString *currentUsername = nil;
@@ -3180,7 +3189,6 @@ static UITableViewCell *hook_groupCell(id self, SEL cmd, UITableView *table, NSI
             WCRRememberGroupingTable(table, self);
             WCRInstallGroupLeadingSwipeForClass(object_getClass(self));
             WCRInstallGroupLeadingSwipeForClass(object_getClass(table.delegate));
-            if (cell) WCRBindCanonicalHomeRow(cell, self, table, path);
         }
     } @catch (__unused NSException *exception) {
         WCRHardResetCellVisual(cell, YES);
@@ -3418,6 +3426,10 @@ static void hook_activeViewDidAppear(id self,
     if (orig_activeViewDidAppear) {
         orig_activeViewDidAppear(self, _cmd, animated);
     }
+    if ([self isKindOfClass:NSClassFromString(@"NewMainFrameViewController")] &&
+        [self isViewLoaded] && [self view].window) {
+        gWCRAppearedHomeController = self;
+    }
 
     WCRPruneStaleActiveFrontState();
     // The original host owns discovery/refresh. Only reconcile tracked rows
@@ -3428,6 +3440,7 @@ static void hook_activeViewDidAppear(id self,
 static void hook_activeViewWillDisappear(id self, SEL _cmd, BOOL animated) {
     WCRCancelReturnAnimation();
     WCRResetVisibleSwipeVisuals();
+    if (gWCRAppearedHomeController == self) gWCRAppearedHomeController = nil;
     if (orig_activeViewWillDisappear) orig_activeViewWillDisappear(self, _cmd, animated);
 }
 

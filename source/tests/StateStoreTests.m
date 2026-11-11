@@ -1169,6 +1169,7 @@ static void SwipeRejectsInvalidGeometry(Fixture *f) {
     CHECK(![intent consumeReturnAtDistance:200 rowWidth:160 actionWidth:82 cancelled:NO]);
     CHECK(WCRAFSwipeReturnThreshold(320, 82) > 82);
     CHECK(WCRAFSwipeReturnThreshold(1024, 82) < 1024);
+    CHECK(WCRAFSwipeReturnThreshold(1024, 82) <= 82 * 3.5);
 }
 
 static void SwipeRejectsReusedRow(Fixture *f) {
@@ -1502,6 +1503,7 @@ static void TwoActionsFitBeforeReturnThreshold(Fixture *f) {
         CHECK(threshold > 164 + 20);
         CHECK(threshold < width.doubleValue);
     }
+    CHECK(WCRAFSwipeReturnThreshold(1024, 82) <= 82 * 3.5);
 }
 
 static void NativeNotifyReadsBooleanAndIntegerStates(Fixture *f) {

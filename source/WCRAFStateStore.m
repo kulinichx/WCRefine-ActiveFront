@@ -362,7 +362,10 @@ static BOOL WCRAFValidDays(id value, NSInteger *result) {
 double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
     if (!isfinite(rowWidth) || !isfinite(actionWidth) || actionWidth <= 0 ||
         rowWidth <= actionWidth * 2.0) return INFINITY;
-    return MIN(rowWidth - 16.0, MAX(actionWidth * 2.35, rowWidth * 0.64));
+    double comfortable = actionWidth * 2.35;
+    double proportional = rowWidth * 0.64;
+    double largeScreenCap = actionWidth * 3.5;
+    return MIN(rowWidth - 16.0, MAX(comfortable, MIN(proportional, largeScreenCap)));
 }
 
 @implementation WCRAFSwipeIntent {
