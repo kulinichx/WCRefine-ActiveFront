@@ -24,9 +24,6 @@ trailing delegate 转发。不能把首页转发当作分组页的全部手势�
 同时保留本轮 iPad 首页可见控制器登记和长滑距离上限修订；
 临时消息活动不写入保持状态，不清除用户已保存的保持记录。
 
-当前源码正在准备 Apple 工具链构建；旧 `build/` 库不能视为本轮产物。
-设备侧是否进入 UIKit leading 回调仍待 iPad 验证。
-
 1.9.23 修正 `canEditRowAtIndexPath:` 的时序门槛：UIKit 可能在 cell 创建前
 询问行是否可编辑。此前必须先取得可见 cell 才返回可滑动，导致 iPad 布局时
 整条原生 leading action 链可能被 UIKit 关闭。现在仅对已确认的分组控制器、
@@ -38,6 +35,10 @@ trailing delegate 转发。不能把首页转发当作分组页的全部手势�
 分组页。设备统一日志中搜索 `[WCRefineGroup swipe]` 可查看版本、表格注册、
 可编辑资格、leading 回调及动作类型。每个进程最多输出 48 条，不含用户名、
 群名、账号标识或消息。默认关闭，无额外轮询或周期任务。
+
+每次构建的源码哈希、签名、测试结果和产物摘要记录在
+`audit/source_build_acceptance.json`。原生测试不覆盖 UIKit 手势；
+右滑是否恢复仍需 iPad 实机验证。
 
 ## 1.9.18：等待真实状态，串行处理提醒设置
 

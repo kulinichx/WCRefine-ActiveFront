@@ -3183,13 +3183,15 @@ static BOOL WCRInstallGroupCanEditForClass(Class cls) {
         'B', &gWCRGroupCanEditOriginals);
 }
 
-static WCRRightActionKind WCRGroupActionAtPath(UITableView *table, NSIndexPath *path) {
+static WCRRightActionKind WCRGroupActionAtPath(UITableView *table,
+                                                NSIndexPath *path,
+                                                NSString **usernameOut) {
     WCRGroupingSessionListViewController *controller = WCRGroupControllerForTable(table);
     if (!controller || !path || path.section != 0 || path.row < 0) return WCRRightActionNone;
     UITableViewCell *cell = [table cellForRowAtIndexPath:path];
     if (!cell) return WCRRightActionNone;
     WCRBindCanonicalHomeRow(cell, controller, table, path);
-    return WCRActionKindForCell(cell, NULL, NULL, NULL, NULL, NULL);
+    return WCRActionKindForCell(cell, NULL, NULL, NULL, NULL, usernameOut);
 }
 
 static BOOL hook_groupCanEdit(id self, SEL cmd, UITableView *table, NSIndexPath *path) {
@@ -3208,7 +3210,7 @@ static BOOL hook_groupCanEdit(id self, SEL cmd, UITableView *table, NSIndexPath 
             return YES;
         }
     }
-    WCRRightActionKind kind = WCRGroupActionAtPath(table, path);
+    WCRRightActionKind kind = WCRGroupActionAtPath(table, path, NULL);
     if (kind == WCRRightActionMute || kind == WCRRightActionRemind ||
         kind == WCRRightActionPending) return YES;
     IMP original = WCRGroupRowOriginal(gWCRGroupCanEditOriginals, self);
@@ -3226,9 +3228,9 @@ static BOOL hook_groupCellPanShouldBegin(id self, SEL cmd, UIGestureRecognizer *
         if (WCRGroupControllerForTable(table) && !WCRWeChatLeftSwipeMenuVisible(cell)) {
             CGPoint velocity = [(UIPanGestureRecognizer *)gesture velocityInView:cell];
             if (velocity.x > 0 && velocity.x > fabs(velocity.y) * 1.12) {
-                WCRRightActionKind kind = WCRGroupActionAtPath(table, [table indexPathForCell:cell]);
-                if (kind == WCRRightActionMute || kind == WCRRightActionRemind ||
-                    kind == WCRRightActionPending) return NO;
+                NSString *username = nil;
+                WCRGroupActionAtPath(table, [table indexPathForCell:cell], &username);
+                if (username.length > 0) return NO;
             }
         }
     }
@@ -3346,8 +3348,7 @@ static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
         WCRGroupSwipeTrace(@"leading-action", [NSString stringWithFormat:@"kind=%ld",
             (long)kind]);
     }
-    if ((kind != WCRRightActionMute && kind != WCRRightActionRemind) ||
-        username.length == 0) {
+    if (username.length == 0) {
         return original ?
             ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))original)(
                 self, cmd, table, path) : nil;
@@ -3359,32 +3360,60 @@ static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
             ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))original)(
                 self, cmd, table, path) : nil;
     }
-    NSString *title = WCRTitleForActionKind(kind);
-    UIContextualAction *action = [UIContextualAction
-        contextualActionWithStyle:UIContextualActionStyleNormal
-        title:title handler:^(__unused UIContextualAction *selected,
-                              __unused UIView *source,
-                              void (^completion)(BOOL)) {
-        if (![WCRAFStore() isCurrentContext:context] ||
-            !WCRIsInCustomGroup(username)) {
+    if (!WCRIsInCustomGroup(username)) {
+        return original ?
+            ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))original)(
+                self, cmd, table, path) : nil;
+    }
+
+    NSMutableArray<UIContextualAction *> *actions = [NSMutableArray array];
+    if (kind == WCRRightActionPending) {
+        UIContextualAction *pending = [UIContextualAction
+            contextualActionWithStyle:UIContextualActionStyleNormal
+            title:WCRTitleForActionKind(kind)
+            handler:^(__unused UIContextualAction *selected,
+                      __unused UIView *source,
+                      void (^completion)(BOOL)) {
             completion(NO);
-            return;
-        }
-        WCRInvalidateSendAcknowledgments(username, context);
-        WCRSetNativeMuted(username, kind == WCRRightActionMute, context,
-            ^(BOOL success, NSString *failure) {
-                if (failure.length > 0) {
-                    WCRReminderFailure(failure);
-                } else if (success) {
-                    WCRRefreshHomeGlobal(@"active_front_group_native_swipe", context);
+        }];
+        pending.backgroundColor = [UIColor secondaryLabelColor];
+        [actions addObject:pending];
+    } else {
+        BOOL stateKnown = kind == WCRRightActionMute || kind == WCRRightActionRemind;
+        NSArray<NSNumber *> *muteChoices = stateKnown ?
+            @[@(kind == WCRRightActionMute)] : @[@NO, @YES];
+        for (NSNumber *muteChoice in muteChoices) {
+            BOOL muted = muteChoice.boolValue;
+            WCRRightActionKind actionKind = muted ? WCRRightActionMute : WCRRightActionRemind;
+            UIContextualAction *action = [UIContextualAction
+                contextualActionWithStyle:UIContextualActionStyleNormal
+                title:WCRTitleForActionKind(actionKind)
+                handler:^(__unused UIContextualAction *selected,
+                          __unused UIView *source,
+                          void (^completion)(BOOL)) {
+                if (![WCRAFStore() isCurrentContext:context] ||
+                    !WCRIsInCustomGroup(username)) {
+                    completion(NO);
+                    return;
                 }
-            });
-        completion(YES);
-    }];
-    action.backgroundColor = kind == WCRRightActionMute ?
-        [UIColor systemGrayColor] : [UIColor systemBlueColor];
+                WCRInvalidateSendAcknowledgments(username, context);
+                WCRSetNativeMuted(username, muted, context,
+                    ^(BOOL success, NSString *failure) {
+                        if (failure.length > 0) {
+                            WCRReminderFailure(failure);
+                        } else if (success) {
+                            WCRRefreshHomeGlobal(@"active_front_group_native_swipe", context);
+                        }
+                    });
+                completion(YES);
+            }];
+            action.backgroundColor = muted ?
+                [UIColor systemGrayColor] : [UIColor systemBlueColor];
+            [actions addObject:action];
+        }
+    }
     UISwipeActionsConfiguration *configuration =
-        [UISwipeActionsConfiguration configurationWithActions:@[action]];
+        [UISwipeActionsConfiguration configurationWithActions:actions];
     configuration.performsFirstActionWithFullSwipe = NO;
     return configuration;
 }
