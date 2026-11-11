@@ -404,14 +404,51 @@ static id WCRObjectResult(id receiver, NSString *selectorName) {
     return ((id (*)(id, SEL))[receiver methodForSelector:selector])(receiver, selector);
 }
 
+static id WCRNativeContactManager(void) {
+    Class serviceCenterClass = NSClassFromString(@"MMServiceCenter");
+    Class contactManagerClass = NSClassFromString(@"CContactMgr");
+    id serviceCenter = WCRObjectResult(serviceCenterClass, @"defaultCenter");
+    SEL getService = NSSelectorFromString(@"getService:");
+    NSMethodSignature *signature = [serviceCenter methodSignatureForSelector:getService];
+    if (!contactManagerClass || signature.numberOfArguments != 3 ||
+        signature.methodReturnType[0] != '@' ||
+        [signature getArgumentTypeAtIndex:2][0] != '#') return nil;
+    return ((id (*)(id, SEL, Class))[serviceCenter methodForSelector:getService])
+        (serviceCenter, getService, contactManagerClass);
+}
+
 static id WCRContactForUsername(NSString *username) {
     @try {
+        if (![username isKindOfClass:NSString.class] || username.length == 0) return nil;
         Class helper = NSClassFromString(@"WCRefineChatRoomMuteHelper");
         SEL lookup = NSSelectorFromString(@"wcr_contactForName:");
         NSMethodSignature *sig = [helper methodSignatureForSelector:lookup];
-        if (sig.numberOfArguments != 3 || sig.methodReturnType[0] != '@' ||
-            [sig getArgumentTypeAtIndex:2][0] != '@') return nil;
-        return ((id (*)(id, SEL, id))[helper methodForSelector:lookup])(helper, lookup, username);
+        if (sig.numberOfArguments == 3 && sig.methodReturnType[0] == '@' &&
+            [sig getArgumentTypeAtIndex:2][0] == '@') {
+            id contact = ((id (*)(id, SEL, id))[helper methodForSelector:lookup])
+                (helper, lookup, username);
+            if (contact) return contact;
+        }
+
+        // The host profile-card path obtains CContactMgr from MMServiceCenter
+        // directly. Use that same verified service path when WCRefine's helper
+        // lookup is unavailable (notably on grouped iPad rows).
+        id manager = WCRNativeContactManager();
+        SEL getContact = NSSelectorFromString(@"getContactByName:");
+        NSMethodSignature *contactSignature = [manager methodSignatureForSelector:getContact];
+        if (contactSignature.numberOfArguments != 3 || contactSignature.methodReturnType[0] != '@' ||
+            [contactSignature getArgumentTypeAtIndex:2][0] != '@') return nil;
+        return ((id (*)(id, SEL, id))[manager methodForSelector:getContact])
+            (manager, getContact, username);
+    } @catch (__unused NSException *exception) { return nil; }
+}
+
+static id WCRContactManager(void) {
+    @try {
+        Class helper = NSClassFromString(@"WCRefineChatRoomMuteHelper");
+        id manager = WCRObjectResult(helper, @"wcr_contactMgr");
+        if (manager) return manager;
+        return WCRNativeContactManager();
     } @catch (__unused NSException *exception) { return nil; }
 }
 
@@ -483,10 +520,13 @@ static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContex
         } write:^WCRAFNativeNotifyResult {
             @try {
                 id contact = WCRContactForUsername(username);
-                Class helper = NSClassFromString(@"WCRefineChatRoomMuteHelper");
-                id manager = WCRObjectResult(helper, @"wcr_contactMgr");
-                if (!manager || !contact) {
-                    writeFailure = @"微信联系人服务不可用（N03）";
+                id manager = WCRContactManager();
+                if (!manager) {
+                    writeFailure = @"微信联系人管理器不可用（N03-M）";
+                    return WCRAFNativeNotifyUnavailable;
+                }
+                if (!contact) {
+                    writeFailure = @"未能找到该微信联系人（N03-C）";
                     return WCRAFNativeNotifyUnavailable;
                 }
                 return WCRAFInvokeNativeNotify(manager, contact, !muted);
