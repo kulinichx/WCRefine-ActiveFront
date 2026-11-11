@@ -231,8 +231,8 @@ static int QualifiedNotifyWrite(id self, __unused SEL cmd, id contact, int notif
                 return current.foreground && [current.fixture.store isCurrentContext:context];
             } clock:^NSTimeInterval {
                 return weakSelf.fixture.now;
-            } scheduler:^(void (^confirm)(void)) {
-                [weakSelf.scheduled addObject:[confirm copy]];
+            } scheduler:^(NSTimeInterval delay, void (^confirm)(void)) {
+                [weakSelf.scheduled addObject:@{@"delay": @(delay), @"confirm": [confirm copy]}];
             }];
     }
     return self;
@@ -253,8 +253,10 @@ static int QualifiedNotifyWrite(id self, __unused SEL cmd, id contact, int notif
 }
 - (void)runNext {
     CHECK(self.scheduled.count > 0);
-    void (^confirm)(void) = self.scheduled.firstObject;
+    NSDictionary *entry = self.scheduled.firstObject;
+    void (^confirm)(void) = entry[@"confirm"];
     [self.scheduled removeObjectAtIndex:0];
+    self.fixture.now += [entry[@"delay"] doubleValue];
     confirm();
 }
 - (void)observe {
@@ -1660,7 +1662,7 @@ static void NotifyUnchangedStateStaysPendingAfterOneRead(Fixture *f) {
     [op runNext];
     CHECK(op.outcomes.count == 0 && op.pendingCount == 1);
     CHECK([op.coordinator pendingNotifyForUsername:@"room@chatroom" context:op.context] == 0);
-    CHECK(op.manager.calls == 1 && op.reads == 3 && op.scheduled.count == 0);
+    CHECK(op.manager.calls == 1 && op.reads == 3 && op.scheduled.count == 1);
 }
 
 static void NotifyAlreadyDesiredDoesNotSchedule(Fixture *f) {
@@ -1703,7 +1705,7 @@ static void NotifyOppositeRequestSupersedesPending(Fixture *f) {
     [op observe];
     CHECK(op.manager.calls == 2 && op.manager.notify && op.outcomes.count == 0);
     op.contact.value = 1;
-    [op runNext];
+    while (op.scheduled.count) [op runNext];
     CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
     CHECK(op.scheduled.count == 0);
 }
@@ -1809,6 +1811,7 @@ static void NotifyLateHostEventConfirmsWithoutNewWrite(Fixture *f) {
     op.contact.value = 1;
     [op observe];
     CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    while (op.scheduled.count) [op runNext];
     CHECK(op.manager.calls == 1 && op.scheduled.count == 0);
     NSUInteger reads = op.reads;
     [op observe];
@@ -1842,6 +1845,7 @@ static void NotifyUnconfirmedExpiresLazily(Fixture *f) {
     [op.coordinator observeUsername:@"room@chatroom" context:op.context];
     CHECK([op.outcomes isEqual:@[@(WCRAFNotifyUnconfirmed)]]);
     CHECK([op.coordinator pendingNotifyForUsername:@"room@chatroom" context:op.context] == -1);
+    while (op.scheduled.count) [op runNext];
     CHECK(op.manager.calls == 1 && op.scheduled.count == 0);
 }
 
@@ -1866,7 +1870,7 @@ static void NotifyLatestIntentCanCancelQueuedReverse(Fixture *f) {
     [op request:NO];
     CHECK([op.coordinator pendingNotifyForUsername:@"room@chatroom" context:op.context] == 0);
     op.contact.value = 0;
-    [op runNext];
+    while (op.scheduled.count) [op runNext];
     CHECK(op.manager.calls == 1);
     CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
 }
@@ -1919,7 +1923,7 @@ static void NotifyReverseWaitsForActualFirstWrite(Fixture *f) {
     [op observe];
     CHECK(op.manager.calls == 2 && !op.manager.notify);
     op.contact.value = 0;
-    [op runNext];
+    while (op.scheduled.count) [op runNext];
     CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
 }
 
@@ -1940,6 +1944,61 @@ static void NotifyAccountSwitchClearsOldCapacity(Fixture *f) {
     CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
     while (op.scheduled.count) [op runNext];
     CHECK(op.outcomes.count == 1);
+}
+
+static void NotifyReadbackFinishesWithoutHostEvents(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    [op runNext];
+    CHECK(op.scheduled.count == 1 && op.outcomes.count == 0);
+    op.contact.value = 0;
+    [op runNext];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    CHECK(op.scheduled.count == 0 && op.manager.calls == 1 && op.reads == 4);
+}
+
+static void NotifyReadbackBudgetEndsWithoutHostEvents(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    NSTimeInterval started = f.now;
+    [op request:NO];
+    for (NSUInteger index = 0; index < 4; index++) {
+        CHECK(op.scheduled.count == 1);
+        [op runNext];
+    }
+    CHECK(op.scheduled.count == 0 && op.reads == 6 && op.manager.calls == 1);
+    CHECK(fabs(f.now - started - 8.0) < 0.001);
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyUnconfirmed)]]);
+    CHECK([op.coordinator pendingNotifyForUsername:@"room@chatroom" context:op.context] == -1);
+}
+
+static void NotifyReadbackUsesReplacementContact(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    NotifyIntReader *old = op.contact;
+    op.contact = [NotifyIntReader new];
+    op.contact.value = 0;
+    CHECK(old.value == 1);
+    [op runNext];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    CHECK(op.manager.calls == 1 && op.scheduled.count == 0);
+}
+
+static void NotifyCancellationStopsFurtherScheduledReads(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    [op runNext];
+    [op.coordinator invalidateUsername:@"room@chatroom"];
+    [op runNext];
+    CHECK(op.reads == 3 && op.outcomes.count == 0 && op.scheduled.count == 0);
+}
+
+static void NotifyUnknownReadbackEndsWithoutSuccess(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    op.contact.throwRead = YES;
+    while (op.scheduled.count) [op runNext];
+    CHECK(op.reads == 6 && op.manager.calls == 1);
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyUnconfirmed)]]);
 }
 
 int main(int argc, const char *argv[]) {
@@ -2005,7 +2064,10 @@ int main(int argc, const char *argv[]) {
         TEST(NotifyUnconfirmedExpiresLazily), TEST(NotifyQueuedReverseCannotConfirmFromStaleState),
         TEST(NotifyLatestIntentCanCancelQueuedReverse), TEST(NotifyCancelledPendingCannotCompleteOnHostEvent),
         TEST(NotifyPendingIsScopedToAccountAndUsername), TEST(NotifyLateUnknownReadNeverClaimsSuccess),
-        TEST(NotifyReverseWaitsForActualFirstWrite), TEST(NotifyAccountSwitchClearsOldCapacity)
+        TEST(NotifyReverseWaitsForActualFirstWrite), TEST(NotifyAccountSwitchClearsOldCapacity),
+        TEST(NotifyReadbackFinishesWithoutHostEvents), TEST(NotifyReadbackBudgetEndsWithoutHostEvents),
+        TEST(NotifyReadbackUsesReplacementContact), TEST(NotifyCancellationStopsFurtherScheduledReads),
+        TEST(NotifyUnknownReadbackEndsWithoutSuccess)
 #undef TEST
     };
     int failed = 0;

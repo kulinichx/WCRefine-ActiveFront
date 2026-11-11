@@ -17,5 +17,7 @@
 @property(nonatomic, weak, readonly) UITableViewCell *cell;
 + (instancetype)controllerForTable:(UITableView *)table create:(BOOL)create;
 + (void)resetAll;
++ (void)resetForCell:(UITableViewCell *)cell;
+- (void)refreshActionForCell:(UITableViewCell *)cell;
 - (void)reset;
 @end

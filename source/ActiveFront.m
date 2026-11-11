@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.26 bounded grouped swipe viewport.
+// WCRefine ActiveFront - v1.9.27 bounded reminder confirmation and isolated swipe.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -78,7 +78,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.26-source";
+static NSString * const kWCRAFVersion = @"1.9.27-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -167,6 +167,7 @@ static void WCRInvalidateOutgoing(NSString *username, WCRAFAccountContext *conte
 static void WCRInvalidateSendAcknowledgments(NSString *username, WCRAFAccountContext *context);
 static void WCRRefreshHomeGlobal(NSString *reason, WCRAFAccountContext *context);
 static void WCRReminderPendingNotice(void);
+static void WCRRefreshGroupingReminderAction(NSString *username, WCRAFAccountContext *context);
 static UIViewController *WCRTopVC(void);
 
 
@@ -329,6 +330,24 @@ static id WCRRememberedGroupingController(UITableView *table) {
     }
 }
 
+static void WCRRefreshGroupingReminderAction(NSString *username, WCRAFAccountContext *context) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (![WCRAFStore() isCurrentContext:context]) return;
+        NSArray *tables;
+        @synchronized([NSMapTable class]) {
+            tables = gWCRGroupingTableOwners.keyEnumerator.allObjects;
+        }
+        for (UITableView *table in tables) {
+            if (!table.window) continue;
+            WCRAFGroupSwipe *swipe = [WCRAFGroupSwipe controllerForTable:table create:NO];
+            UITableViewCell *cell = swipe.cell;
+            if (objc_getAssociatedObject(cell, kWCRCanonicalAccountKey) != context ||
+                ![objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey) isEqualToString:username]) continue;
+            [swipe refreshActionForCell:cell];
+        }
+    });
+}
+
 static BOOL WCRIsActiveFrontHomeTable(UITableView *tableView) {
     if (!WCRIsMainFrameTable(tableView)) return NO;
 
@@ -479,9 +498,8 @@ static WCRAFNotifyCoordinator *WCRReminderCoordinator(void) {
                     [WCRAFStore() isCurrentContext:context];
             } clock:^NSTimeInterval {
                 return NSProcessInfo.processInfo.systemUptime;
-            } scheduler:^(void (^confirm)(void)) {
-                // One confirmation for a pending operation; never a recurring timer.
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+            } scheduler:^(NSTimeInterval delay, void (^confirm)(void)) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), confirm);
             }];
     });
@@ -514,18 +532,10 @@ static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContex
                               void (^completion)(BOOL, NSString *)) {
     if (username.length == 0 || ![WCRAFStore() isCurrentContext:context]) return;
     __block NSString *writeFailure = @"当前微信版本的提醒接口不可用（N04）";
-    __block id contact = nil;
-    __block BOOL contactResolved = NO;
-    id (^resolvedContact)(void) = ^id{
-        if (!contactResolved) {
-            contact = WCRContactForUsername(username);
-            contactResolved = YES;
-        }
-        return contact;
-    };
     [WCRReminderCoordinator() changeUsername:username context:context notify:!muted
         read:^NSInteger {
-            return WCRAFReadNativeNotifyOpen(resolvedContact());
+            // The host can replace its contact object after a native write.
+            return WCRAFReadNativeNotifyOpen(WCRContactForUsername(username));
         } write:^WCRAFNativeNotifyResult {
             @try {
                 id manager = WCRContactManager();
@@ -533,14 +543,17 @@ static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContex
                     writeFailure = @"微信联系人管理器不可用（N03-M）";
                     return WCRAFNativeNotifyUnavailable;
                 }
-                id targetContact = resolvedContact();
+                id targetContact = WCRContactForUsername(username);
                 if (!targetContact) {
                     writeFailure = @"未能找到该微信联系人（N03-C）";
                     return WCRAFNativeNotifyUnavailable;
                 }
                 return WCRAFInvokeNativeNotify(manager, targetContact, !muted);
             } @catch (__unused NSException *exception) { return WCRAFNativeNotifyUnavailable; }
-        } pending:^{} completion:^(WCRAFNotifyOutcome outcome) {
+        } pending:^{
+            WCRRefreshGroupingReminderAction(username, context);
+        } completion:^(WCRAFNotifyOutcome outcome) {
+            WCRRefreshGroupingReminderAction(username, context);
             if (outcome == WCRAFNotifyConfirmed) {
                 WCRRememberReminder(username, muted, context);
                 completion(YES, nil);
@@ -3371,6 +3384,10 @@ static void WCRConfigureGroupingSwipe(UITableView *table, id controller) {
                 presentViewController:sheet animated:YES completion:nil];
             return;
         }
+        if (kind == WCRRightActionPending) {
+            WCRQueueReminderObservation(username, context);
+            return;
+        }
         if (kind != WCRRightActionMute && kind != WCRRightActionRemind) return;
         WCRInvalidateSendAcknowledgments(username, context);
         WCRSetNativeMuted(username, kind == WCRRightActionMute, context,
@@ -3702,6 +3719,7 @@ static void hook_groupingWillDisplay(
 
 static void hook_cellPrepareForReuse(id self, SEL _cmd) {
     if ([self isKindOfClass:[UITableViewCell class]]) {
+        [WCRAFGroupSwipe resetForCell:(UITableViewCell *)self];
         // Restore before native reuse configures its own subview visibility.
         WCRHardResetCellVisual((UITableViewCell *)self, YES);
         WCRClearCanonicalRowBinding((UITableViewCell *)self);
@@ -3719,6 +3737,7 @@ static void hook_cellDidMoveToWindow(id self, SEL _cmd) {
     if (![self isKindOfClass:[UITableViewCell class]]) return;
     UITableViewCell *cell = (UITableViewCell *)self;
     if (!cell.window) {
+        [WCRAFGroupSwipe resetForCell:cell];
         WCRHardResetCellVisual(cell, NO);
         return;
     }

@@ -97,6 +97,28 @@ static const CGFloat actionWidth = 60;
     for (WCRAFGroupSwipe *owner in controllers.allObjects) [owner reset];
 }
 
++ (void)resetForCell:(UITableViewCell *)cell {
+    for (WCRAFGroupSwipe *owner in controllers.allObjects) {
+        if (owner.cell == cell) [owner reset];
+    }
+}
+
+- (void)refreshActionForCell:(UITableViewCell *)cell {
+    if (!cell || self.cell != cell || !self.surface) return;
+    if (!self.validate || !self.validate(cell, self.action.identity, NO)) {
+        [self reset];
+        return;
+    }
+    WCRAFGroupSwipeAction *action = self.resolve ? self.resolve(cell) : nil;
+    if (!action) {
+        [self reset];
+        return;
+    }
+    self.action = action;
+    [self.surface.button setTitle:action.title forState:UIControlStateNormal];
+    [self.surface.button setTitleColor:action.color forState:UIControlStateNormal];
+}
+
 - (void)reset {
     self.generation++;
     WCRAFGroupSwipeSurface *old = self.surface;
@@ -158,11 +180,11 @@ static const CGFloat actionWidth = 60;
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture shouldReceiveTouch:(UITouch *)touch {
-    if (gesture != self.dismissTap) return YES;
+    if (gesture != self.dismissTap && gesture != self.pan) return YES;
     for (UIView *view = touch.view; view; view = view.superview) {
         if ([view isKindOfClass:UIControl.class]) return NO;
     }
-    return self.surface != nil;
+    return gesture == self.pan || self.surface != nil;
 }
 
 - (BOOL)beginSurface {
@@ -176,10 +198,12 @@ static const CGFloat actionWidth = 60;
         return YES;
     }
     UITableViewCell *cell = self.cell;
-    if (!cell.window || CGRectIsEmpty(cell.bounds)) return NO;
+    if (!cell.window || ![self.table indexPathForCell:cell] || CGRectIsEmpty(cell.bounds)) return NO;
+    [cell layoutIfNeeded];
     UIView *picture = [cell snapshotViewAfterScreenUpdates:NO];
     if (!picture) return NO;
-    WCRAFGroupSwipeSurface *surface = [[WCRAFGroupSwipeSurface alloc] initWithFrame:cell.bounds];
+    CGRect rowFrame = [cell convertRect:cell.bounds toView:self.table];
+    WCRAFGroupSwipeSurface *surface = [[WCRAFGroupSwipeSurface alloc] initWithFrame:rowFrame];
     surface.originalBounds = surface.bounds;
     surface.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     surface.backgroundColor = UIColor.clearColor;
@@ -224,7 +248,8 @@ static const CGFloat actionWidth = 60;
     __weak WCRAFGroupSwipe *weakSelf = self;
     surface.invalidated = ^{ [weakSelf reset]; };
     self.surface = surface;
-    [cell addSubview:surface];
+    // Keep the overlay outside native cells: host layout/reuse owns their subviews.
+    [self.table addSubview:surface];
     [self setOffset:0];
     return YES;
 }

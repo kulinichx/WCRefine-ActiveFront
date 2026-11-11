@@ -31,6 +31,10 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           bash source/build_ios.sh 2>&1 | tee source/build/ci-build.log
 
+      - name: Verify UIKit swipe lifecycle on iPhone and iPad Simulator
+        shell: bash
+        run: bash source/test_ui.sh 2>&1 | tee source/build/ui-tests.log
+
       - name: Upload validated library
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -44,6 +48,11 @@ jobs:
             source/build/native-tests.json
             source/build/native-tests.log
             source/build/test-inputs.json
+            source/build/ui/ui-tests.json
+            source/build/ui/iphone/*.json
+            source/build/ui/ipad/*.json
+            source/build/ui/iphone/*.png
+            source/build/ui/ipad/*.png
 
       - name: Upload build log
         if: always()
@@ -52,4 +61,8 @@ jobs:
           name: WCRefineGroup-build-log-${{ github.sha }}
           if-no-files-found: warn
           retention-days: 14
-          path: source/build/ci-build.log
+          path: |
+            source/build/ci-build.log
+            source/build/ui-tests.log
+            source/build/ui/iphone/*.json
+            source/build/ui/ipad/*.json

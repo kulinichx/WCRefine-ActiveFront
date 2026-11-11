@@ -101,6 +101,7 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
 @property(nonatomic) NSTimeInterval started;
 @property(nonatomic) NSTimeInterval lastEventRead;
 @property(nonatomic) NSUInteger eventReads;
+@property(nonatomic) NSUInteger scheduledReads;
 @property(nonatomic, copy) NSInteger (^read)(void);
 @property(nonatomic, copy) WCRAFNativeNotifyResult (^write)(void);
 @property(nonatomic, copy) void (^pending)(void);
@@ -115,11 +116,11 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
     WCRAFAccountContext *_context;
     BOOL (^_validator)(WCRAFAccountContext *);
     NSTimeInterval (^_clock)(void);
-    void (^_scheduler)(void (^)(void));
+    void (^_scheduler)(NSTimeInterval, void (^)(void));
 }
 - (instancetype)initWithValidator:(BOOL (^)(WCRAFAccountContext *))validator
                            clock:(NSTimeInterval (^)(void))clock
-                       scheduler:(void (^)(void (^)(void)))scheduler {
+                       scheduler:(void (^)(NSTimeInterval, void (^)(void)))scheduler {
     self = [super init];
     if (self) {
         _requests = [NSMutableDictionary dictionary];
@@ -179,6 +180,26 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
     } else if (expired) {
         [self finish:request outcome:WCRAFNotifyUnconfirmed];
     }
+}
+- (void)scheduleReadback:(WCRAFNotifyRequest *)request {
+    static const NSTimeInterval delays[] = {0.2, 0.8, 2.0, 5.0};
+    if (![self isCurrent:request]) return;
+    NSTimeInterval delay = delays[request.scheduledReads++];
+    __weak WCRAFNotifyCoordinator *weakSelf = self;
+    _scheduler(delay, ^{
+        WCRAFNotifyCoordinator *coordinator = weakSelf;
+        if (!coordinator || ![coordinator isCurrent:request]) return;
+        NSInteger latest = [coordinator read:request];
+        if (![coordinator isCurrent:request]) return;
+        request.lastEventRead = coordinator->_clock();
+        if (latest == (request.notify ? 1 : 0)) {
+            [coordinator finish:request outcome:WCRAFNotifyConfirmed];
+        } else if (request.scheduledReads >= 4 || [coordinator expired:request]) {
+            [coordinator finish:request outcome:WCRAFNotifyUnconfirmed];
+        } else {
+            [coordinator scheduleReadback:request];
+        }
+    });
 }
 - (void)changeUsername:(NSString *)username context:(WCRAFAccountContext *)context
                 notify:(BOOL)notify read:(NSInteger (^)(void))read
@@ -249,18 +270,7 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
     }
     pending();
     if (![self isCurrent:request]) return;
-    __weak WCRAFNotifyCoordinator *weakSelf = self;
-    _scheduler(^{
-        WCRAFNotifyCoordinator *coordinator = weakSelf;
-        if (!coordinator || ![coordinator isCurrent:request]) return;
-        NSInteger latest = [coordinator read:request];
-        request.lastEventRead = coordinator->_clock();
-        if (latest == (notify ? 1 : 0)) {
-            [coordinator finish:request outcome:WCRAFNotifyConfirmed];
-        }
-        // Unchanged at one second means pending, not failure. Host events can
-        // confirm later without another timer or another native write.
-    });
+    [self scheduleReadback:request];
 }
 - (void)invalidateUsername:(NSString *)username {
     [_requests removeObjectForKey:username];
