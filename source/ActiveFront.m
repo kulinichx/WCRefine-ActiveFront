@@ -48,6 +48,7 @@
 #import <math.h>
 #import <stdarg.h>
 #import <string.h>
+#import <os/log.h>
 
 static const CGFloat kWCRActionWidth = 60.0;
 static const CGFloat kWCRReturnActionWidth = 82.0;
@@ -99,6 +100,17 @@ static void WCRAFLog(NSString *format, ...) {
 #endif
 }
 #define WCRAF_LOG(...) WCRAFLog(__VA_ARGS__)
+
+// Opt-in, process-bounded callback tracing; never record conversation identity.
+static BOOL gWCRGroupSwipeDiagnostics;
+static NSUInteger gWCRGroupSwipeDiagnosticCount;
+static void WCRGroupSwipeTrace(NSString *event, NSString *detail) {
+    if (!gWCRGroupSwipeDiagnostics || gWCRGroupSwipeDiagnosticCount >= 48) return;
+    gWCRGroupSwipeDiagnosticCount++;
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT,
+        "[WCRefineGroup swipe] %{public}s %{public}s",
+        event.UTF8String, detail.UTF8String);
+}
 
 // Per-cell identity logs are useful during bring-up, but they run in table
 // display/gesture paths and expose internal usernames to the unified log.
@@ -3191,7 +3203,10 @@ static BOOL hook_groupCanEdit(id self, SEL cmd, UITableView *table, NSIndexPath 
         // especially while the grouped list is being laid out on iPad.
         // The list contains only real conversation rows; defer action-state
         // resolution until the native leading-action callback has a cell.
-        if (path.row < (NSInteger)items.count) return YES;
+        if (path.row < (NSInteger)items.count) {
+            WCRGroupSwipeTrace(@"canEdit", @"known-group-row=YES");
+            return YES;
+        }
     }
     WCRRightActionKind kind = WCRGroupActionAtPath(table, path);
     if (kind == WCRRightActionMute || kind == WCRRightActionRemind ||
@@ -3231,6 +3246,12 @@ static void WCRConfigureGroupingSwipe(UITableView *table, id controller) {
         leading = WCRInstallGroupLeadingSwipeForClass(object_getClass(delegate)) && leading;
     }
     BOOL canEdit = WCRInstallGroupCanEditForClass(object_getClass(dataSource));
+    if (gWCRGroupSwipeDiagnostics && gWCRGroupSwipeDiagnosticCount < 48) {
+        WCRGroupSwipeTrace(@"configure", [NSString stringWithFormat:
+            @"table=%@ delegate=%@ source=%@ leading=%d canEdit=%d",
+            WCRClassName(table), WCRClassName(delegate), WCRClassName(dataSource),
+            leading, canEdit]);
+    }
     if (!leading || !canEdit || !delegate || !dataSource) return;
 
     // UITableView caches optional callbacks when its delegates are assigned.
@@ -3305,12 +3326,14 @@ static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
     IMP original = WCRGroupRowOriginal(gWCRGroupLeadingSwipeOriginals, self);
     WCRGroupingSessionListViewController *controller =
         WCRGroupControllerForTable(table);
+    WCRGroupSwipeTrace(@"leading", controller ? @"known-group=YES" : @"known-group=NO");
     if (!controller || path.section != 0 || path.row < 0) {
         return original ?
             ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))original)(
                 self, cmd, table, path) : nil;
     }
     UITableViewCell *cell = [table cellForRowAtIndexPath:path];
+    WCRGroupSwipeTrace(@"leading-cell", cell ? @"available=YES" : @"available=NO");
     if (!cell) return original ?
         ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))original)(
             self, cmd, table, path) : nil;
@@ -3319,6 +3342,10 @@ static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
     NSString *username = nil;
     WCRRightActionKind kind = WCRActionKindForCell(
         cell, NULL, NULL, NULL, NULL, &username);
+    if (gWCRGroupSwipeDiagnostics && gWCRGroupSwipeDiagnosticCount < 48) {
+        WCRGroupSwipeTrace(@"leading-action", [NSString stringWithFormat:@"kind=%ld",
+            (long)kind]);
+    }
     if ((kind != WCRRightActionMute && kind != WCRRightActionRemind) ||
         username.length == 0) {
         return original ?
@@ -3370,6 +3397,9 @@ static void hook_groupDisappear(id self, SEL cmd, BOOL animated) {
 static void hook_groupAppear(id self, SEL cmd, BOOL animated) {
     if (orig_groupAppear) orig_groupAppear(self, cmd, animated);
     @try {
+        gWCRGroupSwipeDiagnostics = [NSUserDefaults.standardUserDefaults
+            boolForKey:@"WCRAFGroupSwipeDiagnostics"];
+        WCRGroupSwipeTrace(@"appear", kWCRAFVersion);
         WCRConfigureGroupingSwipe([(WCRGroupingSessionListViewController *)self tableView], self);
     } @catch (__unused NSException *exception) { }
 }
