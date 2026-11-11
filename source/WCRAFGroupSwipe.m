@@ -75,7 +75,9 @@ static const CGFloat actionWidth = 60;
         owner.pan.cancelsTouchesInView = YES;
         owner.pan.delaysTouchesBegan = NO;
         __weak WCRAFGroupSwipe *weakOwner = owner;
-        owner.pan.touchDown = ^(CGPoint point) { [weakOwner captureTouch:point]; };
+        ((WCRAFGroupPan *)owner.pan).touchDown = ^(CGPoint point) {
+            [weakOwner captureTouch:point];
+        };
         [table addGestureRecognizer:owner.pan];
         owner.dismissTap = [[UITapGestureRecognizer alloc] initWithTarget:owner action:@selector(dismiss:)];
         owner.dismissTap.delegate = owner;

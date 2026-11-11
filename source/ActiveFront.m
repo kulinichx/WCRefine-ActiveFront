@@ -3250,9 +3250,9 @@ static void WCRConfigureGroupingSwipe(UITableView *table, id controller) {
     if (!table || !WCRIsGroupingSessionListController(controller)) return;
     WCRRememberGroupingTable(table, controller);
     WCRAFGroupSwipe *rightSwipe = [WCRAFGroupSwipe controllerForTable:table create:YES];
-    __weak UITableView *weakTable = table;
+    __weak UITableView *weakSwipeTable = table;
     rightSwipe.resolve = ^WCRAFGroupSwipeAction *(UITableViewCell *cell) {
-        UITableView *table = weakTable;
+        UITableView *table = weakSwipeTable;
         WCRGroupingSessionListViewController *owner = WCRGroupControllerForTable(table);
         NSIndexPath *path = [table indexPathForCell:cell];
         if (!owner || !path) return nil;
