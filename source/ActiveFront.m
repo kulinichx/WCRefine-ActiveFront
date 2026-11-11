@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.22 native leading swipe actions for grouped rows.
+// WCRefine ActiveFront - v1.9.23 grouped-row editability probe fix.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -76,7 +76,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.22-source";
+static NSString * const kWCRAFVersion = @"1.9.23-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -3181,6 +3181,18 @@ static WCRRightActionKind WCRGroupActionAtPath(UITableView *table, NSIndexPath *
 }
 
 static BOOL hook_groupCanEdit(id self, SEL cmd, UITableView *table, NSIndexPath *path) {
+    WCRGroupingSessionListViewController *controller =
+        WCRGroupControllerForTable(table);
+    if (controller && path && path.section == 0 && path.row >= 0) {
+        NSArray *items = nil;
+        @try { items = [controller items]; }
+        @catch (__unused NSException *exception) { items = nil; }
+        // UIKit may ask whether a row is editable before its cell exists,
+        // especially while the grouped list is being laid out on iPad.
+        // The list contains only real conversation rows; defer action-state
+        // resolution until the native leading-action callback has a cell.
+        if (path.row < (NSInteger)items.count) return YES;
+    }
     WCRRightActionKind kind = WCRGroupActionAtPath(table, path);
     if (kind == WCRRightActionMute || kind == WCRRightActionRemind ||
         kind == WCRRightActionPending) return YES;

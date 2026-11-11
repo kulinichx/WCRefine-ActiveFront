@@ -1,7 +1,7 @@
 # WCRefineGroup 源码修复候选
 
 日期：2026-11-11  
-源码标识：`1.9.22-source`  
+源码标识：`1.9.23-source`  
 最终产品文件名：**`WCRefineGroup.dylib`**
 
 ## 本轮：补齐分组原生右滑入口
@@ -26,6 +26,13 @@ trailing delegate 转发。不能把首页转发当作分组页的全部手势�
 
 当前源码正在准备 Apple 工具链构建；旧 `build/` 库不能视为本轮产物。
 设备侧是否进入 UIKit leading 回调仍待 iPad 验证。
+
+1.9.23 修正 `canEditRowAtIndexPath:` 的时序门槛：UIKit 可能在 cell 创建前
+询问行是否可编辑。此前必须先取得可见 cell 才返回可滑动，导致 iPad 布局时
+整条原生 leading action 链可能被 UIKit 关闭。现在仅对已确认的分组控制器、
+第 0 区且 `items` 范围内的真实会话行提前放行；leading action 回调仍在 cell
+存在后按原逻辑核对会话状态。越界、未知表格仍交还原实现。
+此修正基于源码路径分析，仍需 iPad 实机验证。
 
 ## 1.9.18：等待真实状态，串行处理提醒设置
 
