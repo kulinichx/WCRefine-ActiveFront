@@ -335,8 +335,9 @@ static void WCRRefreshVisibleGroupingLists(void) {
         @synchronized([NSMapTable class]) {
             for (UITableView *table in gWCRGroupingTableOwners.keyEnumerator) {
                 id controller = [gWCRGroupingTableOwners objectForKey:table];
-                if (!table.window || !WCRIsGroupingSessionListController(controller) ||
-                    ![controller isViewLoaded] || controller.view.window != table.window) continue;
+                if (!table.window || !WCRIsGroupingSessionListController(controller)) continue;
+                UIViewController *owner = (UIViewController *)controller;
+                if (!owner.isViewLoaded || owner.view.window != table.window) continue;
                 [tables addObject:table];
             }
         }
