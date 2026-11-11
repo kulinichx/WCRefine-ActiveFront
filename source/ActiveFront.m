@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.25 grouped swipe action and state fallback fix.
+// WCRefine ActiveFront - v1.9.26 bounded grouped swipe viewport.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -49,6 +49,7 @@
 #import <stdarg.h>
 #import <string.h>
 #import <os/log.h>
+#import "WCRAFGroupSwipe.h"
 
 static const CGFloat kWCRActionWidth = 60.0;
 static const CGFloat kWCRReturnActionWidth = 82.0;
@@ -77,7 +78,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.25-source";
+static NSString * const kWCRAFVersion = @"1.9.26-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -3248,6 +3249,91 @@ static BOOL hook_groupCellPanShouldBegin(id self, SEL cmd, UIGestureRecognizer *
 static void WCRConfigureGroupingSwipe(UITableView *table, id controller) {
     if (!table || !WCRIsGroupingSessionListController(controller)) return;
     WCRRememberGroupingTable(table, controller);
+    WCRAFGroupSwipe *rightSwipe = [WCRAFGroupSwipe controllerForTable:table create:YES];
+    __weak UITableView *weakTable = table;
+    rightSwipe.resolve = ^WCRAFGroupSwipeAction *(UITableViewCell *cell) {
+        UITableView *table = weakTable;
+        WCRGroupingSessionListViewController *owner = WCRGroupControllerForTable(table);
+        NSIndexPath *path = [table indexPathForCell:cell];
+        if (!owner || !path) return nil;
+        WCRBindCanonicalHomeRow(cell, owner, table, path);
+        NSString *username = nil;
+        WCRRightActionKind kind = WCRActionKindForCell(cell, NULL, NULL, NULL, NULL, &username);
+        if (username.length == 0 || !WCRIsInCustomGroup(username) ||
+            (kind != WCRRightActionMute && kind != WCRRightActionRemind &&
+             kind != WCRRightActionPending && kind != WCRRightActionUnknown)) return nil;
+        WCRAFAccountContext *context = objc_getAssociatedObject(cell, kWCRCanonicalAccountKey);
+        if (![WCRAFStore() isCurrentContext:context]) return nil;
+        WCRAFGroupSwipeAction *action = [WCRAFGroupSwipeAction new];
+        action.title = WCRTitleForActionKind(kind);
+        action.color = WCRColorForActionKind(kind);
+        action.identity = @{@"username": username, @"context": context, @"kind": @(kind)};
+        return action;
+    };
+    rightSwipe.validate = ^BOOL(UITableViewCell *cell, id identity, BOOL resolveAgain) {
+        if (![identity isKindOfClass:NSDictionary.class]) return NO;
+        NSString *username = identity[@"username"];
+        WCRAFAccountContext *context = identity[@"context"];
+        WCRRightActionKind expected = [identity[@"kind"] integerValue];
+        if (username.length == 0 || ![WCRAFStore() isCurrentContext:context] ||
+            !WCRIsInCustomGroup(username)) return NO;
+        if (!resolveAgain) {
+            return objc_getAssociatedObject(cell, kWCRCanonicalAccountKey) == context &&
+                [objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey) isEqualToString:username];
+        }
+        UITableView *table = WCRTableForCell(cell);
+        WCRGroupingSessionListViewController *owner = WCRGroupControllerForTable(table);
+        NSIndexPath *path = [table indexPathForCell:cell];
+        if (!owner || !path) return NO;
+        WCRBindCanonicalHomeRow(cell, owner, table, path);
+        NSString *currentName = nil;
+        WCRRightActionKind current = WCRActionKindForCell(cell, NULL, NULL, NULL, NULL, &currentName);
+        return [currentName isEqualToString:username] && current == expected &&
+            objc_getAssociatedObject(cell, kWCRCanonicalAccountKey) == context;
+    };
+    rightSwipe.nativeMenuVisible = ^BOOL(UITableViewCell *cell) {
+        return WCRWeChatLeftSwipeMenuVisible(cell);
+    };
+    rightSwipe.rowColor = ^UIColor *(UITableViewCell *cell) {
+        return WCRSwipeBackground(cell);
+    };
+    rightSwipe.perform = ^(UITableViewCell *cell, WCRAFGroupSwipeAction *action) {
+        NSDictionary *identity = action.identity;
+        NSString *username = identity[@"username"];
+        WCRAFAccountContext *context = identity[@"context"];
+        WCRRightActionKind kind = [identity[@"kind"] integerValue];
+        if (![WCRAFStore() isCurrentContext:context] || !WCRIsInCustomGroup(username)) return;
+        if (kind == WCRRightActionUnknown) {
+            UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"消息提醒"
+                message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+            for (NSNumber *target in @[@NO, @YES]) {
+                BOOL muted = target.boolValue;
+                [sheet addAction:[UIAlertAction actionWithTitle:muted ? @"开启免打扰" : @"开启提醒"
+                    style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *selected) {
+                    if (![WCRAFStore() isCurrentContext:context]) return;
+                    WCRInvalidateSendAcknowledgments(username, context);
+                    WCRSetNativeMuted(username, muted, context, ^(BOOL success, NSString *failure) {
+                        if (failure.length) WCRReminderFailure(failure);
+                        if (success) WCRRefreshHomeGlobal(@"active_front_group_reminder_selected", context);
+                    });
+                }]];
+            }
+            [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+            UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+            popover.sourceView = cell;
+            popover.sourceRect = cell.bounds;
+            [WCRPresenterForHost(WCRGroupControllerForTable(WCRTableForCell(cell)))
+                presentViewController:sheet animated:YES completion:nil];
+            return;
+        }
+        if (kind != WCRRightActionMute && kind != WCRRightActionRemind) return;
+        WCRInvalidateSendAcknowledgments(username, context);
+        WCRSetNativeMuted(username, kind == WCRRightActionMute, context,
+            ^(BOOL success, NSString *failure) {
+            if (failure.length) WCRReminderFailure(failure);
+            else if (success) WCRRefreshHomeGlobal(@"active_front_group_swipe", context);
+        });
+    };
     id delegate = table.delegate;
     id dataSource = table.dataSource;
     BOOL leading = WCRInstallGroupLeadingSwipeForClass(object_getClass(controller));
@@ -3321,9 +3407,10 @@ static UITableViewCell *hook_groupCell(id self, SEL cmd, UITableView *table, NSI
     UITableViewCell *cell = orig_groupCell ? orig_groupCell(self, cmd, table, path) : nil;
     @try {
         if (WCRIsGroupingSessionListController(self) && table) {
-            table.clipsToBounds = YES;
-            cell.clipsToBounds = YES;
+            WCRAFGroupSwipe *rightSwipe = [WCRAFGroupSwipe controllerForTable:table create:NO];
+            if (rightSwipe.cell == cell) [rightSwipe reset];
             WCRConfigureGroupingSwipe(table, self);
+            if (cell) WCRBindCanonicalHomeRow(cell, self, table, path);
         }
     } @catch (__unused NSException *exception) {
         WCRHardResetCellVisual(cell, YES);
@@ -3343,121 +3430,14 @@ static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
             ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))original)(
                 self, cmd, table, path) : nil;
     }
-    if (!path || path.section != 0 || path.row < 0) return nil;
-    NSArray *items = nil;
-    @try { items = [controller items]; }
-    @catch (__unused NSException *exception) { return nil; }
-    if (path.row >= (NSInteger)items.count) return nil;
-
-    UITableViewCell *cell = [table cellForRowAtIndexPath:path];
-    WCRGroupSwipeTrace(@"leading-cell", cell ? @"available=YES" : @"available=NO");
-    if (!cell) return nil;
-
-    WCRBindCanonicalHomeRow(cell, controller, table, path);
-    NSString *username = nil;
-    WCRRightActionKind kind = WCRActionKindForCell(
-        cell, NULL, NULL, NULL, NULL, &username);
-    if (gWCRGroupSwipeDiagnostics && gWCRGroupSwipeDiagnosticCount < 48) {
-        WCRGroupSwipeTrace(@"leading-action", [NSString stringWithFormat:@"kind=%ld",
-            (long)kind]);
-    }
-    if (username.length == 0) {
-        return nil;
-    }
-
-    WCRAFAccountContext *context = objc_getAssociatedObject(cell, kWCRCanonicalAccountKey);
-    if (![WCRAFStore() isCurrentContext:context]) {
-        return nil;
-    }
-    if (!WCRIsInCustomGroup(username)) {
-        return nil;
-    }
-
-    NSMutableArray<UIContextualAction *> *actions = [NSMutableArray array];
-    if (kind == WCRRightActionPending || kind == WCRRightActionUnknown ||
-        kind == WCRRightActionNone) {
-        WCRRightActionKind placeholderKind = kind == WCRRightActionPending ?
-            WCRRightActionPending : WCRRightActionUnknown;
-        UIContextualAction *pending = [UIContextualAction
-            contextualActionWithStyle:UIContextualActionStyleNormal
-            title:placeholderKind == WCRRightActionUnknown ? @"设置" :
-                WCRTitleForActionKind(placeholderKind)
-            handler:^(__unused UIContextualAction *selected,
-                      UIView *source,
-                      void (^completion)(BOOL)) {
-            if (placeholderKind == WCRRightActionUnknown &&
-                [WCRAFStore() isCurrentContext:context]) {
-                UIAlertController *sheet = [UIAlertController
-                    alertControllerWithTitle:@"消息提醒"
-                    message:nil
-                    preferredStyle:UIAlertControllerStyleActionSheet];
-                for (NSNumber *target in @[@NO, @YES]) {
-                    BOOL muted = target.boolValue;
-                    [sheet addAction:[UIAlertAction
-                        actionWithTitle:muted ? @"开启免打扰" : @"开启提醒"
-                        style:UIAlertActionStyleDefault
-                        handler:^(__unused UIAlertAction *action) {
-                        if (![WCRAFStore() isCurrentContext:context]) return;
-                        WCRInvalidateSendAcknowledgments(username, context);
-                        WCRSetNativeMuted(username, muted, context,
-                            ^(BOOL success, NSString *failure) {
-                            if (failure.length > 0) WCRReminderFailure(failure);
-                            if (success) {
-                                WCRRefreshHomeGlobal(
-                                    @"active_front_group_reminder_selected", context);
-                            }
-                        });
-                    }]];
-                }
-                [sheet addAction:[UIAlertAction actionWithTitle:@"取消"
-                    style:UIAlertActionStyleCancel handler:nil]];
-                UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-                popover.sourceView = source;
-                popover.sourceRect = source.bounds;
-                UIViewController *presenter = WCRPresenterForHost(controller);
-                [presenter presentViewController:sheet animated:YES completion:nil];
-            }
-            completion(NO);
-        }];
-        pending.backgroundColor = [UIColor clearColor];
-        [actions addObject:pending];
-    } else {
-        BOOL stateKnown = kind == WCRRightActionMute || kind == WCRRightActionRemind;
-        if (!stateKnown) return nil;
-        BOOL muted = kind == WCRRightActionMute;
-        WCRRightActionKind actionKind = muted ? WCRRightActionMute : WCRRightActionRemind;
-        UIContextualAction *action = [UIContextualAction
-                contextualActionWithStyle:UIContextualActionStyleNormal
-                title:WCRTitleForActionKind(actionKind)
-                handler:^(__unused UIContextualAction *selected,
-                          __unused UIView *source,
-                          void (^completion)(BOOL)) {
-                if (![WCRAFStore() isCurrentContext:context] ||
-                    !WCRIsInCustomGroup(username)) {
-                    completion(NO);
-                    return;
-                }
-                WCRInvalidateSendAcknowledgments(username, context);
-                WCRSetNativeMuted(username, muted, context,
-                    ^(BOOL success, NSString *failure) {
-                        if (failure.length > 0) {
-                            WCRReminderFailure(failure);
-                        } else if (success) {
-                            WCRRefreshHomeGlobal(@"active_front_group_native_swipe", context);
-                        }
-                    });
-                completion(YES);
-            }];
-        action.backgroundColor = [UIColor clearColor];
-        [actions addObject:action];
-    }
-    UISwipeActionsConfiguration *configuration =
-        [UISwipeActionsConfiguration configurationWithActions:actions];
-    configuration.performsFirstActionWithFullSwipe = NO;
-    return configuration;
+    // Recognized grouped rows use WCRAFGroupSwipe's bounded transparent
+    // viewport. Do not let UIKit create its rounded gray action container.
+    WCRConfigureGroupingSwipe(table, controller);
+    return nil;
 }
 
 static void hook_groupDisappear(id self, SEL cmd, BOOL animated) {
+    [WCRAFGroupSwipe resetAll];
     WCRResetVisibleSwipeVisuals();
     if (orig_groupDisappear) orig_groupDisappear(self, cmd, animated);
 }
@@ -3971,6 +3951,7 @@ static void WCRRightGroupUIInit(void) {
             [WCRReminderCoordinator() cancelAll];
             WCRCancelReturnAnimation();
             WCRResetVisibleSwipeVisuals();
+            [WCRAFGroupSwipe resetAll];
         }];
         static id activeObserver __attribute__((unused));
         activeObserver = [[NSNotificationCenter defaultCenter]

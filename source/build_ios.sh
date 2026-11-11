@@ -19,8 +19,8 @@ xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -isysroot "$SDK" \
     -DWCRAF_DIAGNOSTICS=0 -DWCRAF_VERBOSE_CELL_LOGS=0 \
     -dynamiclib -framework Foundation -framework UIKit -framework CoreGraphics \
     -Wl,-install_name,@rpath/WCRefineGroup.dylib \
-    -Wl,-current_version,1.9.25 -Wl,-compatibility_version,1.0 -Wl,-dead_strip \
-    "$ROOT/ActiveFront.m" "$ROOT/WCRAFStateStore.m" -o "$TARGET"
+    -Wl,-current_version,1.9.26 -Wl,-compatibility_version,1.0 -Wl,-dead_strip \
+    "$ROOT/ActiveFront.m" "$ROOT/WCRAFGroupSwipe.m" "$ROOT/WCRAFStateStore.m" -o "$TARGET"
 codesign --force --sign - "$TARGET"
 codesign --verify --strict --verbose=2 "$TARGET"
 xcrun otool -hv "$TARGET"

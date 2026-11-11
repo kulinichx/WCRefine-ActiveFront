@@ -12,7 +12,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 INPUTS = (
-    "ActiveFront.m", "WCRAFStateStore.h", "WCRAFStateStore.m",
+    "ActiveFront.m", "WCRAFGroupSwipe.h", "WCRAFGroupSwipe.m",
+    "WCRAFStateStore.h", "WCRAFStateStore.m",
     "tests/StateStoreTests.m", "test_core.sh", "build_ios.sh", "verify_build.py",
 )
 
@@ -142,7 +143,7 @@ def main():
     validate_inputs(tests, inputs, current)
     binary = inspect_macho(args.binary.read_bytes())
     report = {
-        "product": "WCRefineGroup.dylib", "source_version": "1.9.25-source",
+        "product": "WCRefineGroup.dylib", "source_version": "1.9.26-source",
         "binary_sha256": sha256(args.binary), "binary_size": args.binary.stat().st_size,
         "native_tests": tests, "native_test_report_sha256": sha256(args.tests),
         "source_files_sha256": current, "macho": binary,
