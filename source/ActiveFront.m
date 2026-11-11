@@ -329,33 +329,6 @@ static id WCRRememberedGroupingController(UITableView *table) {
     }
 }
 
-static void WCRRefreshVisibleGroupingRow(NSString *username, WCRAFAccountContext *context) {
-    if (username.length == 0 || !context) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSMutableArray<NSDictionary *> *matches = [NSMutableArray array];
-        @synchronized([NSMapTable class]) {
-            for (UITableView *table in gWCRGroupingTableOwners.keyEnumerator) {
-                id controller = [gWCRGroupingTableOwners objectForKey:table];
-                if (!table.window || !WCRIsGroupingSessionListController(controller)) continue;
-                UIViewController *owner = (UIViewController *)controller;
-                if (!owner.isViewLoaded || owner.view.window != table.window) continue;
-                for (UITableViewCell *cell in table.visibleCells) {
-                    if (![objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey) isEqualToString:username] ||
-                        objc_getAssociatedObject(cell, kWCRCanonicalAccountKey) != context) continue;
-                    NSIndexPath *indexPath = [table indexPathForCell:cell];
-                    if (indexPath) [matches addObject:@{@"table": table, @"indexPath": indexPath}];
-                }
-            }
-        }
-        for (NSDictionary *match in matches) {
-            UITableView *table = match[@"table"];
-            NSIndexPath *indexPath = match[@"indexPath"];
-            if (!table.window || ![table cellForRowAtIndexPath:indexPath]) continue;
-            [table reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
-        }
-    });
-}
-
 static BOOL WCRIsActiveFrontHomeTable(UITableView *tableView) {
     if (!WCRIsMainFrameTable(tableView)) return NO;
 
@@ -568,7 +541,6 @@ static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContex
                 return WCRAFInvokeNativeNotify(manager, targetContact, !muted);
             } @catch (__unused NSException *exception) { return WCRAFNativeNotifyUnavailable; }
         } pending:^{} completion:^(WCRAFNotifyOutcome outcome) {
-            WCRRefreshVisibleGroupingRow(username, context);
             if (outcome == WCRAFNotifyConfirmed) {
                 WCRRememberReminder(username, muted, context);
                 completion(YES, nil);
@@ -576,7 +548,6 @@ static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContex
             }
             if (outcome == WCRAFNotifyUnconfirmed) {
                 WCRReminderPendingNotice();
-                WCRRefreshHomeGlobal(@"active_front_reminder_unconfirmed", context);
                 completion(NO, nil);
                 return;
             }
@@ -3387,9 +3358,8 @@ static void WCRConfigureGroupingSwipe(UITableView *table, id controller) {
                     style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *selected) {
                     if (![WCRAFStore() isCurrentContext:context]) return;
                     WCRInvalidateSendAcknowledgments(username, context);
-                    WCRSetNativeMuted(username, muted, context, ^(BOOL success, NSString *failure) {
+                    WCRSetNativeMuted(username, muted, context, ^(__unused BOOL success, NSString *failure) {
                         if (failure.length) WCRReminderFailure(failure);
-                        if (success) WCRRefreshHomeGlobal(@"active_front_group_reminder_selected", context);
                     });
                 }]];
             }
@@ -3404,9 +3374,8 @@ static void WCRConfigureGroupingSwipe(UITableView *table, id controller) {
         if (kind != WCRRightActionMute && kind != WCRRightActionRemind) return;
         WCRInvalidateSendAcknowledgments(username, context);
         WCRSetNativeMuted(username, kind == WCRRightActionMute, context,
-            ^(BOOL success, NSString *failure) {
+            ^(__unused BOOL success, NSString *failure) {
             if (failure.length) WCRReminderFailure(failure);
-            else if (success) WCRRefreshHomeGlobal(@"active_front_group_swipe", context);
         });
     };
     id delegate = table.delegate;
