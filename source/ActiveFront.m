@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.21 native leading swipe actions for grouped rows.
+// WCRefine ActiveFront - v1.9.22 native leading swipe actions for grouped rows.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -76,7 +76,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.21-source";
+static NSString * const kWCRAFVersion = @"1.9.22-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -2839,8 +2839,10 @@ static void WCRWirePanPriority(UIView *view,
 
 static void WCRAttachToCell(UITableViewCell *cell) {
     UITableView *tableView = WCRTableForCell(cell);
-    if (!WCRIsSupportedSwipeTable(tableView) ||
-        !WCRIsSupportedSwipeCell(cell)) return;
+    // All entry points, including didMoveToWindow, must leave grouping rows
+    // to UIKit. A cell pan would otherwise compete with the native action.
+    if (!WCRIsActiveFrontHomeTable(tableView) ||
+        !WCRIsMainFrameCell(cell)) return;
 
     NSString *currentUsername = nil;
     WCRRightActionKind currentKind =
@@ -3082,34 +3084,39 @@ static void (*orig_sessionAddMsg)(id, SEL, id, id);
 static void (*orig_sessionModMsg)(id, SEL, id, id);
 static UITableViewCell *(*orig_groupCell)(id, SEL, UITableView *, NSIndexPath *);
 static NSMutableDictionary *gWCRGroupLeadingSwipeOriginals;
+static NSMutableDictionary *gWCRGroupCanEditOriginals;
+static BOOL (*orig_groupCellPanShouldBegin)(id, SEL, UIGestureRecognizer *);
 static void (*orig_homeSelection)(id, SEL, UITableView *, NSIndexPath *);
 static void (*orig_groupDisappear)(id, SEL, BOOL);
+static void (*orig_groupAppear)(id, SEL, BOOL);
 static BOOL gWCRHookGroupLeadingSwipe;
+static BOOL gWCRHookGroupCanEdit;
+static const void *kWCRGroupSwipeDelegatesKey = &kWCRGroupSwipeDelegatesKey;
 
 static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
     id self, SEL cmd, UITableView *table, NSIndexPath *path);
+static BOOL hook_groupCanEdit(id self, SEL cmd, UITableView *table, NSIndexPath *path);
 
 static NSValue *WCRClassKey(Class cls) {
     return [NSValue valueWithPointer:(__bridge const void *)cls];
 }
 
-static void WCRRememberGroupLeadingOriginal(Class cls, IMP original) {
-    if (!gWCRGroupLeadingSwipeOriginals) {
-        gWCRGroupLeadingSwipeOriginals = [NSMutableDictionary dictionary];
+static void WCRRememberGroupRowOriginal(NSMutableDictionary *__strong *originals, Class cls, IMP original) {
+    if (!*originals) {
+        *originals = [NSMutableDictionary dictionary];
     }
     if (original) {
-        gWCRGroupLeadingSwipeOriginals[WCRClassKey(cls)] =
+        (*originals)[WCRClassKey(cls)] =
             [NSValue valueWithBytes:&original objCType:@encode(IMP)];
     } else {
-        gWCRGroupLeadingSwipeOriginals[WCRClassKey(cls)] = [NSNull null];
+        (*originals)[WCRClassKey(cls)] = [NSNull null];
     }
 }
 
-static IMP WCRGroupLeadingSwipeOriginal(id receiver) {
-    if (!gWCRGroupLeadingSwipeOriginals) return NULL;
+static IMP WCRGroupRowOriginal(NSMutableDictionary *originals, id receiver) {
     for (Class cls = object_getClass(receiver); cls; cls = class_getSuperclass(cls)) {
         NSValue *key = WCRClassKey(cls);
-        id value = gWCRGroupLeadingSwipeOriginals[key];
+        id value = originals[key];
         if (!value) continue;
         if (![value isKindOfClass:[NSValue class]]) return NULL;
         IMP original = NULL;
@@ -3119,36 +3126,122 @@ static IMP WCRGroupLeadingSwipeOriginal(id receiver) {
     return NULL;
 }
 
-static BOOL WCRInstallGroupLeadingSwipeForClass(Class cls) {
+static BOOL WCRInstallGroupRowMethod(Class cls, SEL selector, IMP replacement,
+                                     char result, NSMutableDictionary *__strong *originals) {
     if (!cls) return NO;
-    SEL selector = NSSelectorFromString(
-        @"tableView:leadingSwipeActionsConfigurationForRowAtIndexPath:");
     Method method = class_getInstanceMethod(cls, selector);
     if (!method) {
-        if (!class_addMethod(cls, selector, (IMP)hook_groupLeadingSwipe, "@@:@@")) {
+        const char *types = result == '@' ? "@@:@@" : "B@:@@";
+        if (!class_addMethod(cls, selector, replacement, types)) {
             return NO;
         }
-        WCRRememberGroupLeadingOriginal(cls, NULL);
+        WCRRememberGroupRowOriginal(originals, cls, NULL);
         return YES;
     }
 
     const char *types = method_getTypeEncoding(method);
     NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:types];
     if (signature.numberOfArguments != 4 ||
-        signature.methodReturnType[0] != '@' ||
+        (signature.methodReturnType[0] != result &&
+         !(result == 'B' && signature.methodReturnType[0] == 'c')) ||
         [signature getArgumentTypeAtIndex:2][0] != '@' ||
         [signature getArgumentTypeAtIndex:3][0] != '@') {
         return NO;
     }
 
     IMP current = method_getImplementation(method);
-    if (current == (IMP)hook_groupLeadingSwipe) return YES;
-    BOOL added = class_addMethod(cls, selector, (IMP)hook_groupLeadingSwipe, types);
+    if (current == replacement) return YES;
+    BOOL added = class_addMethod(cls, selector, replacement, types);
     if (!added) {
-        current = class_replaceMethod(cls, selector, (IMP)hook_groupLeadingSwipe, types);
+        current = class_replaceMethod(cls, selector, replacement, types);
     }
-    WCRRememberGroupLeadingOriginal(cls, current);
+    WCRRememberGroupRowOriginal(originals, cls, current);
     return YES;
+}
+
+static BOOL WCRInstallGroupLeadingSwipeForClass(Class cls) {
+    return WCRInstallGroupRowMethod(cls, NSSelectorFromString(
+        @"tableView:leadingSwipeActionsConfigurationForRowAtIndexPath:"),
+        (IMP)hook_groupLeadingSwipe, '@', &gWCRGroupLeadingSwipeOriginals);
+}
+
+static BOOL WCRInstallGroupCanEditForClass(Class cls) {
+    return WCRInstallGroupRowMethod(cls, NSSelectorFromString(
+        @"tableView:canEditRowAtIndexPath:"), (IMP)hook_groupCanEdit,
+        'B', &gWCRGroupCanEditOriginals);
+}
+
+static WCRRightActionKind WCRGroupActionAtPath(UITableView *table, NSIndexPath *path) {
+    WCRGroupingSessionListViewController *controller = WCRGroupControllerForTable(table);
+    if (!controller || !path || path.section != 0 || path.row < 0) return WCRRightActionNone;
+    UITableViewCell *cell = [table cellForRowAtIndexPath:path];
+    if (!cell) return WCRRightActionNone;
+    WCRBindCanonicalHomeRow(cell, controller, table, path);
+    return WCRActionKindForCell(cell, NULL, NULL, NULL, NULL, NULL);
+}
+
+static BOOL hook_groupCanEdit(id self, SEL cmd, UITableView *table, NSIndexPath *path) {
+    WCRRightActionKind kind = WCRGroupActionAtPath(table, path);
+    if (kind == WCRRightActionMute || kind == WCRRightActionRemind ||
+        kind == WCRRightActionPending) return YES;
+    IMP original = WCRGroupRowOriginal(gWCRGroupCanEditOriginals, self);
+    return original ? ((BOOL (*)(id, SEL, UITableView *, NSIndexPath *))original)(
+        self, cmd, table, path) : NO;
+}
+
+static BOOL hook_groupCellPanShouldBegin(id self, SEL cmd, UIGestureRecognizer *gesture) {
+    // WCRefine configures WeChat's MMBaseMultiMenuTableViewCell for LEFT
+    // menus. Yield only a closed, eligible grouped row's RIGHT pan to UIKit.
+    if ([self isKindOfClass:UITableViewCell.class] &&
+        [gesture isKindOfClass:UIPanGestureRecognizer.class]) {
+        UITableViewCell *cell = self;
+        UITableView *table = WCRTableForCell(cell);
+        if (WCRGroupControllerForTable(table) && !WCRWeChatLeftSwipeMenuVisible(cell)) {
+            CGPoint velocity = [(UIPanGestureRecognizer *)gesture velocityInView:cell];
+            if (velocity.x > 0 && velocity.x > fabs(velocity.y) * 1.12) {
+                WCRRightActionKind kind = WCRGroupActionAtPath(table, [table indexPathForCell:cell]);
+                if (kind == WCRRightActionMute || kind == WCRRightActionRemind ||
+                    kind == WCRRightActionPending) return NO;
+            }
+        }
+    }
+    return orig_groupCellPanShouldBegin ?
+        orig_groupCellPanShouldBegin(self, cmd, gesture) : YES;
+}
+
+static void WCRConfigureGroupingSwipe(UITableView *table, id controller) {
+    if (!table || !WCRIsGroupingSessionListController(controller)) return;
+    WCRRememberGroupingTable(table, controller);
+    id delegate = table.delegate;
+    id dataSource = table.dataSource;
+    BOOL leading = WCRInstallGroupLeadingSwipeForClass(object_getClass(controller));
+    if (delegate != controller) {
+        leading = WCRInstallGroupLeadingSwipeForClass(object_getClass(delegate)) && leading;
+    }
+    BOOL canEdit = WCRInstallGroupCanEditForClass(object_getClass(dataSource));
+    if (!leading || !canEdit || !delegate || !dataSource) return;
+
+    // UITableView caches optional callbacks when its delegates are assigned.
+    // Reassign once per delegate pair after installing the missing selectors.
+    NSArray *pair = @[[NSValue valueWithNonretainedObject:delegate],
+                     [NSValue valueWithNonretainedObject:dataSource]];
+    if ([objc_getAssociatedObject(table, kWCRGroupSwipeDelegatesKey) isEqual:pair]) return;
+    objc_setAssociatedObject(table, kWCRGroupSwipeDelegatesKey, pair, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    __weak UITableView *weakTable = table;
+    __weak id weakDelegate = delegate;
+    __weak id weakDataSource = dataSource;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITableView *liveTable = weakTable;
+        id liveDelegate = weakDelegate;
+        id liveDataSource = weakDataSource;
+        if (!liveTable || liveTable.delegate != liveDelegate ||
+            liveTable.dataSource != liveDataSource ||
+            ![objc_getAssociatedObject(liveTable, kWCRGroupSwipeDelegatesKey) isEqual:pair]) return;
+        liveTable.delegate = nil;
+        liveTable.dataSource = nil;
+        liveTable.dataSource = liveDataSource;
+        liveTable.delegate = liveDelegate;
+    });
 }
 
 static void hook_addMsg(id self, SEL cmd, id username, id wrap) {
@@ -3186,9 +3279,7 @@ static UITableViewCell *hook_groupCell(id self, SEL cmd, UITableView *table, NSI
     UITableViewCell *cell = orig_groupCell ? orig_groupCell(self, cmd, table, path) : nil;
     @try {
         if (WCRIsGroupingSessionListController(self) && table) {
-            WCRRememberGroupingTable(table, self);
-            WCRInstallGroupLeadingSwipeForClass(object_getClass(self));
-            WCRInstallGroupLeadingSwipeForClass(object_getClass(table.delegate));
+            WCRConfigureGroupingSwipe(table, self);
         }
     } @catch (__unused NSException *exception) {
         WCRHardResetCellVisual(cell, YES);
@@ -3199,7 +3290,7 @@ static UITableViewCell *hook_groupCell(id self, SEL cmd, UITableView *table, NSI
 
 static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
     id self, SEL cmd, UITableView *table, NSIndexPath *path) {
-    IMP original = WCRGroupLeadingSwipeOriginal(self);
+    IMP original = WCRGroupRowOriginal(gWCRGroupLeadingSwipeOriginals, self);
     WCRGroupingSessionListViewController *controller =
         WCRGroupControllerForTable(table);
     if (!controller || path.section != 0 || path.row < 0) {
@@ -3262,6 +3353,13 @@ static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
 static void hook_groupDisappear(id self, SEL cmd, BOOL animated) {
     WCRResetVisibleSwipeVisuals();
     if (orig_groupDisappear) orig_groupDisappear(self, cmd, animated);
+}
+
+static void hook_groupAppear(id self, SEL cmd, BOOL animated) {
+    if (orig_groupAppear) orig_groupAppear(self, cmd, animated);
+    @try {
+        WCRConfigureGroupingSwipe([(WCRGroupingSessionListViewController *)self tableView], self);
+    } @catch (__unused NSException *exception) { }
 }
 
 static void hook_homeSelection(id self, SEL cmd, UITableView *table, NSIndexPath *path) {
@@ -3648,6 +3746,15 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         gWCRHookGroupLeadingSwipe =
             WCRInstallGroupLeadingSwipeForClass(groupList);
     }
+    if (!gWCRHookGroupCanEdit && groupList) {
+        gWCRHookGroupCanEdit = WCRInstallGroupCanEditForClass(groupList);
+    }
+    if (!orig_groupCellPanShouldBegin) WCRInstallCheckedHook(
+        NSClassFromString(@"MMBaseMultiMenuTableViewCell"),
+        @"gestureRecognizerShouldBegin:", 'B', "@",
+        (IMP)hook_groupCellPanShouldBegin, (IMP *)&orig_groupCellPanShouldBegin);
+    if (!orig_groupAppear) WCRInstallCheckedHook(groupList,
+        @"viewDidAppear:", 'v', "B", (IMP)hook_groupAppear, (IMP *)&orig_groupAppear);
     if (!orig_groupDisappear) WCRInstallCheckedHook(groupList,
         @"viewWillDisappear:", 'v', "B", (IMP)hook_groupDisappear, (IMP *)&orig_groupDisappear);
     if (!orig_homeSelection) WCRInstallCheckedHook(mainFrame,
@@ -3662,7 +3769,8 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         gWCRHookWillDisplay &&
         gWCRHookCellReuse &&
         gWCRHookCellDidMove && orig_addMsg && orig_sessionAddMsg && orig_sessionModMsg &&
-        orig_groupCell && gWCRHookGroupLeadingSwipe && orig_groupDisappear &&
+        orig_groupCell && gWCRHookGroupLeadingSwipe && gWCRHookGroupCanEdit &&
+        orig_groupCellPanShouldBegin && orig_groupAppear && orig_groupDisappear &&
         orig_homeSelection;
 
     if (allInstalled) {

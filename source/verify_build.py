@@ -142,7 +142,7 @@ def main():
     validate_inputs(tests, inputs, current)
     binary = inspect_macho(args.binary.read_bytes())
     report = {
-        "product": "WCRefineGroup.dylib", "source_version": "1.9.21-source",
+        "product": "WCRefineGroup.dylib", "source_version": "1.9.22-source",
         "binary_sha256": sha256(args.binary), "binary_size": args.binary.stat().st_size,
         "native_tests": tests, "native_test_report_sha256": sha256(args.tests),
         "source_files_sha256": current, "macho": binary,

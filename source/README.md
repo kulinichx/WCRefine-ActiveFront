@@ -1,36 +1,31 @@
 # WCRefineGroup 源码修复候选
 
 日期：2026-11-11  
-源码标识：`1.9.21-source`  
+源码标识：`1.9.22-source`  
 最终产品文件名：**`WCRefineGroup.dylib`**
 
-## 本轮：分组右滑接入原生 swipe actions
+## 本轮：补齐分组原生右滑入口
 
-1.9.20 放开分组 cell 类型后，用户反馈 iPad 分组右滑仍无响应；1.9.21 首版加入
-UIKit 原生 leading action 后，用户复测仍无响应。实际手势拦截点尚未通过设备日志确认。
-本版不再在分组 cell 上安装自定义 Pan，而是在分组控制器及分组表格
-实际 delegate 上提供 UIKit `leadingSwipeActionsConfigurationForRowAtIndexPath:`；
-右滑动作使用系统原生揭示、收拢和回弹，WCRefine 原有 `trailing` 左滑路径不变。
+1.9.21 加入 leading action 后，iPad 分组右滑仍无响应。反汇编确认分组页复用
+`NewMainFrameCell`，并配置微信多菜单 cell 的原有菜单；首页同时有 WCRefine 的
+trailing delegate 转发。不能把首页转发当作分组页的全部手势实现。
 
-本次源码修订将旧 Pan 限定在首页表格；分组表格由 WCRefine 自身的 `cellForRow`
-回调登记其控制器，避免依赖可能被 iPad 容器或 delegate proxy 隔开的 responder
-chain。实际 delegate class 也会保存/调用原始右滑实现；非 WCRefine 分组表格回落到
-原 delegate。此修订已通过 Apple 工具链编译，尚待 iPad 实机验证。
+1.9.22 修正三个缺口：
 
-右滑显示“免扰”或“提醒”，点击后切换微信实际通知状态；禁用整行全滑触发，
-减少误触。每次仅针对 UIKit 提供的分组行读取会话状态。
+- 自定义 pan 在统一安装入口限定为首页，包含 `didMoveToWindow` 路径。
+  分组页通过 UIKit leading action 显示“免扰”或“提醒”，全滑不执行操作。
+- 为实际 dataSource 补齐 `canEditRowAtIndexPath:`，原实现按类保存。
+  添加可选方法后，每个 delegate/dataSource 组合只重新登记一次表格代理。
+  不增加周期扫描、计时器或逐行异步安装。
+- 包装 WCRefine 已使用的 `MMBaseMultiMenuTableViewCell` 手势入口。
+  只有分组行、菜单关闭且有可用提醒操作的水平右滑才退让给 UIKit。
+  左滑、原菜单收起、竖滑和其它表格继续调用原实现。
 
-包含上述表格登记修订的 1.9.21 后续构建已完成 Apple 工具链构建：35 项本地源码契约检查、
-18 项构建验收器测试、**123 项原生 Foundation 核心测试全部通过，iOS ARM64 编译零警告**。
-Apple 签名检查、下载压缩包哈希、CodeDirectory 页哈希和编译输入快照均已验收通过。
-当前 `build/WCRefineGroup.dylib` 为最新库，298,960 字节，SHA-256：
-`2ddb736d95213eb1a20562e8c1a386363a784c3653875053850e65a33d7ca00b`。
-源码提交 `3e9594a777ed58dbfb5d21ac73ee06283c725532`；
-CI run `42947733633`，artifact `13823248287`。
-上一版归档在 `../audit/backups/source-build-1.9.21-pre-3e9594a/`，1.9.20
-归档在 `../audit/backups/source-build-1.9.20-pre-f02c826/`；
-根目录旧库未替换。证据见 `../audit/source_build_acceptance.json`。
-**上述检查不包含 UIKit 手势或 iPad 真机测试，分组右滑效果仍待设备确认。**
+同时保留本轮 iPad 首页可见控制器登记和长滑距离上限修订；
+临时消息活动不写入保持状态，不清除用户已保存的保持记录。
+
+当前源码正在准备 Apple 工具链构建；旧 `build/` 库不能视为本轮产物。
+设备侧是否进入 UIKit leading 回调仍待 iPad 验证。
 
 ## 1.9.18：等待真实状态，串行处理提醒设置
 
