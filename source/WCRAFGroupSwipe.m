@@ -200,8 +200,15 @@ static const CGFloat actionWidth = 60;
     UITableViewCell *cell = self.cell;
     if (!cell.window || ![self.table indexPathForCell:cell] || CGRectIsEmpty(cell.bounds)) return NO;
     [cell layoutIfNeeded];
-    UIView *picture = [cell snapshotViewAfterScreenUpdates:NO];
-    if (!picture) return NO;
+    // Own the rendered pixels. A live UIKit snapshot can be unavailable or
+    // invalidated when the host reconfigures/recycles the native row.
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithBounds:cell.bounds];
+    UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+        [cell.layer renderInContext:context.CGContext];
+    }];
+    if (!image.CGImage) return NO;
+    UIImageView *picture = [[UIImageView alloc] initWithImage:image];
+    picture.contentMode = UIViewContentModeScaleToFill;
     WCRAFGroupSwipeSurface *surface = [[WCRAFGroupSwipeSurface alloc] initWithFrame:cell.bounds];
     surface.originalBounds = surface.bounds;
     surface.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;

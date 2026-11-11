@@ -16,6 +16,29 @@ static void Check(BOOL condition, NSString *message) {
     if (!condition) @throw [NSException exceptionWithName:@"UITestFailure" reason:message userInfo:nil];
 }
 
+static BOOL HasRenderedContent(UIImage *image) {
+    CGImageRef pixels = image.CGImage;
+    if (!pixels) return NO;
+    CFDataRef data = CGDataProviderCopyData(CGImageGetDataProvider(pixels));
+    if (!data) return NO;
+    const UInt8 *bytes = CFDataGetBytePtr(data);
+    CFIndex length = CFDataGetLength(data);
+    size_t stride = CGImageGetBitsPerPixel(pixels) / 8;
+    BOOL varied = NO;
+    if (stride >= 3 && length > (CFIndex)stride) {
+        for (CFIndex offset = (CFIndex)stride; offset + 2 < length; offset += (CFIndex)stride * 7) {
+            if (abs((int)bytes[offset] - bytes[0]) > 24 ||
+                abs((int)bytes[offset + 1] - bytes[1]) > 24 ||
+                abs((int)bytes[offset + 2] - bytes[2]) > 24) {
+                varied = YES;
+                break;
+            }
+        }
+    }
+    CFRelease(data);
+    return varied;
+}
+
 @interface SwipeTestController : UIViewController <UITableViewDataSource>
 @property(nonatomic, strong) UITableView *table;
 @end
@@ -103,6 +126,8 @@ static void Check(BOOL condition, NSString *message) {
                     Check([swipe beginSurface], @"Snapshot must be created");
                     UIView *surface = [swipe valueForKey:@"surface"];
                     Check(surface.superview == cell, @"Overlay must stay aligned to its native row");
+                    UIImageView *foreground = [surface valueForKey:@"foreground"];
+                    Check(HasRenderedContent(foreground.image), @"Rendered swipe row must contain visible pixels");
                     [swipe setOffset:1000];
                     UIView *viewport = [surface valueForKey:@"viewport"];
                     UIView *actions = [surface valueForKey:@"actions"];
