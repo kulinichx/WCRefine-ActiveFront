@@ -265,6 +265,74 @@ static int QualifiedNotifyWrite(id self, __unused SEL cmd, id contact, int notif
 }
 @end
 
+@protocol WCRAFTestContactExtension <NSObject>
+- (void)onModifyContact:(id)contact;
+@end
+
+@interface NotifyNamedContact : NotifyIntReader
+@property(nonatomic, copy) NSString *m_nsUsrName;
+@end
+@implementation NotifyNamedContact
+@end
+
+@interface NotifyHostContext : NSObject
+@property(nonatomic, strong) id<WCRAFTestContactExtension> target;
+@property(nonatomic) NSUInteger registrations;
+@property(nonatomic) NSUInteger removals;
+- (void)registerExtension:(Protocol *)extension withTarget:(id)target;
+- (void)unRegisterExtension:(Protocol *)extension withTarget:(id)target;
+@end
+@implementation NotifyHostContext
+- (void)registerExtension:(__unused Protocol *)extension withTarget:(id)target {
+    self.registrations++;
+    self.target = target;
+}
+- (void)unRegisterExtension:(__unused Protocol *)extension withTarget:(id)target {
+    self.removals++;
+    if (self.target == target) self.target = nil;
+}
+@end
+
+@interface ContactObserverFixture : NSObject
+@property(nonatomic, strong) WCRAFContactChangeObserver *observer;
+@property(nonatomic, strong) NotifyHostContext *host;
+@property(nonatomic, strong) NotifyNamedContact *contact;
+@property(nonatomic, strong) NSMutableArray *queued;
+@property(nonatomic, strong) NSMutableArray *delivered;
+- (BOOL)watch:(NSString *)name;
+- (void)drain;
+@end
+@implementation ContactObserverFixture
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _queued = [NSMutableArray array];
+        _delivered = [NSMutableArray array];
+        _host = [NotifyHostContext new];
+        _contact = [NotifyNamedContact new];
+        _contact.m_nsUsrName = @"room@chatroom";
+        __weak ContactObserverFixture *weakSelf = self;
+        _observer = [[WCRAFContactChangeObserver alloc] initWithScheduler:^(void (^work)(void)) {
+            [weakSelf.queued addObject:[work copy]];
+        }];
+    }
+    return self;
+}
+- (BOOL)watch:(NSString *)name {
+    __weak ContactObserverFixture *weakSelf = self;
+    return [self.observer watchUsername:name hostContext:self.host
+        extensionProtocol:@protocol(WCRAFTestContactExtension) changed:^(NSString *username) {
+            [weakSelf.delivered addObject:username];
+        }];
+}
+- (void)drain {
+    CHECK(self.queued.count == 1);
+    void (^work)(void) = self.queued.firstObject;
+    [self.queued removeObjectAtIndex:0];
+    work();
+}
+@end
+
 static void NoAutomaticLegacyMigration(Fixture *f) {
     [f.defaults setObject:@[@"alice"] forKey:LegacyNames];
     [f.defaults setInteger:3 forKey:LegacyDays];
@@ -1827,11 +1895,11 @@ static void NotifyHostEventsHaveReadBudget(Fixture *f) {
     }
     CHECK(op.reads == 3);
     for (NSUInteger index = 0; index < 20; index++) [op observe];
-    CHECK(op.reads == 19 && op.manager.calls == 1 && op.outcomes.count == 0);
+    CHECK(op.reads == 11 && op.manager.calls == 1 && op.outcomes.count == 0);
     f.now += 20;
     op.contact.value = 0; // Final event still gets a fresh read despite the budget.
     [op.coordinator observeUsername:@"room@chatroom" context:op.context];
-    CHECK(op.reads == 20 && op.outcomes.lastObject.integerValue == WCRAFNotifyConfirmed);
+    CHECK(op.reads == 12 && op.outcomes.lastObject.integerValue == WCRAFNotifyConfirmed);
 }
 
 static void NotifyUnconfirmedExpiresLazily(Fixture *f) {
@@ -1961,11 +2029,11 @@ static void NotifyReadbackBudgetEndsWithoutHostEvents(Fixture *f) {
     NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
     NSTimeInterval started = f.now;
     [op request:NO];
-    for (NSUInteger index = 0; index < 4; index++) {
+    for (NSUInteger index = 0; index < 5; index++) {
         CHECK(op.scheduled.count == 1);
         [op runNext];
     }
-    CHECK(op.scheduled.count == 0 && op.reads == 6 && op.manager.calls == 1);
+    CHECK(op.scheduled.count == 0 && op.reads == 7 && op.manager.calls == 1);
     CHECK(fabs(f.now - started - 8.0) < 0.001);
     CHECK([op.outcomes isEqual:@[@(WCRAFNotifyUnconfirmed)]]);
     CHECK([op.coordinator pendingNotifyForUsername:@"room@chatroom" context:op.context] == -1);
@@ -1997,8 +2065,208 @@ static void NotifyUnknownReadbackEndsWithoutSuccess(Fixture *f) {
     [op request:NO];
     op.contact.throwRead = YES;
     while (op.scheduled.count) [op runNext];
-    CHECK(op.reads == 6 && op.manager.calls == 1);
+    CHECK(op.reads == 7 && op.manager.calls == 1);
     CHECK([op.outcomes isEqual:@[@(WCRAFNotifyUnconfirmed)]]);
+}
+
+static void NotifyNextTurnDoesNotWaitForTimer(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    NSTimeInterval start = f.now;
+    [op request:NO];
+    CHECK([op.scheduled.firstObject[@"delay"] doubleValue] == 0);
+    op.contact.value = 0;
+    [op runNext];
+    CHECK(f.now == start && op.reads == 3 && op.manager.calls == 1);
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    CHECK(op.scheduled.count == 0);
+}
+
+static void NotifyContactEventDoesNotWaitForThrottle(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    [op runNext];
+    f.now += 0.01;
+    op.contact.value = 0;
+    [op.coordinator observeUsername:@"room@chatroom" context:op.context];
+    CHECK(op.outcomes.count == 0);
+    [op.coordinator contactDidChangeUsername:@"room@chatroom" context:op.context];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    NSUInteger reads = op.reads;
+    while (op.scheduled.count) [op runNext];
+    CHECK(op.reads == reads && op.manager.calls == 1);
+}
+
+static void NotifyContactEventsHaveSeparateBoundedBudget(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    for (NSUInteger i = 0; i < 1000; i++)
+        [op.coordinator contactDidChangeUsername:@"room@chatroom" context:op.context];
+    CHECK(op.reads == 10);
+    for (NSUInteger i = 0; i < 20; i++) [op observe];
+    CHECK(op.reads == 18 && op.manager.calls == 1 && op.outcomes.count == 0);
+    op.contact.value = 0;
+    [op runNext];
+    CHECK(op.reads == 19 && op.outcomes.lastObject.integerValue == WCRAFNotifyConfirmed);
+}
+
+static void NotifyContactEventIsScopedAndCancelled(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    op.contact.value = 0;
+    [op.coordinator contactDidChangeUsername:@"other" context:op.context];
+    CHECK(op.reads == 2);
+    [op.coordinator cancelAll];
+    [op.coordinator contactDidChangeUsername:@"room@chatroom" context:op.context];
+    CHECK(op.reads == 2 && op.outcomes.count == 0);
+}
+
+static void NotifyContactEventDropsOldAccount(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    f.account = @"account-B";
+    op.contact.value = 0;
+    [op.coordinator contactDidChangeUsername:@"room@chatroom" context:op.context];
+    CHECK(op.reads == 2 && op.outcomes.count == 0);
+}
+
+static void NotifyContactEventSerializesReverse(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    [op request:YES];
+    op.contact.value = 0;
+    [op.coordinator contactDidChangeUsername:@"room@chatroom" context:op.context];
+    CHECK(op.manager.calls == 2 && op.manager.notify && op.outcomes.count == 0);
+    op.contact.value = 1;
+    [op.coordinator contactDidChangeUsername:@"room@chatroom" context:op.context];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    NSUInteger reads = op.reads;
+    while (op.scheduled.count) [op runNext];
+    CHECK(op.reads == reads);
+}
+
+static void ContactObserverRegistersOnceAndCoalesces(__unused Fixture *f) {
+    ContactObserverFixture *observer = [ContactObserverFixture new];
+    CHECK([observer watch:@"room@chatroom"]);
+    CHECK([observer watch:@"room@chatroom"]);
+    CHECK(observer.host.registrations == 1);
+    for (NSUInteger i = 0; i < 1000; i++)
+        [observer.host.target onModifyContact:observer.contact];
+    CHECK(observer.queued.count == 1 && observer.delivered.count == 0);
+    [observer drain];
+    CHECK([observer.delivered isEqual:@[@"room@chatroom"]]);
+}
+
+static void ContactObserverIgnoresUnwatchedEvents(__unused Fixture *f) {
+    ContactObserverFixture *observer = [ContactObserverFixture new];
+    CHECK([observer watch:@"room@chatroom"]);
+    observer.contact.m_nsUsrName = @"other";
+    for (NSUInteger i = 0; i < 1000; i++)
+        [observer.host.target onModifyContact:observer.contact];
+    CHECK(observer.queued.count == 0 && observer.delivered.count == 0);
+    [observer.observer onModifyContact:[NSObject new]];
+    CHECK(observer.queued.count == 0);
+}
+
+static void ContactObserverCancellationDropsQueuedEvents(__unused Fixture *f) {
+    ContactObserverFixture *observer = [ContactObserverFixture new];
+    CHECK([observer watch:@"room@chatroom"]);
+    [observer.host.target onModifyContact:observer.contact];
+    [observer.observer stopUsername:@"room@chatroom"];
+    [observer drain];
+    CHECK(observer.delivered.count == 0);
+    [observer.host.target onModifyContact:observer.contact];
+    CHECK(observer.queued.count == 0);
+    CHECK([observer watch:@"room@chatroom"]);
+    [observer.host.target onModifyContact:observer.contact];
+    [observer.observer stopAll];
+    [observer drain];
+    CHECK(observer.delivered.count == 0 && observer.host.registrations == 1);
+}
+
+static void ContactObserverRebindsHostAndDropsOldBatch(__unused Fixture *f) {
+    ContactObserverFixture *observer = [ContactObserverFixture new];
+    CHECK([observer watch:@"room@chatroom"]);
+    NotifyHostContext *old = observer.host;
+    [old.target onModifyContact:observer.contact];
+    observer.host = [NotifyHostContext new];
+    CHECK([observer watch:@"new-room"]);
+    CHECK(old.removals == 1 && old.target == nil && observer.host.registrations == 1);
+    [observer drain];
+    CHECK(observer.delivered.count == 0);
+    observer.contact.m_nsUsrName = @"new-room";
+    [observer.host.target onModifyContact:observer.contact];
+    [observer drain];
+    CHECK([observer.delivered isEqual:@[@"new-room"]]);
+}
+
+static void ContactObserverRejectsUnsupportedInterfaces(__unused Fixture *f) {
+    ContactObserverFixture *observer = [ContactObserverFixture new];
+    CHECK(![observer.observer watchUsername:@"room" hostContext:[NSObject new]
+        extensionProtocol:@protocol(WCRAFTestContactExtension) changed:^(__unused NSString *name) {}]);
+    CHECK(![observer.observer watchUsername:@"room" hostContext:observer.host
+        extensionProtocol:@protocol(NSObject) changed:^(__unused NSString *name) {}]);
+    CHECK(observer.host.registrations == 0 && observer.queued.count == 0);
+}
+
+static void ContactObserverWatchSetIsBounded(__unused Fixture *f) {
+    ContactObserverFixture *observer = [ContactObserverFixture new];
+    for (NSUInteger i = 0; i < 128; i++) {
+        NSString *name = [NSString stringWithFormat:@"room-%lu", (unsigned long)i];
+        CHECK([observer watch:name]);
+    }
+    CHECK(![observer watch:@"overflow"]);
+    CHECK([observer watch:@"room-0"]);
+    CHECK(observer.host.registrations == 1);
+    [observer.observer stopUsername:@"room-0"];
+    CHECK([observer watch:@"overflow"]);
+}
+
+static void ContactObserverConfirmsThroughNativeCallback(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    ContactObserverFixture *observer = [ContactObserverFixture new];
+    CHECK([observer.observer watchUsername:@"room@chatroom" hostContext:observer.host
+        extensionProtocol:@protocol(WCRAFTestContactExtension) changed:^(NSString *name) {
+            [op.coordinator contactDidChangeUsername:name context:op.context];
+        }]);
+    [op request:NO];
+    [op runNext];
+    op.contact.value = 0;
+    [observer.host.target onModifyContact:observer.contact];
+    CHECK(op.outcomes.count == 0);
+    [observer drain];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+    CHECK(op.manager.calls == 1);
+}
+
+static void NotifyContactEventUnknownNeverConfirms(Fixture *f) {
+    NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
+    [op request:NO];
+    op.contact.throwRead = YES;
+    [op.coordinator contactDidChangeUsername:@"room@chatroom" context:op.context];
+    CHECK(op.reads == 3 && op.outcomes.count == 0);
+    op.contact.throwRead = NO;
+    op.contact.value = 0;
+    [op.coordinator contactDidChangeUsername:@"room@chatroom" context:op.context];
+    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyConfirmed)]]);
+}
+
+static void ContactObserverCapturesEventAccountBeforeDispatch(__unused Fixture *f) {
+    ContactObserverFixture *observer = [ContactObserverFixture new];
+    CHECK([observer.observer watchUsername:@"room@chatroom" hostContext:observer.host
+        extensionProtocol:@protocol(WCRAFTestContactExtension) changed:^(__unused NSString *name) {
+            [observer.delivered addObject:@"old-account"];
+        }]);
+    [observer.host.target onModifyContact:observer.contact];
+    CHECK([observer.observer watchUsername:@"room@chatroom" hostContext:observer.host
+        extensionProtocol:@protocol(WCRAFTestContactExtension) changed:^(__unused NSString *name) {
+            [observer.delivered addObject:@"new-account"];
+        }]);
+    [observer drain];
+    CHECK([observer.delivered.lastObject isEqual:@"old-account"]);
+    [observer.host.target onModifyContact:observer.contact];
+    [observer drain];
+    CHECK([observer.delivered.lastObject isEqual:@"new-account"]);
+    [observer.observer stopAll];
 }
 
 int main(int argc, const char *argv[]) {
@@ -2067,7 +2335,15 @@ int main(int argc, const char *argv[]) {
         TEST(NotifyReverseWaitsForActualFirstWrite), TEST(NotifyAccountSwitchClearsOldCapacity),
         TEST(NotifyReadbackFinishesWithoutHostEvents), TEST(NotifyReadbackBudgetEndsWithoutHostEvents),
         TEST(NotifyReadbackUsesReplacementContact), TEST(NotifyCancellationStopsFurtherScheduledReads),
-        TEST(NotifyUnknownReadbackEndsWithoutSuccess)
+        TEST(NotifyUnknownReadbackEndsWithoutSuccess),
+        TEST(NotifyNextTurnDoesNotWaitForTimer), TEST(NotifyContactEventDoesNotWaitForThrottle),
+        TEST(NotifyContactEventsHaveSeparateBoundedBudget), TEST(NotifyContactEventIsScopedAndCancelled),
+        TEST(NotifyContactEventDropsOldAccount), TEST(NotifyContactEventSerializesReverse),
+        TEST(ContactObserverRegistersOnceAndCoalesces), TEST(ContactObserverIgnoresUnwatchedEvents),
+        TEST(ContactObserverCancellationDropsQueuedEvents), TEST(ContactObserverRebindsHostAndDropsOldBatch),
+        TEST(ContactObserverRejectsUnsupportedInterfaces), TEST(ContactObserverWatchSetIsBounded),
+        TEST(ContactObserverConfirmsThroughNativeCallback), TEST(NotifyContactEventUnknownNeverConfirms),
+        TEST(ContactObserverCapturesEventAccountBeforeDispatch)
 #undef TEST
     };
     int failed = 0;

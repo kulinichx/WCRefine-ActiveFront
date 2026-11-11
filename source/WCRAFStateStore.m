@@ -1,6 +1,7 @@
 #import "WCRAFStateStore.h"
 #import <math.h>
 #import <string.h>
+#import <objc/runtime.h>
 
 static NSString * const WCRAFAccountKeyPrefix = @"com.local.wcrefine.activefront.account.v2.";
 static NSInteger const WCRAFDefaultExpiryDays = 3;
@@ -94,6 +95,129 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
     } @catch (__unused NSException *exception) { return WCRAFNativeNotifyUnavailable; }
 }
 
+static BOOL WCRAFContactExtensionMethod(id host, SEL selector) {
+    NSMethodSignature *signature = [host methodSignatureForSelector:selector];
+    return signature && signature.numberOfArguments == 4 &&
+        *WCRAFNativeType(signature.methodReturnType) == 'v' &&
+        *WCRAFNativeType([signature getArgumentTypeAtIndex:2]) == '@' &&
+        *WCRAFNativeType([signature getArgumentTypeAtIndex:3]) == '@';
+}
+
+@implementation WCRAFContactChangeObserver {
+    __weak id _host;
+    Protocol *_extension;
+    NSMutableDictionary<NSString *, id> *_handlers;
+    NSMutableDictionary<NSString *, id> *_queued;
+    BOOL _scheduled;
+    void (^_scheduler)(void (^)(void));
+}
+- (instancetype)initWithScheduler:(void (^)(void (^)(void)))scheduler {
+    self = [super init];
+    if (self) {
+        _handlers = [NSMutableDictionary dictionary];
+        _queued = [NSMutableDictionary dictionary];
+        _scheduler = [scheduler copy];
+    }
+    return self;
+}
+- (BOOL)watchUsername:(NSString *)username hostContext:(id)host
+    extensionProtocol:(Protocol *)extension changed:(void (^)(NSString *))changed {
+    if (!username.length || !host || !extension || !changed) return NO;
+    SEL registration = NSSelectorFromString(@"registerExtension:withTarget:");
+    SEL removal = NSSelectorFromString(@"unRegisterExtension:withTarget:");
+    @try {
+        struct objc_method_description method =
+            protocol_getMethodDescription(extension, @selector(onModifyContact:), NO, YES);
+        if (!method.types)
+            method = protocol_getMethodDescription(extension, @selector(onModifyContact:), YES, YES);
+        if (!method.types) return NO;
+        NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:method.types];
+        if (signature.numberOfArguments != 3 ||
+            *WCRAFNativeType(signature.methodReturnType) != 'v' ||
+            *WCRAFNativeType([signature getArgumentTypeAtIndex:2]) != '@' ||
+            !WCRAFContactExtensionMethod(host, registration) ||
+            !WCRAFContactExtensionMethod(host, removal)) return NO;
+        @synchronized (self) {
+            if (_host != host || _extension != extension) {
+                [self stopAll];
+                id previous = _host;
+                _host = nil;
+                if (previous) {
+                    ((void (*)(id, SEL, id, id))[previous methodForSelector:removal])
+                        (previous, removal, _extension, self);
+                }
+                _extension = extension;
+                _host = host;
+                _handlers[username] = [changed copy];
+                ((void (*)(id, SEL, id, id))[host methodForSelector:registration])
+                    (host, registration, extension, self);
+            } else {
+                if (_handlers.count >= 128 && !_handlers[username]) return NO;
+                _handlers[username] = [changed copy];
+            }
+        }
+        return YES;
+    } @catch (__unused NSException *exception) {
+        [self stopAll];
+        _host = nil;
+        return NO;
+    }
+}
+- (void)stopUsername:(NSString *)username {
+    @synchronized (self) {
+        [_handlers removeObjectForKey:username];
+        [_queued removeObjectForKey:username];
+    }
+}
+- (void)stopAll {
+    @synchronized (self) {
+        [_handlers removeAllObjects];
+        [_queued removeAllObjects];
+    }
+}
+- (void)onModifyContact:(id)contact {
+    @synchronized (self) {
+        if (_handlers.count == 0) return;
+    }
+    NSString *username;
+    @try {
+        SEL selector = NSSelectorFromString(@"m_nsUsrName");
+        NSMethodSignature *signature = [contact methodSignatureForSelector:selector];
+        if (signature.numberOfArguments != 2 ||
+            *WCRAFNativeType(signature.methodReturnType) != '@') return;
+        id value = ((id (*)(id, SEL))[contact methodForSelector:selector])(contact, selector);
+        if (![value isKindOfClass:NSString.class] || ![value length]) return;
+        username = [value copy];
+    } @catch (__unused NSException *exception) { return; }
+    @synchronized (self) {
+        id handler = _handlers[username];
+        if (!handler) return;
+        _queued[username] = handler;
+        if (_scheduled) return;
+        _scheduled = YES;
+    }
+    __weak WCRAFContactChangeObserver *weakSelf = self;
+    _scheduler(^{
+        WCRAFContactChangeObserver *observer = weakSelf;
+        if (!observer) return;
+        NSDictionary *batch;
+        @synchronized (observer) {
+            batch = [observer->_queued copy];
+            [observer->_queued removeAllObjects];
+            observer->_scheduled = NO;
+        }
+        for (NSString *name in batch) {
+            void (^handler)(NSString *) = batch[name];
+            handler(name);
+        }
+    });
+}
+// Match the supplied observer's other callbacks without changing host contacts.
+- (void)onNewContact:(__unused id)contact {}
+- (void)onRemoveContactFromAddressBook:(__unused id)contact {}
+- (void)onDeleteContact:(__unused id)contact {}
+@end
+
 @interface WCRAFNotifyRequest : NSObject
 @property(nonatomic, copy) NSString *username;
 @property(nonatomic, strong) WCRAFAccountContext *context;
@@ -101,6 +225,7 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
 @property(nonatomic) NSTimeInterval started;
 @property(nonatomic) NSTimeInterval lastEventRead;
 @property(nonatomic) NSUInteger eventReads;
+@property(nonatomic) NSUInteger contactReads;
 @property(nonatomic) NSUInteger scheduledReads;
 @property(nonatomic, copy) NSInteger (^read)(void);
 @property(nonatomic, copy) WCRAFNativeNotifyResult (^write)(void);
@@ -170,7 +295,7 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
     if (!request || request.context != context || ![self isCurrent:request]) return;
     BOOL expired = [self expired:request];
     NSTimeInterval now = _clock();
-    if (!expired && (request.eventReads >= 16 || now - request.lastEventRead < 0.5)) return;
+    if (!expired && (request.eventReads >= 8 || now - request.lastEventRead < 0.5)) return;
     request.eventReads++;
     request.lastEventRead = now;
     NSInteger current = [self read:request];
@@ -181,8 +306,21 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
         [self finish:request outcome:WCRAFNotifyUnconfirmed];
     }
 }
+- (void)contactDidChangeUsername:(NSString *)username context:(WCRAFAccountContext *)context {
+    WCRAFNotifyRequest *request = _requests[username];
+    if (!request || request.context != context || ![self isCurrent:request] ||
+        request.contactReads >= 8) return;
+    request.contactReads++;
+    NSInteger current = [self read:request];
+    if (![self isCurrent:request]) return;
+    if (current == (request.notify ? 1 : 0)) {
+        [self finish:request outcome:WCRAFNotifyConfirmed];
+    } else if ([self expired:request]) {
+        [self finish:request outcome:WCRAFNotifyUnconfirmed];
+    }
+}
 - (void)scheduleReadback:(WCRAFNotifyRequest *)request {
-    static const NSTimeInterval delays[] = {0.2, 0.8, 2.0, 5.0};
+    static const NSTimeInterval delays[] = {0.0, 0.2, 0.8, 2.0, 5.0};
     if (![self isCurrent:request]) return;
     NSTimeInterval delay = delays[request.scheduledReads++];
     __weak WCRAFNotifyCoordinator *weakSelf = self;
@@ -194,7 +332,7 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
         request.lastEventRead = coordinator->_clock();
         if (latest == (request.notify ? 1 : 0)) {
             [coordinator finish:request outcome:WCRAFNotifyConfirmed];
-        } else if (request.scheduledReads >= 4 || [coordinator expired:request]) {
+        } else if (request.scheduledReads >= 5 || [coordinator expired:request]) {
             [coordinator finish:request outcome:WCRAFNotifyUnconfirmed];
         } else {
             [coordinator scheduleReadback:request];

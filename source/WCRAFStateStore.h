@@ -26,7 +26,7 @@ typedef NS_ENUM(NSInteger, WCRAFNotifyOutcome) {
 };
 
 @class WCRAFAccountContext;
-// Main queue: serialized writes, four bounded readbacks and throttled host events.
+// Main queue: serialized writes, next-turn readback and four bounded timers.
 @interface WCRAFNotifyCoordinator : NSObject
 - (instancetype)initWithValidator:(BOOL (^)(WCRAFAccountContext *))validator
                            clock:(NSTimeInterval (^)(void))clock
@@ -38,8 +38,20 @@ typedef NS_ENUM(NSInteger, WCRAFNotifyOutcome) {
             completion:(void (^)(WCRAFNotifyOutcome))completion;
 - (NSInteger)pendingNotifyForUsername:(NSString *)username context:(WCRAFAccountContext *)context;
 - (void)observeUsername:(NSString *)username context:(WCRAFAccountContext *)context;
+- (void)contactDidChangeUsername:(NSString *)username context:(WCRAFAccountContext *)context;
 - (void)invalidateUsername:(NSString *)username;
 - (void)cancelAll;
+@end
+
+// Native contact events are coalesced and routed only to watched usernames.
+// The scheduler must enqueue asynchronously on the main queue.
+@interface WCRAFContactChangeObserver : NSObject
+- (instancetype)initWithScheduler:(void (^)(void (^)(void)))scheduler;
+- (BOOL)watchUsername:(NSString *)username hostContext:(id)host
+    extensionProtocol:(Protocol *)extension changed:(void (^)(NSString *))changed;
+- (void)stopUsername:(NSString *)username;
+- (void)stopAll;
+- (void)onModifyContact:(id)contact;
 @end
 
 @interface WCRAFAccountContext : NSObject

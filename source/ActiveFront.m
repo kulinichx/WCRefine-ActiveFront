@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.27 bounded reminder confirmation and isolated swipe.
+// WCRefine ActiveFront - v1.9.28 event-driven reminder confirmation.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -78,7 +78,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.27-source";
+static NSString * const kWCRAFVersion = @"1.9.28-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -499,11 +499,42 @@ static WCRAFNotifyCoordinator *WCRReminderCoordinator(void) {
             } clock:^NSTimeInterval {
                 return NSProcessInfo.processInfo.systemUptime;
             } scheduler:^(NSTimeInterval delay, void (^confirm)(void)) {
+                if (delay == 0) {
+                    dispatch_async(dispatch_get_main_queue(), confirm);
+                    return;
+                }
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), confirm);
             }];
     });
     return coordinator;
+}
+
+static WCRAFContactChangeObserver *WCRReminderContactObserver(void) {
+    static WCRAFContactChangeObserver *observer;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        observer = [[WCRAFContactChangeObserver alloc] initWithScheduler:^(void (^drain)(void)) {
+            dispatch_async(dispatch_get_main_queue(), drain);
+        }];
+    });
+    return observer;
+}
+
+static void WCRWatchReminderContact(NSString *username, WCRAFAccountContext *context) {
+    static WCRAFAccountContext *observedContext;
+    if (observedContext != context) {
+        [WCRReminderContactObserver() stopAll];
+        observedContext = context;
+    }
+    @try {
+        id host = WCRObjectResult(NSClassFromString(@"MMContext"), @"currentContext");
+        Protocol *extension = NSProtocolFromString(@"IContactMgrExt");
+        [WCRReminderContactObserver() watchUsername:username hostContext:host
+            extensionProtocol:extension changed:^(NSString *name) {
+                [WCRReminderCoordinator() contactDidChangeUsername:name context:context];
+            }];
+    } @catch (__unused NSException *exception) { }
 }
 
 // Defer until after native row rendering; coalesce each username per queue turn.
@@ -531,6 +562,7 @@ static void WCRQueueReminderObservation(NSString *username, WCRAFAccountContext 
 static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContext *context,
                               void (^completion)(BOOL, NSString *)) {
     if (username.length == 0 || ![WCRAFStore() isCurrentContext:context]) return;
+    WCRWatchReminderContact(username, context);
     __block NSString *writeFailure = @"当前微信版本的提醒接口不可用（N04）";
     [WCRReminderCoordinator() changeUsername:username context:context notify:!muted
         read:^NSInteger {
@@ -553,6 +585,7 @@ static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContex
         } pending:^{
             WCRRefreshGroupingReminderAction(username, context);
         } completion:^(WCRAFNotifyOutcome outcome) {
+            [WCRReminderContactObserver() stopUsername:username];
             WCRRefreshGroupingReminderAction(username, context);
             if (outcome == WCRAFNotifyConfirmed) {
                 WCRRememberReminder(username, muted, context);
@@ -3077,6 +3110,7 @@ static void WCRInvalidateOutgoing(NSString *username, WCRAFAccountContext *conte
     if (![NSThread isMainThread] || ![WCRAFStore() isCurrentContext:context]) return;
     WCRInvalidateSendAcknowledgments(username, context);
     [WCRReminderCoordinator() invalidateUsername:username];
+    [WCRReminderContactObserver() stopUsername:username];
 }
 
 static id WCRMessageValue(id wrap, NSString *key) {
@@ -4012,6 +4046,7 @@ static void WCRRightGroupUIInit(void) {
             addObserverForName:UIApplicationWillResignActiveNotification object:nil
             queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *notification) {
             [WCRReminderCoordinator() cancelAll];
+            [WCRReminderContactObserver() stopAll];
             WCRCancelReturnAnimation();
             WCRResetVisibleSwipeVisuals();
             [WCRAFGroupSwipe resetAll];
