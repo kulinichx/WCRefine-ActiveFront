@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.20 grouping-cell and native swipe compatibility.
+// WCRefine ActiveFront - v1.9.21 native leading swipe actions for grouped rows.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -75,7 +75,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.20-source";
+static NSString * const kWCRAFVersion = @"1.9.21-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -3047,8 +3047,11 @@ static void (*orig_addMsg)(id, SEL, id, id);
 static void (*orig_sessionAddMsg)(id, SEL, id, id);
 static void (*orig_sessionModMsg)(id, SEL, id, id);
 static UITableViewCell *(*orig_groupCell)(id, SEL, UITableView *, NSIndexPath *);
+static UISwipeActionsConfiguration *(*orig_groupLeadingSwipe)(
+    id, SEL, UITableView *, NSIndexPath *);
 static void (*orig_homeSelection)(id, SEL, UITableView *, NSIndexPath *);
 static void (*orig_groupDisappear)(id, SEL, BOOL);
+static BOOL gWCRHookGroupLeadingSwipe;
 
 static void hook_addMsg(id self, SEL cmd, id username, id wrap) {
     WCRAFOutgoingTicket *ticket = nil;
@@ -3086,13 +3089,68 @@ static UITableViewCell *hook_groupCell(id self, SEL cmd, UITableView *table, NSI
     @try {
         if (cell && WCRGroupControllerForTable(table) == self) {
             WCRBindCanonicalHomeRow(cell, self, table, path);
-            WCRAttachToCell(cell);
         }
     } @catch (__unused NSException *exception) {
         WCRHardResetCellVisual(cell, YES);
         WCRClearCanonicalRowBinding(cell);
     }
     return cell;
+}
+
+static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
+    id self, SEL cmd, UITableView *table, NSIndexPath *path) {
+    if (WCRGroupControllerForTable(table) != self || path.section != 0 ||
+        path.row < 0) {
+        return orig_groupLeadingSwipe ?
+            orig_groupLeadingSwipe(self, cmd, table, path) : nil;
+    }
+    UITableViewCell *cell = [table cellForRowAtIndexPath:path];
+    if (!cell) return orig_groupLeadingSwipe ?
+        orig_groupLeadingSwipe(self, cmd, table, path) : nil;
+
+    WCRBindCanonicalHomeRow(cell, self, table, path);
+    NSString *username = nil;
+    WCRRightActionKind kind = WCRActionKindForCell(
+        cell, NULL, NULL, NULL, NULL, &username);
+    if ((kind != WCRRightActionMute && kind != WCRRightActionRemind) ||
+        username.length == 0) {
+        return orig_groupLeadingSwipe ?
+            orig_groupLeadingSwipe(self, cmd, table, path) : nil;
+    }
+
+    WCRAFAccountContext *context = objc_getAssociatedObject(cell, kWCRCanonicalAccountKey);
+    if (![WCRAFStore() isCurrentContext:context]) {
+        return orig_groupLeadingSwipe ?
+            orig_groupLeadingSwipe(self, cmd, table, path) : nil;
+    }
+    NSString *title = WCRTitleForActionKind(kind);
+    UIContextualAction *action = [UIContextualAction
+        contextualActionWithStyle:UIContextualActionStyleNormal
+        title:title handler:^(__unused UIContextualAction *selected,
+                              __unused UIView *source,
+                              void (^completion)(BOOL)) {
+        if (![WCRAFStore() isCurrentContext:context] ||
+            !WCRIsInCustomGroup(username)) {
+            completion(NO);
+            return;
+        }
+        WCRInvalidateSendAcknowledgments(username, context);
+        WCRSetNativeMuted(username, kind == WCRRightActionMute, context,
+            ^(BOOL success, NSString *failure) {
+                if (failure.length > 0) {
+                    WCRReminderFailure(failure);
+                } else if (success) {
+                    WCRRefreshHomeGlobal(@"active_front_group_native_swipe", context);
+                }
+            });
+        completion(YES);
+    }];
+    action.backgroundColor = kind == WCRRightActionMute ?
+        [UIColor systemGrayColor] : [UIColor systemBlueColor];
+    UISwipeActionsConfiguration *configuration =
+        [UISwipeActionsConfiguration configurationWithActions:@[action]];
+    configuration.performsFirstActionWithFullSwipe = NO;
+    return configuration;
 }
 
 static void hook_groupDisappear(id self, SEL cmd, BOOL animated) {
@@ -3475,6 +3533,19 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
     Class groupList = NSClassFromString(@"WCRGroupingSessionListViewController");
     if (!orig_groupCell) WCRInstallCheckedHook(groupList,
         @"tableView:cellForRowAtIndexPath:", '@', "@@", (IMP)hook_groupCell, (IMP *)&orig_groupCell);
+    if (!gWCRHookGroupLeadingSwipe && groupList) {
+        SEL leading = NSSelectorFromString(
+            @"tableView:leadingSwipeActionsConfigurationForRowAtIndexPath:");
+        if (class_getInstanceMethod(groupList, leading)) {
+            gWCRHookGroupLeadingSwipe = WCRInstallCheckedHook(groupList,
+                @"tableView:leadingSwipeActionsConfigurationForRowAtIndexPath:",
+                '@', "@@", (IMP)hook_groupLeadingSwipe,
+                (IMP *)&orig_groupLeadingSwipe);
+        } else {
+            gWCRHookGroupLeadingSwipe = class_addMethod(groupList, leading,
+                (IMP)hook_groupLeadingSwipe, "@@:@@");
+        }
+    }
     if (!orig_groupDisappear) WCRInstallCheckedHook(groupList,
         @"viewWillDisappear:", 'v', "B", (IMP)hook_groupDisappear, (IMP *)&orig_groupDisappear);
     if (!orig_homeSelection) WCRInstallCheckedHook(mainFrame,
@@ -3489,7 +3560,8 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         gWCRHookWillDisplay &&
         gWCRHookCellReuse &&
         gWCRHookCellDidMove && orig_addMsg && orig_sessionAddMsg && orig_sessionModMsg &&
-        orig_groupCell && orig_groupDisappear && orig_homeSelection;
+        orig_groupCell && gWCRHookGroupLeadingSwipe && orig_groupDisappear &&
+        orig_homeSelection;
 
     if (allInstalled) {
         WCRAF_LOG(@"business hooks installed config=1 provider=1 home=1 disappear=1 willDisplay=1 reuse=1 didMove=1 settings=%d",
