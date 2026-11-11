@@ -179,11 +179,18 @@ static NSData *IconPixels(UIImage *image, ReminderTestCell *cell) {
         SwipeTestController *controller = (SwipeTestController *)self.window.rootViewController;
         for (NSNumber *width in @[@360, @768]) {
             for (NSNumber *style in @[@(UIUserInterfaceStyleLight), @(UIUserInterfaceStyleDark)]) {
-                self.window.overrideUserInterfaceStyle = style.integerValue;
                 UITableView *table = controller.table;
-                table.frame = CGRectMake(0, 0, width.doubleValue, 700);
-                [table reloadData];
-                [table layoutIfNeeded];
+                [UIView performWithoutAnimation:^{
+                    self.window.overrideUserInterfaceStyle = style.integerValue;
+                    table.frame = CGRectMake(0, 0, width.doubleValue, 700);
+                    [table reloadData];
+                    [self.window layoutIfNeeded];
+                    [table layoutIfNeeded];
+                }];
+                // Let UIKit commit the appearance change before comparing
+                // snapshots; otherwise the first dark icon can use light tint.
+                [CATransaction flush];
+                [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.35]];
                 ReminderTestCell *cell = (ReminderTestCell *)[table cellForRowAtIndexPath:
                     [NSIndexPath indexPathForRow:2 inSection:0]];
                 Check(cell.window != nil, @"Native row must be visible");
@@ -233,7 +240,9 @@ static NSData *IconPixels(UIImage *image, ReminderTestCell *cell) {
                     UIButton *button = [surface valueForKey:@"button"];
                     Check([button.currentTitle isEqual:title], @"Pending action must update in place");
                     Check([beforeIcon isEqual:IconPixels(foreground.image, cell)],
-                          @"Pending state must retain the real icon, excluding the overlay");
+                          [NSString stringWithFormat:
+                              @"Pending icon changed without native state change (width=%@ style=%@ cycle=%lu)",
+                              width, style, (unsigned long)cycle]);
                     ReminderTestData *data = cell.cellData;
                     data.actualMuted = !data.actualMuted;
                     NSUInteger refreshes = data.refreshes;

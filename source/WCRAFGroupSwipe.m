@@ -73,11 +73,13 @@ BOOL WCRAFRefreshNativeRow(UITableViewCell *cell, id data, CGRect tableFrame) {
 }
 
 static UIImage *WCRAFRenderRow(UITableViewCell *cell, UIView *overlay) {
+    if (!cell || CGRectIsEmpty(cell.bounds)) return nil;
     BOOL hidden = overlay.hidden;
     UIImage *image = nil;
     @try {
         overlay.hidden = YES;
         [cell layoutIfNeeded];
+        if (CGRectIsEmpty(cell.bounds)) return nil;
         UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithBounds:cell.bounds];
         image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
             [cell.layer renderInContext:context.CGContext];
