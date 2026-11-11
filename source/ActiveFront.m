@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.23 grouped-row editability probe fix.
+// WCRefine ActiveFront - v1.9.24 grouped swipe edge and mute action fix.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -77,7 +77,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.23-source";
+static NSString * const kWCRAFVersion = @"1.9.24-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -199,7 +199,8 @@ typedef NS_ENUM(NSInteger, WCRRightActionKind) {
     WCRRightActionReturn,
     WCRRightActionMute,
     WCRRightActionRemind,
-    WCRRightActionPending
+    WCRRightActionPending,
+    WCRRightActionUnknown
 };
 
 #pragma mark - Helpers
@@ -1790,6 +1791,8 @@ static NSString *WCRTitleForActionKind(WCRRightActionKind kind) {
             return @"提醒";
         case WCRRightActionPending:
             return @"同步中";
+        case WCRRightActionUnknown:
+            return @"状态未知";
         case WCRRightActionNone:
         default:
             return nil;
@@ -1810,6 +1813,7 @@ static UIColor *WCRColorForActionKind(WCRRightActionKind kind) {
         case WCRRightActionMute:
         case WCRRightActionRemind:
         case WCRRightActionPending:
+        case WCRRightActionUnknown:
             return [UIColor secondaryLabelColor];
         case WCRRightActionNone:
         default:
@@ -3314,6 +3318,8 @@ static UITableViewCell *hook_groupCell(id self, SEL cmd, UITableView *table, NSI
     UITableViewCell *cell = orig_groupCell ? orig_groupCell(self, cmd, table, path) : nil;
     @try {
         if (WCRIsGroupingSessionListController(self) && table) {
+            table.clipsToBounds = YES;
+            cell.clipsToBounds = YES;
             WCRConfigureGroupingSwipe(table, self);
         }
     } @catch (__unused NSException *exception) {
@@ -3367,25 +3373,26 @@ static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
     }
 
     NSMutableArray<UIContextualAction *> *actions = [NSMutableArray array];
-    if (kind == WCRRightActionPending) {
+    if (kind == WCRRightActionPending || kind == WCRRightActionUnknown ||
+        kind == WCRRightActionNone) {
+        WCRRightActionKind placeholderKind = kind == WCRRightActionPending ?
+            WCRRightActionPending : WCRRightActionUnknown;
         UIContextualAction *pending = [UIContextualAction
             contextualActionWithStyle:UIContextualActionStyleNormal
-            title:WCRTitleForActionKind(kind)
+            title:WCRTitleForActionKind(placeholderKind)
             handler:^(__unused UIContextualAction *selected,
                       __unused UIView *source,
                       void (^completion)(BOOL)) {
             completion(NO);
         }];
-        pending.backgroundColor = [UIColor secondaryLabelColor];
+        pending.backgroundColor = [UIColor systemGrayColor];
         [actions addObject:pending];
     } else {
         BOOL stateKnown = kind == WCRRightActionMute || kind == WCRRightActionRemind;
-        NSArray<NSNumber *> *muteChoices = stateKnown ?
-            @[@(kind == WCRRightActionMute)] : @[@NO, @YES];
-        for (NSNumber *muteChoice in muteChoices) {
-            BOOL muted = muteChoice.boolValue;
-            WCRRightActionKind actionKind = muted ? WCRRightActionMute : WCRRightActionRemind;
-            UIContextualAction *action = [UIContextualAction
+        if (!stateKnown) return nil;
+        BOOL muted = kind == WCRRightActionMute;
+        WCRRightActionKind actionKind = muted ? WCRRightActionMute : WCRRightActionRemind;
+        UIContextualAction *action = [UIContextualAction
                 contextualActionWithStyle:UIContextualActionStyleNormal
                 title:WCRTitleForActionKind(actionKind)
                 handler:^(__unused UIContextualAction *selected,
@@ -3407,10 +3414,9 @@ static UISwipeActionsConfiguration *hook_groupLeadingSwipe(
                     });
                 completion(YES);
             }];
-            action.backgroundColor = muted ?
-                [UIColor systemGrayColor] : [UIColor systemBlueColor];
-            [actions addObject:action];
-        }
+        action.backgroundColor = muted ?
+            [UIColor systemGrayColor] : [UIColor systemBlueColor];
+        [actions addObject:action];
     }
     UISwipeActionsConfiguration *configuration =
         [UISwipeActionsConfiguration configurationWithActions:actions];

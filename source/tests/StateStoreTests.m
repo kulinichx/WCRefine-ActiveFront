@@ -1757,9 +1757,15 @@ static void NotifyUnavailableReadAndWriteFailWithoutSchedule(Fixture *f) {
     NotifyOperationFixture *op = [[NotifyOperationFixture alloc] initWithFixture:f];
     op.contact.throwRead = YES;
     [op request:NO];
-    CHECK([op.outcomes isEqual:@[@(WCRAFNotifyReadUnavailable)]]);
-    CHECK(op.manager.calls == 0 && op.scheduled.count == 0);
+    CHECK(op.outcomes.count == 0 && op.manager.calls == 1);
+    CHECK(op.reads == 2 && op.scheduled.count == 1);
     op.contact.throwRead = NO;
+    op.contact.value = 0;
+    [op runNext];
+    CHECK(op.outcomes.lastObject.integerValue == WCRAFNotifyConfirmed);
+    CHECK(op.manager.calls == 1);
+
+    op.contact.value = 1;
     op.manager.throwWrite = YES;
     [op request:NO];
     CHECK(op.outcomes.lastObject.integerValue == WCRAFNotifyWriteUnavailable);

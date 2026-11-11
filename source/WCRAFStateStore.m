@@ -227,14 +227,12 @@ WCRAFNativeNotifyResult WCRAFInvokeNativeNotify(id manager, id contact, BOOL not
     _requests[username] = request;
     NSInteger before = [self read:request];
     if (![self isCurrent:request]) return;
-    if (before != 0 && before != 1) {
-        [self finish:request outcome:WCRAFNotifyReadUnavailable];
-        return;
-    }
     if (before == (notify ? 1 : 0)) {
         [self finish:request outcome:WCRAFNotifyConfirmed];
         return;
     }
+    // A user's explicit target remains actionable if the initial native read
+    // is temporarily unavailable. Submit once, then require a confirmed read.
     WCRAFNativeNotifyResult result = WCRAFNativeNotifyUnavailable;
     @try { result = write(); }
     @catch (__unused NSException *exception) { }
