@@ -3,6 +3,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -39,14 +40,22 @@ def main():
             run("xcrun", "simctl", "boot", device)
             run("xcrun", "simctl", "bootstatus", device, "-b", timeout=240)
             run("xcrun", "simctl", "install", device, str(out / "SwipeTests.app"))
-            log = run("xcrun", "simctl", "launch", "--console", device,
-                      "local.wcrefine.swipetests", timeout=90)
-            print(log)
             container = Path(run("xcrun", "simctl", "get_app_container", device,
                                  "local.wcrefine.swipetests", "data"))
+            report_path = container / "Documents/ui-tests.json"
+            # simctl's console attachment can outlive an exited simulator app.
+            # The app writes its terminal report atomically before exiting.
+            print(run("xcrun", "simctl", "launch", device,
+                      "local.wcrefine.swipetests"), flush=True)
+            deadline = time.monotonic() + 90
+            while not report_path.is_file():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"No UIKit terminal report for {family}")
+                time.sleep(0.25)
             destination = out / family
             shutil.copytree(container / "Documents", destination)
             report = json.loads((destination / "ui-tests.json").read_text())
+            print(json.dumps({"device": family, **report}), flush=True)
             if report.get("passed") is not True or report.get("checks_run", 0) < 900:
                 raise RuntimeError(report)
             reports.append({"device": family, "report": report})
