@@ -2,6 +2,91 @@
 #import <UIKit/UIGestureRecognizerSubclass.h>
 #import <objc/runtime.h>
 #import <math.h>
+#import <string.h>
+
+BOOL WCRAFRefreshNativeRow(UITableViewCell *cell, id data, CGRect tableFrame) {
+    if (![NSThread isMainThread] || !cell || !data || CGRectIsEmpty(cell.bounds)) return NO;
+    SEL update = NSSelectorFromString(@"updateContentView:tableViewFrame:");
+    NSMethodSignature *signature = [cell methodSignatureForSelector:update];
+    BOOL extended = NO;
+    if (!signature) {
+        update = NSSelectorFromString(
+            @"updateContentView:tableViewFrame:isSearching:isSearchTableView:searchBarText:");
+        signature = [cell methodSignatureForSelector:update];
+        extended = YES;
+    }
+    if (signature.numberOfArguments != (extended ? 7 : 4) ||
+        strcmp(signature.methodReturnType, @encode(void)) != 0 ||
+        [signature getArgumentTypeAtIndex:2][0] != '@' ||
+        strcmp([signature getArgumentTypeAtIndex:3], @encode(CGRect)) != 0) return NO;
+    if (extended && (strcmp([signature getArgumentTypeAtIndex:4], @encode(BOOL)) != 0 ||
+                     strcmp([signature getArgumentTypeAtIndex:5], @encode(BOOL)) != 0 ||
+                     [signature getArgumentTypeAtIndex:6][0] != '@')) return NO;
+
+    // Native content updates can lay out against the table's outer width.
+    // Keep the existing row/container geometry, including grouped-list insets.
+    NSMutableArray<NSDictionary *> *geometry = [NSMutableArray array];
+    NSArray<UIView *> *views = [[cell.subviews arrayByAddingObjectsFromArray:cell.contentView.subviews]
+        arrayByAddingObject:cell];
+    for (UIView *view in views) {
+        [geometry addObject:@{@"view": view, @"parent": view.superview ?: NSNull.null,
+            @"bounds": [NSValue valueWithCGRect:view.bounds],
+            @"center": [NSValue valueWithCGPoint:view.center],
+            @"transform": [NSValue valueWithCGAffineTransform:view.transform]}];
+    }
+    __block BOOL updated = NO;
+    [UIView performWithoutAnimation:^{
+        @try {
+            SEL prepare = NSSelectorFromString(@"updateDataFieldForUI");
+            NSMethodSignature *prepareSignature = [data methodSignatureForSelector:prepare];
+            if (prepareSignature.numberOfArguments == 2 &&
+                strcmp(prepareSignature.methodReturnType, @encode(void)) == 0) {
+                ((void (*)(id, SEL))[data methodForSelector:prepare])(data, prepare);
+            }
+            if (extended) {
+                ((void (*)(id, SEL, id, CGRect, BOOL, BOOL, id))[cell methodForSelector:update])
+                    (cell, update, data, tableFrame, NO, NO, nil);
+            } else {
+                ((void (*)(id, SEL, id, CGRect))[cell methodForSelector:update])
+                    (cell, update, data, tableFrame);
+            }
+            [cell setNeedsLayout];
+            [cell layoutIfNeeded];
+            updated = YES;
+        } @catch (__unused NSException *exception) {
+            updated = NO;
+        } @finally {
+            for (NSDictionary *saved in geometry.reverseObjectEnumerator) {
+                UIView *view = saved[@"view"];
+                id parent = view.superview ?: NSNull.null;
+                if (parent != saved[@"parent"]) continue;
+                CGAffineTransform transform = [saved[@"transform"] CGAffineTransformValue];
+                CGRect bounds = [saved[@"bounds"] CGRectValue];
+                CGPoint center = [saved[@"center"] CGPointValue];
+                if (!CGAffineTransformEqualToTransform(view.transform, transform)) view.transform = transform;
+                if (!CGRectEqualToRect(view.bounds, bounds)) view.bounds = bounds;
+                if (!CGPointEqualToPoint(view.center, center)) view.center = center;
+            }
+        }
+    }];
+    return updated;
+}
+
+static UIImage *WCRAFRenderRow(UITableViewCell *cell, UIView *overlay) {
+    BOOL hidden = overlay.hidden;
+    UIImage *image = nil;
+    @try {
+        overlay.hidden = YES;
+        [cell layoutIfNeeded];
+        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithBounds:cell.bounds];
+        image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+            [cell.layer renderInContext:context.CGContext];
+        }];
+    } @finally {
+        overlay.hidden = hidden;
+    }
+    return image;
+}
 
 @implementation WCRAFGroupSwipeAction
 @end
@@ -117,6 +202,11 @@ static const CGFloat actionWidth = 60;
     self.action = action;
     [self.surface.button setTitle:action.title forState:UIControlStateNormal];
     [self.surface.button setTitleColor:action.color forState:UIControlStateNormal];
+    // A menu can stay open across confirmation. Replace its old pixels once,
+    // excluding our own overlay so the old icon is not captured again.
+    UIImage *image = WCRAFRenderRow(cell, self.surface);
+    if (image.CGImage) ((UIImageView *)self.surface.foreground).image = image;
+    else [self reset];
 }
 
 - (void)reset {
@@ -202,10 +292,7 @@ static const CGFloat actionWidth = 60;
     [cell layoutIfNeeded];
     // Own the rendered pixels. A live UIKit snapshot can be unavailable or
     // invalidated when the host reconfigures/recycles the native row.
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithBounds:cell.bounds];
-    UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
-        [cell.layer renderInContext:context.CGContext];
-    }];
+    UIImage *image = WCRAFRenderRow(cell, nil);
     if (!image.CGImage) return NO;
     UIImageView *picture = [[UIImageView alloc] initWithImage:image];
     picture.contentMode = UIViewContentModeScaleToFill;

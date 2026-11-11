@@ -1,5 +1,8 @@
 #import <UIKit/UIKit.h>
 
+// Recompute native UI data and repaint one row without asking its table to reload.
+BOOL WCRAFRefreshNativeRow(UITableViewCell *cell, id data, CGRect tableFrame);
+
 @interface WCRAFGroupSwipeAction : NSObject
 @property(nonatomic, copy) NSString *title;
 @property(nonatomic, strong) UIColor *color;

@@ -39,6 +39,78 @@ static BOOL HasRenderedContent(UIImage *image) {
     return varied;
 }
 
+@interface ReminderTestData : NSObject
+@property(nonatomic) BOOL actualMuted;
+@property(nonatomic) BOOL cachedMuted;
+@property(nonatomic) NSUInteger refreshes;
+@end
+@implementation ReminderTestData
+- (void)updateDataFieldForUI {
+    self.refreshes++;
+    self.cachedMuted = self.actualMuted;
+}
+@end
+
+@interface ReminderTestCell : UITableViewCell
+@property(nonatomic, strong) ReminderTestData *cellData;
+@property(nonatomic, strong) UIImageView *statusIcon;
+@property(nonatomic) BOOL failUpdate;
+@end
+@implementation ReminderTestCell
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)identifier {
+    if ((self = [super initWithStyle:style reuseIdentifier:identifier])) {
+        _cellData = [ReminderTestData new];
+        _statusIcon = [[UIImageView alloc] initWithFrame:CGRectMake(0, 24, 20, 20)];
+        _statusIcon.image = [UIImage systemImageNamed:@"bell.fill"];
+        _statusIcon.tintColor = UIColor.systemGreenColor;
+        [self.contentView addSubview:_statusIcon];
+    }
+    return self;
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    self.statusIcon.frame = CGRectMake(self.contentView.bounds.size.width - 32, 24, 20, 20);
+}
+- (void)updateContentView:(ReminderTestData *)data tableViewFrame:(CGRect)tableFrame {
+    (void)tableFrame;
+    self.cellData = data;
+    self.statusIcon.image = [UIImage systemImageNamed:data.cachedMuted ? @"bell.slash.fill" : @"bell.fill"];
+    self.statusIcon.tintColor = data.cachedMuted ? UIColor.systemRedColor : UIColor.systemGreenColor;
+    // Exercise native code laying out at the outer table width.
+    self.contentView.frame = CGRectInset(self.contentView.frame, -20, 0);
+    if (self.failUpdate) @throw [NSException exceptionWithName:@"NativeRowFailure" reason:@"test" userInfo:nil];
+}
+@end
+
+@interface ExtendedReminderTestCell : UITableViewCell
+@property(nonatomic) BOOL updated;
+@end
+@implementation ExtendedReminderTestCell
+- (void)updateContentView:(ReminderTestData *)data tableViewFrame:(CGRect)frame
+             isSearching:(BOOL)searching isSearchTableView:(BOOL)searchTable searchBarText:(id)text {
+    self.updated = data.refreshes > 0 && !searching && !searchTable && text == nil && frame.size.width == 768;
+}
+@end
+
+@interface InvalidReminderTestCell : UITableViewCell
+@end
+@implementation InvalidReminderTestCell
+- (id)updateContentView:(id)data tableViewFrame:(CGRect)frame {
+    (void)data; (void)frame;
+    @throw [NSException exceptionWithName:@"BadABICalled" reason:@"test" userInfo:nil];
+}
+@end
+
+static NSData *IconPixels(UIImage *image, ReminderTestCell *cell) {
+    CGRect rect = [cell.statusIcon convertRect:cell.statusIcon.bounds toView:cell];
+    rect = CGRectApplyAffineTransform(rect, CGAffineTransformMakeScale(image.scale, image.scale));
+    CGImageRef crop = CGImageCreateWithImageInRect(image.CGImage, rect);
+    if (!crop) return nil;
+    NSData *pixels = UIImagePNGRepresentation([UIImage imageWithCGImage:crop]);
+    CGImageRelease(crop);
+    return pixels;
+}
+
 @interface SwipeTestController : UIViewController <UITableViewDataSource>
 @property(nonatomic, strong) UITableView *table;
 @end
@@ -57,7 +129,7 @@ static BOOL HasRenderedContent(UIImage *image) {
 }
 - (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)path {
     (void)table;
-    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    UITableViewCell *cell = [[ReminderTestCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
     cell.textLabel.text = [NSString stringWithFormat:@"Conversation %ld", (long)path.row];
     cell.detailTextLabel.text = @"Native content must survive swipe and reuse";
     cell.imageView.image = [UIImage systemImageNamed:@"person.crop.circle.fill"];
@@ -85,6 +157,25 @@ static BOOL HasRenderedContent(UIImage *image) {
     NSString *failure = @"";
     NSString *folder = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     @try {
+        CGRect sampleFrame = CGRectMake(0, 0, 768, 84);
+        ReminderTestData *sampleData = [ReminderTestData new];
+        ExtendedReminderTestCell *extended = [[ExtendedReminderTestCell alloc] initWithFrame:sampleFrame];
+        Check(WCRAFRefreshNativeRow(extended, sampleData, sampleFrame) && extended.updated,
+              @"Verified extended native signature must repaint with non-search arguments");
+        UITableViewCell *unsupported = [[UITableViewCell alloc] initWithFrame:sampleFrame];
+        NSUInteger before = sampleData.refreshes;
+        Check(!WCRAFRefreshNativeRow(unsupported, sampleData, sampleFrame) && sampleData.refreshes == before,
+              @"Unsupported native rows must not mutate UI data");
+        InvalidReminderTestCell *invalid = [[InvalidReminderTestCell alloc] initWithFrame:sampleFrame];
+        Check(!WCRAFRefreshNativeRow(invalid, sampleData, sampleFrame),
+              @"Incompatible native method ABI must be rejected");
+        ReminderTestCell *failing = [[ReminderTestCell alloc] initWithFrame:sampleFrame];
+        [failing layoutIfNeeded];
+        CGRect failureFrame = failing.contentView.frame;
+        failing.failUpdate = YES;
+        Check(!WCRAFRefreshNativeRow(failing, sampleData, sampleFrame) &&
+              CGRectEqualToRect(failing.contentView.frame, failureFrame),
+              @"Native exceptions must still restore container bounds");
         SwipeTestController *controller = (SwipeTestController *)self.window.rootViewController;
         for (NSNumber *width in @[@360, @768]) {
             for (NSNumber *style in @[@(UIUserInterfaceStyleLight), @(UIUserInterfaceStyleDark)]) {
@@ -93,13 +184,15 @@ static BOOL HasRenderedContent(UIImage *image) {
                 table.frame = CGRectMake(0, 0, width.doubleValue, 700);
                 [table reloadData];
                 [table layoutIfNeeded];
-                UITableViewCell *cell = [table cellForRowAtIndexPath:[NSIndexPath indexPathForRow:2 inSection:0]];
+                ReminderTestCell *cell = (ReminderTestCell *)[table cellForRowAtIndexPath:
+                    [NSIndexPath indexPathForRow:2 inSection:0]];
                 Check(cell.window != nil, @"Native row must be visible");
                 [cell layoutIfNeeded];
                 NSArray *nativeSubviews = [cell.subviews copy];
                 CGRect nativeFrame = cell.frame, contentFrame = cell.contentView.frame;
                 __block NSString *title = @"Mute";
                 __block NSUInteger performed = 0;
+                __block BOOL bindingCurrent = YES;
                 WCRAFGroupSwipe *swipe = [WCRAFGroupSwipe controllerForTable:table create:YES];
                 __weak WCRAFGroupSwipe *weakSwipe = swipe;
                 swipe.resolve = ^WCRAFGroupSwipeAction *(__unused UITableViewCell *row) {
@@ -110,7 +203,7 @@ static BOOL HasRenderedContent(UIImage *image) {
                     return action;
                 };
                 swipe.validate = ^BOOL(UITableViewCell *row, id identity, __unused BOOL again) {
-                    return row == cell && [identity isEqual:@"same-account-and-conversation"];
+                    return bindingCurrent && row == cell && [identity isEqual:@"same-account-and-conversation"];
                 };
                 swipe.rowColor = ^UIColor *(__unused UITableViewCell *row) {
                     return UIColor.secondarySystemGroupedBackgroundColor;
@@ -128,6 +221,8 @@ static BOOL HasRenderedContent(UIImage *image) {
                     Check(surface.superview == cell, @"Overlay must stay aligned to its native row");
                     UIImageView *foreground = [surface valueForKey:@"foreground"];
                     Check(HasRenderedContent(foreground.image), @"Rendered swipe row must contain visible pixels");
+                    NSData *beforeIcon = IconPixels(foreground.image, cell);
+                    Check(beforeIcon.length > 0, @"Trailing native status icon pixels must be available");
                     [swipe setOffset:1000];
                     UIView *viewport = [surface valueForKey:@"viewport"];
                     UIView *actions = [surface valueForKey:@"actions"];
@@ -137,9 +232,23 @@ static BOOL HasRenderedContent(UIImage *image) {
                     [swipe refreshActionForCell:cell];
                     UIButton *button = [surface valueForKey:@"button"];
                     Check([button.currentTitle isEqual:title], @"Pending action must update in place");
-                    title = @"Remind";
+                    Check([beforeIcon isEqual:IconPixels(foreground.image, cell)],
+                          @"Pending state must retain the real icon, excluding the overlay");
+                    ReminderTestData *data = cell.cellData;
+                    data.actualMuted = !data.actualMuted;
+                    NSUInteger refreshes = data.refreshes;
+                    Check(WCRAFRefreshNativeRow(cell, data, table.frame) &&
+                          data.refreshes == refreshes + 1 && data.cachedMuted == data.actualMuted,
+                          @"Native cached UI data must be recomputed before repainting");
+                    CGRect pictureFrame = foreground.frame;
+                    title = data.actualMuted ? @"Remind" : @"Mute";
                     [swipe refreshActionForCell:cell];
                     Check([button.currentTitle isEqual:title], @"Confirmed action must update without row reload");
+                    Check(![beforeIcon isEqual:IconPixels(foreground.image, cell)],
+                          @"Confirmed native icon must replace stale swipe snapshot pixels in both directions");
+                    Check(CGRectEqualToRect(pictureFrame, foreground.frame) &&
+                          actions.frame.size.width == 60 && !surface.hidden,
+                          @"Refreshing an open menu must preserve offset, bounds and visibility");
                     [swipe tapped:button];
                     Check(surface.superview == nil, @"Tap must remove overlay");
                     Check([cell.subviews isEqual:nativeSubviews], @"Swipe must preserve all native subviews");
@@ -150,6 +259,19 @@ static BOOL HasRenderedContent(UIImage *image) {
                           @"Native content must remain visible after tap");
                 }
                 Check(performed == 20, @"Each tap must submit exactly one action");
+                cell.cellData.actualMuted = !cell.cellData.actualMuted;
+                Check(WCRAFRefreshNativeRow(cell, cell.cellData, table.frame) &&
+                      [swipe valueForKey:@"surface"] == nil,
+                      @"Closed visible rows must repaint without reopening or reloading the menu");
+                [swipe setValue:cell forKey:@"cell"];
+                [swipe setValue:swipe.resolve(cell) forKey:@"action"];
+                Check([swipe beginSurface], @"Overlay before identity invalidation");
+                UIView *staleSurface = [swipe valueForKey:@"surface"];
+                bindingCurrent = NO;
+                [swipe refreshActionForCell:cell];
+                Check(staleSurface.superview == nil && swipe.cell == nil,
+                      @"Old account or reused-row binding must discard its snapshot");
+                bindingCurrent = YES;
                 [swipe setValue:cell forKey:@"cell"];
                 [swipe setValue:swipe.resolve(cell) forKey:@"action"];
                 Check([swipe beginSurface], @"Overlay before reuse");

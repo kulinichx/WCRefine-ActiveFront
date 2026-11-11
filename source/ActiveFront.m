@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.28 event-driven reminder confirmation.
+// WCRefine ActiveFront - v1.9.29 native reminder row refresh.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -78,7 +78,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.28-source";
+static NSString * const kWCRAFVersion = @"1.9.29-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -158,6 +158,7 @@ static void WCRGroupSwipeTrace(NSString *event, NSString *detail) {
 - (NSUInteger)groupScopeForNativeSession:(id)session;
 - (BOOL)shouldExcludeNativeSessionFromGroupingForUnreadPolicy:(id)session;
 - (id)fulfilledSessionForUsername:(NSString *)username fallback:(id)fallback;
+- (id)nativeCellDataForSession:(id)session;
 @end
 
 static WCRAFStateStore *WCRAFStore(void);
@@ -168,6 +169,8 @@ static void WCRInvalidateSendAcknowledgments(NSString *username, WCRAFAccountCon
 static void WCRRefreshHomeGlobal(NSString *reason, WCRAFAccountContext *context);
 static void WCRReminderPendingNotice(void);
 static void WCRRefreshGroupingReminderAction(NSString *username, WCRAFAccountContext *context);
+static void WCRRefreshReminderRow(UITableViewCell *cell, NSString *username, WCRAFAccountContext *context,
+                                  UITableView *table, NSIndexPath *path);
 static UIViewController *WCRTopVC(void);
 
 
@@ -340,10 +343,15 @@ static void WCRRefreshGroupingReminderAction(NSString *username, WCRAFAccountCon
         for (UITableView *table in tables) {
             if (!table.window) continue;
             WCRAFGroupSwipe *swipe = [WCRAFGroupSwipe controllerForTable:table create:NO];
-            UITableViewCell *cell = swipe.cell;
-            if (objc_getAssociatedObject(cell, kWCRCanonicalAccountKey) != context ||
-                ![objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey) isEqualToString:username]) continue;
-            [swipe refreshActionForCell:cell];
+            for (UITableViewCell *cell in table.visibleCells) {
+                if (objc_getAssociatedObject(cell, kWCRCanonicalAccountKey) != context ||
+                    ![objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey) isEqualToString:username]) continue;
+                WCRRefreshReminderRow(cell, username, context, table, [table indexPathForCell:cell]);
+                [swipe refreshActionForCell:cell];
+            }
+        }
+        for (UITableViewCell *cell in gWCRSwipeCells.allObjects) {
+            if (cell.window) WCRRefreshReminderRow(cell, username, context, nil, nil);
         }
     });
 }
@@ -477,6 +485,9 @@ static NSInteger WCRContactMuted(NSString *username) {
 }
 
 static NSMutableDictionary<NSString *, NSDictionary *> *gWCRReminderChanges;
+// Render invalidations survive the shorter session-policy bridge. They never
+// supply a mute value; each repaint asks the native data provider for real data.
+static NSMutableDictionary<NSString *, WCRAFAccountContext *> *gWCRReminderRowChanges;
 
 static void WCRRememberReminder(NSString *username, BOOL muted, WCRAFAccountContext *context) {
     @synchronized (WCRAFStore()) {
@@ -484,6 +495,9 @@ static void WCRRememberReminder(NSString *username, BOOL muted, WCRAFAccountCont
         if (!gWCRReminderChanges) gWCRReminderChanges = [NSMutableDictionary dictionary];
         if (gWCRReminderChanges.count >= 128) [gWCRReminderChanges removeAllObjects];
         gWCRReminderChanges[username] = @{@"context": context, @"muted": @(muted)};
+        if (!gWCRReminderRowChanges) gWCRReminderRowChanges = [NSMutableDictionary dictionary];
+        if (gWCRReminderRowChanges.count >= 128) [gWCRReminderRowChanges removeAllObjects];
+        gWCRReminderRowChanges[username] = context;
     }
 }
 
@@ -1678,6 +1692,46 @@ static void WCRBindCanonicalHomeRow(UITableViewCell *cell,
                    username ?: @"<nil>",
                    (unsigned long)scope,
                    eligibleConversation);
+}
+
+static void WCRRefreshReminderRow(UITableViewCell *cell, NSString *username, WCRAFAccountContext *context,
+                                  UITableView *table, NSIndexPath *path) {
+    if (!cell || username.length == 0 || ![WCRAFStore() isCurrentContext:context] ||
+        gWCRReminderRowChanges[username] != context ||
+        objc_getAssociatedObject(cell, kWCRCanonicalAccountKey) != context ||
+        ![objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey) isEqualToString:username] ||
+        [WCRReminderCoordinator() pendingNotifyForUsername:username context:context] >= 0) return;
+    if (!table) table = WCRTableForCell(cell);
+    if (!path) path = [table indexPathForCell:cell];
+    id owner = WCRGroupControllerForTable(table) ?: (id)WCRHomeControllerForTable(table);
+    if (!owner || !path) return;
+    @try {
+        NSString *renderedName = nil;
+        id session = WCRResolveRenderedConversationForCell(cell, owner, path, &renderedName, NULL, NULL);
+        if (![renderedName isEqualToString:username]) return;
+        WCRefineGroupDataProvider *provider = WCRDataProvider();
+        id latest = [provider fulfilledSessionForUsername:username fallback:session];
+        id data = [provider nativeCellDataForSession:latest ?: session];
+        NSString *dataName = nil;
+        if (!WCRConversationFromCandidate(data, NULL, &dataName, NULL) ||
+            ![dataName isEqualToString:username] || ![WCRAFStore() isCurrentContext:context]) return;
+        if (!WCRAFRefreshNativeRow(cell, data, table.frame)) return;
+        // Preserve WCRefine's item cache as well as the visible native cell.
+        if (WCRIsGroupingSessionListController(owner)) {
+            NSArray *items = [owner items];
+            if (path.section != 0 || path.row < 0 || (NSUInteger)path.row >= items.count) return;
+            id item = items[path.row];
+            NSString *itemName = nil;
+            if (!WCRConversationFromCandidate(WCRObjectResult(item, @"session"), NULL, &itemName, NULL) ||
+                ![itemName isEqualToString:username]) return;
+            SEL setter = NSSelectorFromString(@"setCellData:");
+            NSMethodSignature *signature = [item methodSignatureForSelector:setter];
+            if (signature.numberOfArguments == 3 && signature.methodReturnType[0] == 'v' &&
+                [signature getArgumentTypeAtIndex:2][0] == '@') {
+                ((void (*)(id, SEL, id))[item methodForSelector:setter])(item, setter, data);
+            }
+        }
+    } @catch (__unused NSException *exception) { }
 }
 
 static id WCRSessionForCell(UITableViewCell *cell,
@@ -3505,7 +3559,11 @@ static UITableViewCell *hook_groupCell(id self, SEL cmd, UITableView *table, NSI
             WCRAFGroupSwipe *rightSwipe = [WCRAFGroupSwipe controllerForTable:table create:NO];
             if (rightSwipe.cell == cell) [rightSwipe reset];
             WCRConfigureGroupingSwipe(table, self);
-            if (cell) WCRBindCanonicalHomeRow(cell, self, table, path);
+            if (cell) {
+                WCRBindCanonicalHomeRow(cell, self, table, path);
+                WCRRefreshReminderRow(cell, objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey),
+                    objc_getAssociatedObject(cell, kWCRCanonicalAccountKey), table, path);
+            }
         }
     } @catch (__unused NSException *exception) {
         WCRHardResetCellVisual(cell, YES);
@@ -3746,6 +3804,8 @@ static void hook_groupingWillDisplay(
                             (NewMainFrameViewController *)self,
                             tableView,
                             indexPath);
+    WCRRefreshReminderRow(cell, objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey),
+        objc_getAssociatedObject(cell, kWCRCanonicalAccountKey), tableView, indexPath);
 
     // Attach/reconcile only after WCRefine has given us the canonical identity.
     WCRAttachToCell(cell);
