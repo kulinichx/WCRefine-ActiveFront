@@ -202,8 +202,7 @@ static const CGFloat actionWidth = 60;
     [cell layoutIfNeeded];
     UIView *picture = [cell snapshotViewAfterScreenUpdates:NO];
     if (!picture) return NO;
-    CGRect rowFrame = [cell convertRect:cell.bounds toView:self.table];
-    WCRAFGroupSwipeSurface *surface = [[WCRAFGroupSwipeSurface alloc] initWithFrame:rowFrame];
+    WCRAFGroupSwipeSurface *surface = [[WCRAFGroupSwipeSurface alloc] initWithFrame:cell.bounds];
     surface.originalBounds = surface.bounds;
     surface.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     surface.backgroundColor = UIColor.clearColor;
@@ -248,8 +247,8 @@ static const CGFloat actionWidth = 60;
     __weak WCRAFGroupSwipe *weakSelf = self;
     surface.invalidated = ^{ [weakSelf reset]; };
     self.surface = surface;
-    // Keep the overlay outside native cells: host layout/reuse owns their subviews.
-    [self.table addSubview:surface];
+    // Keep the picture in the row's own coordinate space and remove it on reuse.
+    [cell addSubview:surface];
     [self setOffset:0];
     return YES;
 }

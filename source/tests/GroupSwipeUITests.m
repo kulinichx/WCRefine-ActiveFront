@@ -102,7 +102,7 @@ static void Check(BOOL condition, NSString *message) {
                     [swipe setValue:swipe.resolve(cell) forKey:@"action"];
                     Check([swipe beginSurface], @"Snapshot must be created");
                     UIView *surface = [swipe valueForKey:@"surface"];
-                    Check(surface.superview == table, @"Overlay must not enter native row subviews");
+                    Check(surface.superview == cell, @"Overlay must stay aligned to its native row");
                     [swipe setOffset:1000];
                     UIView *viewport = [surface valueForKey:@"viewport"];
                     UIView *actions = [surface valueForKey:@"actions"];
