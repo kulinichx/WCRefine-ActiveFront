@@ -329,6 +329,23 @@ static id WCRRememberedGroupingController(UITableView *table) {
     }
 }
 
+static void WCRRefreshVisibleGroupingLists(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSMutableArray<UITableView *> *tables = [NSMutableArray array];
+        @synchronized([NSMapTable class]) {
+            for (UITableView *table in gWCRGroupingTableOwners.keyEnumerator) {
+                id controller = [gWCRGroupingTableOwners objectForKey:table];
+                if (!table.window || !WCRIsGroupingSessionListController(controller) ||
+                    ![controller isViewLoaded] || controller.view.window != table.window) continue;
+                [tables addObject:table];
+            }
+        }
+        for (UITableView *table in tables) {
+            if (table.window) [table reloadData];
+        }
+    });
+}
+
 static BOOL WCRIsActiveFrontHomeTable(UITableView *tableView) {
     if (!WCRIsMainFrameTable(tableView)) return NO;
 
@@ -532,8 +549,10 @@ static void WCRSetNativeMuted(NSString *username, BOOL muted, WCRAFAccountContex
                 return WCRAFInvokeNativeNotify(manager, contact, !muted);
             } @catch (__unused NSException *exception) { return WCRAFNativeNotifyUnavailable; }
         } pending:^{
+            WCRRefreshVisibleGroupingLists();
             WCRRefreshHomeGlobal(@"active_front_reminder_pending", context);
         } completion:^(WCRAFNotifyOutcome outcome) {
+            WCRRefreshVisibleGroupingLists();
             if (outcome == WCRAFNotifyConfirmed) {
                 WCRRememberReminder(username, muted, context);
                 completion(YES, nil);
