@@ -7,17 +7,22 @@
 ## 本轮：分组右滑接入原生 swipe actions
 
 1.9.20 放开分组 cell 类型仍无效，因为 iPad 分组表格没有让自定义 Pan 获得
-右滑手势。本版不再在分组 cell 上安装自定义 Pan，而是在分组控制器上提供
-UIKit `leadingSwipeActionsConfigurationForRowAtIndexPath:`，右滑动作使用系统
-原生揭示、收拢和回弹；WCRefine 原有 `trailing` 左滑路径不变。
+右滑手势。本版不再在分组 cell 上安装自定义 Pan，而是在分组控制器及分组表格
+实际 delegate 上提供 UIKit `leadingSwipeActionsConfigurationForRowAtIndexPath:`；
+右滑动作使用系统原生揭示、收拢和回弹，WCRefine 原有 `trailing` 左滑路径不变。
+
+后续源码修订额外将旧 Pan 限定在首页表格，并按实际 delegate class 保存/调用原始
+右滑实现。这样可覆盖 iPad 使用代理对象的情况，同时让非 WCRefine 分组表格回落到
+原 delegate。此修订尚未经过 Apple 工具链编译或 iPad 实机验证。
 
 右滑显示“免扰”或“提醒”，点击后切换微信实际通知状态；禁用整行全滑触发，
 减少误触。每次仅针对 UIKit 提供的分组行读取会话状态。
 
-本轮已完成 Apple 工具链构建：35 项本地源码契约检查、18 项构建验收器测试、
-**123 项原生 Foundation 核心测试全部通过，iOS ARM64 编译零警告。**
-Apple 签名、下载压缩包哈希、CodeDirectory 页哈希及编译输入快照验证通过。
-当前工作区安装库仍是 1.9.20；1.9.21 构建与 iPad 实机验证待完成。
+基础 1.9.21 候选已完成 Apple 工具链构建：35 项本地源码契约检查、18 项构建验收器
+测试、**123 项原生 Foundation 核心测试全部通过，iOS ARM64 编译零警告**。
+但以上构建不包含本节记录的后续 delegate 修订。当前 `build/WCRefineGroup.dylib`
+哈希为 `8976f0a43b83b5e4122767235cba6f72b5b8f78b8ea23ac6d241d51768682df5`，
+只能代表旧源码，不能用于验证本修订。新源码仍待 Apple 工具链重编译及 iPad 实测。
 
 ## 1.9.18：等待真实状态，串行处理提醒设置
 
