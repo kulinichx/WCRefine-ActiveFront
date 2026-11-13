@@ -162,10 +162,22 @@ static void ActivityCheck(BOOL condition, NSString *message) {
 }
 @end
 
+static void ActivityQueueTurns(NSUInteger remaining, dispatch_block_t completion) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (remaining > 1) ActivityQueueTurns(remaining - 1, completion);
+        else completion();
+    });
+}
+
 static void DrainActivity(void) {
-    for (NSUInteger i = 0; i < 5; i++) {
-        [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    __block BOOL advanced = NO;
+    ActivityQueueTurns(4, ^{ advanced = YES; });
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:3];
+    while (!advanced && deadline.timeIntervalSinceNow > 0) {
+        [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
+            beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
     }
+    ActivityCheck(advanced, @"Activity main queue must advance before state assertions");
 }
 
 static ActivitySession *NewActivitySession(NSString *name, NSInteger unread) {
@@ -181,7 +193,8 @@ static ActivitySession *NewActivitySession(NSString *name, NSInteger unread) {
 static void TrackActivity(ActivitySession *session, WCRAFAccountContext *context) {
     ActivityCheck(WCRIsMessageActiveSession(session, session.m_nsUsrName, context), @"Unread row starts active");
     DrainActivity();
-    ActivityCheck([WCRAFStore() hasTrackedMessageActivity:session.m_nsUsrName context:context], @"Runtime persisted activity");
+    ActivityCheck([WCRAFStore() hasTrackedMessageActivity:session.m_nsUsrName context:context],
+        [@"Runtime persisted activity: " stringByAppendingString:session.m_nsUsrName]);
 }
 
 NSUInteger WCRRunActivityIntegrationTests(UIWindow *window) {

@@ -150,8 +150,9 @@ static NSData *IconPixels(UIImage *image, ReminderTestCell *cell) {
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     self.window.rootViewController = [SwipeTestController new];
     [self.window makeKeyAndVisible];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [self runTests]; });
+    // Run from a run-loop timer so nested test waits can service main-queue
+    // production callbacks instead of blocking behind this dispatch block.
+    [self performSelector:@selector(runTests) withObject:nil afterDelay:0.5];
     return YES;
 }
 - (void)runTests {
