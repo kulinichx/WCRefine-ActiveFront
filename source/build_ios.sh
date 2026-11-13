@@ -19,7 +19,7 @@ xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -isysroot "$SDK" \
     -DWCRAF_DIAGNOSTICS=0 -DWCRAF_VERBOSE_CELL_LOGS=0 \
     -dynamiclib -framework Foundation -framework UIKit -framework CoreGraphics -framework QuartzCore \
     -Wl,-install_name,@rpath/WCRefineGroup.dylib \
-    -Wl,-current_version,1.9.30 -Wl,-compatibility_version,1.0 -Wl,-dead_strip \
+    -Wl,-current_version,1.9.31 -Wl,-compatibility_version,1.0 -Wl,-dead_strip \
     "$ROOT/ActiveFront.m" "$ROOT/WCRAFGroupSwipe.m" "$ROOT/WCRAFStateStore.m" -o "$TARGET"
 codesign --force --sign - "$TARGET"
 codesign --verify --strict --verbose=2 "$TARGET"
@@ -41,8 +41,8 @@ cp "$STAGE/tests/test-inputs.json" "$OUT/test-inputs.json"
 mv -f "$TARGET" "$FINAL"
 (cd "$OUT" && /usr/bin/shasum -a 256 WCRefineGroup.dylib) | tee "$OUT/WCRefineGroup.dylib.sha256"
 # Versioned delivery copy; the injected library retains its required install name.
-cp "$FINAL" "$OUT/WCRefineGroup_1.9.30.dylib"
-(cd "$OUT" && /usr/bin/shasum -a 256 WCRefineGroup_1.9.30.dylib) > "$OUT/WCRefineGroup_1.9.30.dylib.sha256"
+cp "$FINAL" "$OUT/WCRefineGroup_1.9.31.dylib"
+(cd "$OUT" && /usr/bin/shasum -a 256 WCRefineGroup_1.9.31.dylib) > "$OUT/WCRefineGroup_1.9.31.dylib.sha256"
 printf '%s\n' \
     "Built: $FINAL" \
     'This is ad-hoc signed only. Device trust/injection compatibility is NOT verified.' \

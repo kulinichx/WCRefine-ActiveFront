@@ -4,6 +4,8 @@
 #import <stdlib.h>
 #import "../WCRAFGroupSwipe.h"
 
+extern NSUInteger WCRRunActivityIntegrationTests(UIWindow *window);
+
 @interface WCRAFGroupSwipe (Tests)
 - (BOOL)beginSurface;
 - (void)setOffset:(CGFloat)offset;
@@ -154,6 +156,7 @@ static NSData *IconPixels(UIImage *image, ReminderTestCell *cell) {
 }
 - (void)runTests {
     BOOL passed = YES;
+    NSUInteger activityChecks = 0;
     NSString *failure = @"";
     NSString *folder = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     @try {
@@ -305,11 +308,14 @@ static NSData *IconPixels(UIImage *image, ReminderTestCell *cell) {
                 swipe.perform = nil;
             }
         }
+        activityChecks = WCRRunActivityIntegrationTests(self.window);
+        checks += activityChecks;
     } @catch (NSException *exception) {
         passed = NO;
         failure = exception.reason ?: @"Unknown UIKit test failure";
     }
-    NSDictionary *report = @{@"passed": @(passed), @"checks_run": @(checks), @"failure": failure,
+    NSDictionary *report = @{@"passed": @(passed), @"checks_run": @(checks),
+        @"activity_checks_run": @(activityChecks), @"failure": failure,
         @"scope": @"UIKit simulator overlay and native-row invariants; no WeChat host or physical device"};
     NSData *data = [NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingPrettyPrinted error:nil];
     [data writeToFile:[folder stringByAppendingPathComponent:@"ui-tests.json"] atomically:YES];

@@ -15,6 +15,8 @@ INPUTS = (
     "ActiveFront.m", "WCRAFGroupSwipe.h", "WCRAFGroupSwipe.m",
     "WCRAFStateStore.h", "WCRAFStateStore.m",
     "tests/StateStoreTests.m", "test_core.sh", "build_ios.sh", "verify_build.py",
+    "tests/ActivityIntegrationTests.m", "tests/GroupSwipeUITests.m", "test_ui.sh",
+    "tests/run_ui_tests.py", "tests/SwipeTests-Info.plist",
 )
 
 
@@ -37,6 +39,7 @@ def inspect_macho(data):
         raise ValueError("Invalid load command bounds")
     offset = 32
     names = []
+    current_versions = []
     dependencies = []
     versions = []
     signatures = []
@@ -58,6 +61,9 @@ def inspect_macho(data):
                 raise ValueError("Unterminated dylib name")
             name = raw[:terminator].decode("utf-8", errors="strict")
             (names if command == 0xD else dependencies).append(name)
+            if command == 0xD:
+                version = struct.unpack_from("<I", data, offset + 16)[0]
+                current_versions.append(f"{version >> 16}.{(version >> 8) & 255}.{version & 255}")
         elif command == 0x32:
             if length < 24:
                 raise ValueError("Truncated build version")
@@ -93,6 +99,7 @@ def inspect_macho(data):
     ):
         raise ValueError("Unexpected non-system dependency")
     return {
+        "current_version": current_versions[0],
         "architecture": "arm64", "platform": "iOS", "minimum_os": "14.0",
         "install_name": names[0], "dependencies": dependencies,
         "signature_blob_present": True,
@@ -142,8 +149,10 @@ def main():
     current = source_snapshot()
     validate_inputs(tests, inputs, current)
     binary = inspect_macho(args.binary.read_bytes())
+    if binary["current_version"] != "1.9.31":
+        raise ValueError("Expected Mach-O current_version 1.9.31")
     report = {
-        "product": "WCRefineGroup.dylib", "source_version": "1.9.30-source",
+        "product": "WCRefineGroup.dylib", "source_version": "1.9.31-source",
         "binary_sha256": sha256(args.binary), "binary_size": args.binary.stat().st_size,
         "native_tests": tests, "native_test_report_sha256": sha256(args.tests),
         "source_files_sha256": current, "macho": binary,

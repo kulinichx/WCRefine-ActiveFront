@@ -77,7 +77,8 @@ def main():
             # Gate on the app's atomic report, independently of simctl's lifetime.
             report = launch_and_collect(device, container, destination)
             print(json.dumps({"device": family, **report}), flush=True)
-            if report.get("passed") is not True or report.get("checks_run", 0) < 900:
+            if (report.get("passed") is not True or report.get("checks_run", 0) < 1400 or
+                    report.get("activity_checks_run", 0) < 40):
                 raise RuntimeError(report)
             reports.append({"device": family, "report": report})
         finally:

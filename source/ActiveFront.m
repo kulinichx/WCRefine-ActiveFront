@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.30 home projection invalidation.
+// WCRefine ActiveFront - v1.9.31 event-driven read return.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -55,6 +55,12 @@
 static const CGFloat kWCRActionWidth = 60.0;
 static const CGFloat kWCRReturnActionWidth = 82.0;
 static __weak id gWCRAppearedHomeController;
+static __weak id gWCRKnownHomeController;
+static WCRAFAccountContext *gWCRKnownHomeContext;
+static NSDictionary *gWCRPendingHomeVisit;
+static __weak UIViewController *gWCRHomeChatController;
+static NSDictionary *gWCRHomeChatVisit;
+static const void *kWCROutgoingHomeVisitKey = &kWCROutgoingHomeVisitKey;
 
 static const void *kWCRPanKey          = &kWCRPanKey;
 static const void *kWCRActionViewKey   = &kWCRActionViewKey;
@@ -79,7 +85,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.30-source";
+static NSString * const kWCRAFVersion = @"1.9.31-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -1146,7 +1152,8 @@ static void WCRRefreshHomeDeferred(id host, NSString *reason, WCRAFAccountContex
 // Invalidate that snapshot on the actual home controller before scheduling once.
 static void WCRRefreshHomeProjection(id host, WCRAFAccountContext *context) {
     if (![NSThread isMainThread] || ![WCRAFStore() isCurrentContext:context]) return;
-    id home = host ?: WCRActivityHomeController();
+    id home = host ?: WCRActivityHomeController() ?:
+        (gWCRKnownHomeContext == context ? gWCRKnownHomeController : nil);
     Class homeClass = NSClassFromString(@"NewMainFrameViewController");
     SEL schedule = @selector(wcrGrouping_scheduleRefreshForTrigger:);
     if (!homeClass || ![home isKindOfClass:homeClass] || ![home respondsToSelector:schedule]) {
@@ -1393,6 +1400,7 @@ static NewMainFrameViewController *WCRActivityHomeController(void) {
 // The predicate must not persist state or recurse into a home refresh.
 static NSMutableDictionary<NSString *, NSDictionary *> *gWCRActivityObservations;
 static BOOL gWCRActivityObservationScheduled;
+static WCRAFAccountContext *gWCRActivityProjectionDirtyContext;
 
 static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountContext *context,
                                            BOOL projectedActive) {
@@ -1404,6 +1412,8 @@ static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountConte
     }
     if (username.length == 0 || ![WCRAFStore() isCurrentContext:context]) return;
     if (!gWCRActivityObservations) gWCRActivityObservations = [NSMutableDictionary dictionary];
+    NSDictionary *queued = gWCRActivityObservations[username];
+    if (queued[@"context"] == context) projectedActive |= [queued[@"active"] boolValue];
     gWCRActivityObservations[username] = @{@"context": context, @"active": @(projectedActive)};
     if (gWCRActivityObservationScheduled) return;
     gWCRActivityObservationScheduled = YES;
@@ -1449,18 +1459,40 @@ static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountConte
         // Persisting new-message state alone does not change the projection.
         // Only a visibility transition requests the host's structural refresh.
         NewMainFrameViewController *home = WCRActivityHomeController();
+        if (projectionChanged && [WCRAFStore() isCurrentContext:current]) {
+            gWCRActivityProjectionDirtyContext = current;
+        }
         if (projectionChanged && home && [WCRAFStore() isCurrentContext:current] &&
             [home respondsToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)]) {
+            gWCRActivityProjectionDirtyContext = nil;
             WCRRefreshHomeProjection(home, current);
         }
     });
 }
 
 static void WCRReconcileTrackedActivity(WCRAFAccountContext *context) {
+    if (gWCRActivityProjectionDirtyContext) {
+        WCRAFAccountContext *dirty = gWCRActivityProjectionDirtyContext;
+        gWCRActivityProjectionDirtyContext = nil;
+        if (dirty == context && [WCRAFStore() isCurrentContext:dirty]) {
+            WCRRefreshHomeProjection(nil, dirty);
+        }
+    }
     // Home return/foreground events inspect only tracked conversations, not history.
     for (NSString *name in [WCRAFStore() trackedMessageActivityUsernamesForContext:context]) {
         WCRScheduleActivityObservation(name, context, YES);
     }
+}
+
+static void WCRQueueNativeActivityEvent(id username, WCRAFAccountContext *context) {
+    if (![username isKindOfClass:NSString.class] || [username length] == 0 || !context) return;
+    NSString *name = [username copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (![WCRAFStore() isCurrentContext:context]) return;
+        BOOL tracked = [WCRAFStore() hasTrackedMessageActivity:name context:context];
+        if (!tracked && !WCRIsInCustomGroup(name)) return;
+        WCRScheduleActivityObservation(name, context, tracked);
+    });
 }
 
 static BOOL WCRIsMessageActiveSession(id session, NSString *username,
@@ -3217,6 +3249,46 @@ static NSString *WCRCurrentChatUsername(void) {
     } @catch (__unused NSException *exception) { return nil; }
 }
 
+static NSString *WCRChatUsernameForController(UIViewController *controller) {
+    Class chatClass = NSClassFromString(@"BaseMsgContentViewController");
+    if (!chatClass || ![controller isKindOfClass:chatClass]) return nil;
+    @try {
+        // The same accessors are used by WCRefine's contactFromMsgViewController:.
+        id contact = WCRObjectResult(controller, @"GetContact") ?:
+            WCRObjectResult(controller, @"getChatContact") ?:
+            WCRMessageValue(controller, @"m_contact");
+        id username = WCRMessageValue(contact, @"m_nsUsrName");
+        return [username isKindOfClass:NSString.class] ? username : nil;
+    } @catch (__unused NSException *exception) { return nil; }
+}
+
+static void WCRConfirmHomeVisit(UIViewController *chat, NSDictionary *visit) {
+    if (!visit || visit != gWCRPendingHomeVisit ||
+        ![WCRAFStore() isCurrentContext:visit[@"context"]] ||
+        ![WCRChatUsernameForController(chat) isEqualToString:visit[@"username"]] ||
+        !chat.isViewLoaded || !chat.view.window) return;
+    gWCRPendingHomeVisit = nil;
+    gWCRHomeChatController = chat;
+    gWCRHomeChatVisit = visit;
+    [WCRAFStore() markHomeConversationOpened:visit[@"username"] context:visit[@"context"]];
+    WCRQueueNativeActivityEvent(visit[@"username"], visit[@"context"]);
+}
+
+static void WCRConfirmVisibleHomeVisit(UIViewController *controller, NSDictionary *visit) {
+    if (!controller || !visit || visit != gWCRPendingHomeVisit) return;
+    if ([WCRChatUsernameForController(controller) isEqualToString:visit[@"username"]]) {
+        WCRConfirmHomeVisit(controller, visit);
+    } else if ([controller isKindOfClass:UINavigationController.class]) {
+        WCRConfirmVisibleHomeVisit(((UINavigationController *)controller).visibleViewController, visit);
+    } else if ([controller isKindOfClass:UITabBarController.class]) {
+        WCRConfirmVisibleHomeVisit(((UITabBarController *)controller).selectedViewController, visit);
+    } else if ([controller isKindOfClass:UISplitViewController.class]) {
+        for (UIViewController *child in controller.childViewControllers) {
+            WCRConfirmVisibleHomeVisit(child, visit);
+        }
+    }
+}
+
 static uint64_t WCRMessageID(id wrap, NSString *key) {
     id number = WCRMessageValue(wrap, key);
     return [number isKindOfClass:NSNumber.class] ? [number unsignedLongLongValue] : 0;
@@ -3239,7 +3311,24 @@ static WCRAFOutgoingTicket *WCRStageLocalSend(NSString *username, id wrap) {
     NSTimeInterval time = WCRMessageTime(wrap), now = NSDate.date.timeIntervalSince1970;
     if (time <= 0 || time > now || now - time > 60) return nil;
     if (![WCRAFStore() isCurrentContext:context]) return nil;
-    return [WCROutgoingLedger() stageUsername:username context:context token:wrap messageTime:time];
+    WCRAFOutgoingTicket *ticket = [WCROutgoingLedger() stageUsername:username
+        context:context token:wrap messageTime:time];
+    BOOL fromHome = gWCRHomeChatVisit[@"context"] == context &&
+        [gWCRHomeChatVisit[@"username"] isEqualToString:username] &&
+        gWCRHomeChatController.isViewLoaded && gWCRHomeChatController.view.window &&
+        [WCRChatUsernameForController(gWCRHomeChatController) isEqualToString:username];
+    if (ticket && fromHome) objc_setAssociatedObject(ticket, kWCROutgoingHomeVisitKey,
+        @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return ticket;
+}
+
+static BOOL WCRRecordOutgoingActivity(WCRAFOutgoingTicket *ticket, NSTimeInterval time) {
+    if (!ticket || ![WCRAFStore() noteOutgoingMessage:ticket.username context:ticket.context
+        lastMessageTime:time]) return NO;
+    if ([objc_getAssociatedObject(ticket, kWCROutgoingHomeVisitKey) boolValue]) {
+        [WCRAFStore() markHomeConversationOpened:ticket.username context:ticket.context];
+    }
+    return [WCRAFStore() isCurrentContext:ticket.context];
 }
 
 static void WCRQueueSendAcknowledgment(NSString *username, id wrap) {
@@ -3273,7 +3362,7 @@ static void WCRQueueSendAcknowledgment(NSString *username, id wrap) {
                     if (!WCRConversationFromCandidate(current, NULL, &currentName, NULL) ||
                         ![currentName isEqualToString:name]) return;
                     NSTimeInterval latestTime = MAX(ticket.messageTime, WCRSessionLastMessageTime(current));
-                    if ([WCRAFStore() noteOutgoingMessage:name context:context lastMessageTime:latestTime]) {
+                    if (WCRRecordOutgoingActivity(ticket, latestTime)) {
                         WCRRefreshHomeGlobal(@"active_front_outgoing_acknowledged", context);
                     }
                 } @catch (__unused NSException *exception) { }
@@ -3285,6 +3374,9 @@ static void WCRQueueSendAcknowledgment(NSString *username, id wrap) {
 static void (*orig_addMsg)(id, SEL, id, id);
 static void (*orig_sessionAddMsg)(id, SEL, id, id);
 static void (*orig_sessionModMsg)(id, SEL, id, id);
+static void (*orig_sessionUnread)(id, SEL, id, unsigned int);
+static void (*orig_chatAppear)(id, SEL, BOOL);
+static void (*orig_groupSelection)(id, SEL, UITableView *, NSIndexPath *);
 static UITableViewCell *(*orig_groupCell)(id, SEL, UITableView *, NSIndexPath *);
 static NSMutableDictionary *gWCRGroupLeadingSwipeOriginals;
 static NSMutableDictionary *gWCRGroupCanEditOriginals;
@@ -3571,21 +3663,45 @@ static void hook_addMsg(id self, SEL cmd, id username, id wrap) {
 }
 
 static void hook_sessionAddMsg(id self, SEL cmd, id username, id wrap) {
+    WCRAFAccountContext *context = [WCRAFStore() currentContext];
     if (orig_sessionAddMsg) orig_sessionAddMsg(self, cmd, username, wrap);
     @try {
         WCRQueueSendAcknowledgment(username, wrap);
-        WCRQueueReminderObservation(username, [WCRAFStore() currentContext]);
+        WCRQueueReminderObservation(username, context);
+        WCRQueueNativeActivityEvent(username, context);
     }
     @catch (__unused NSException *exception) { }
 }
 
 static void hook_sessionModMsg(id self, SEL cmd, id username, id wrap) {
+    WCRAFAccountContext *context = [WCRAFStore() currentContext];
     if (orig_sessionModMsg) orig_sessionModMsg(self, cmd, username, wrap);
     @try {
         WCRQueueSendAcknowledgment(username, wrap);
-        WCRQueueReminderObservation(username, [WCRAFStore() currentContext]);
+        WCRQueueReminderObservation(username, context);
+        WCRQueueNativeActivityEvent(username, context);
     }
     @catch (__unused NSException *exception) { }
+}
+
+static void hook_sessionUnread(id self, SEL cmd, id username, unsigned int count) {
+    WCRAFAccountContext *context = [WCRAFStore() currentContext];
+    if (orig_sessionUnread) orig_sessionUnread(self, cmd, username, count);
+    // The callback is a wake-up signal, not proof that the session is read.
+    // Read the current native session again after the original method finishes.
+    WCRQueueNativeActivityEvent(username, context);
+}
+
+static void hook_chatAppear(id self, SEL cmd, BOOL animated) {
+    if (orig_chatAppear) orig_chatAppear(self, cmd, animated);
+    WCRConfirmHomeVisit(self, gWCRPendingHomeVisit);
+}
+
+static void hook_groupSelection(id self, SEL cmd, UITableView *table, NSIndexPath *path) {
+    gWCRPendingHomeVisit = nil;
+    gWCRHomeChatVisit = nil;
+    gWCRHomeChatController = nil;
+    if (orig_groupSelection) orig_groupSelection(self, cmd, table, path);
 }
 
 static UITableViewCell *hook_groupCell(id self, SEL cmd, UITableView *table, NSIndexPath *path) {
@@ -3643,28 +3759,31 @@ static void hook_groupAppear(id self, SEL cmd, BOOL animated) {
 
 static void hook_homeSelection(id self, SEL cmd, UITableView *table, NSIndexPath *path) {
     UITableViewCell *cell = [table cellForRowAtIndexPath:path];
-    WCRAFAccountContext *context = objc_getAssociatedObject(cell, kWCRCanonicalAccountKey);
+    WCRAFAccountContext *context = [WCRAFStore() currentContext];
     NSString *username = nil;
     @try {
         if (WCRIsActiveFrontHomeTable(table) && !WCRBool(cell, kWCROpenKey) &&
-            !WCRBool(cell, kWCRTrackingKey)) {
+            !WCRBool(cell, kWCRTrackingKey) && !WCRWeChatLeftSwipeMenuVisible(cell)) {
+            WCRBindCanonicalHomeRow(cell, self, table, path);
             id session = WCRSessionForCell(cell, NULL, NULL, NULL);
             WCRConversationFromCandidate(session, NULL, &username, NULL);
         }
     } @catch (__unused NSException *exception) { username = nil; }
+    NSDictionary *visit = username.length && context ?
+        @{@"username": [username copy], @"context": context} : nil;
+    gWCRPendingHomeVisit = visit;
+    gWCRHomeChatVisit = nil;
+    gWCRHomeChatController = nil;
     if (orig_homeSelection) orig_homeSelection(self, cmd, table, path);
-    if (username.length == 0 || !context) return;
-    NSString *name = [username copy];
+    if (!visit) return;
     void (^opened)(void) = ^{
-        if ([WCRAFStore() isCurrentContext:context] &&
-            [WCRCurrentChatUsername() isEqualToString:name]) {
-            [WCRAFStore() markHomeConversationOpened:name context:context];
-        }
+        WCRConfirmVisibleHomeVisit(WCRTopVC(), visit);
     };
     id<UIViewControllerTransitionCoordinator> transition = WCRTopVC().transitionCoordinator;
     if (transition) {
         [transition animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> result) {
             if (!result.isCancelled) opened();
+            else if (gWCRPendingHomeVisit == visit) gWCRPendingHomeVisit = nil;
         }];
     } else {
         dispatch_async(dispatch_get_main_queue(), opened);
@@ -3806,7 +3925,12 @@ static void hook_activeViewDidAppear(id self,
     if ([self isKindOfClass:NSClassFromString(@"NewMainFrameViewController")] &&
         [self isViewLoaded] && [self view].window) {
         gWCRAppearedHomeController = self;
+        gWCRKnownHomeController = self;
+        gWCRKnownHomeContext = context;
     }
+    gWCRHomeChatVisit = nil;
+    gWCRHomeChatController = nil;
+    gWCRPendingHomeVisit = nil;
 
     WCRPruneStaleActiveFrontState();
     // The original host owns discovery/refresh. Only reconcile tracked rows
@@ -3840,6 +3964,9 @@ static void hook_groupingWillDisplay(
                             (NewMainFrameViewController *)self,
                             tableView,
                             indexPath);
+    WCRIsMessageActiveSession(objc_getAssociatedObject(cell, kWCRCanonicalSessionKey),
+        objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey),
+        objc_getAssociatedObject(cell, kWCRCanonicalAccountKey));
     WCRRefreshReminderRow(cell, objc_getAssociatedObject(cell, kWCRCanonicalUsernameKey),
         objc_getAssociatedObject(cell, kWCRCanonicalAccountKey), tableView, indexPath);
 
@@ -4022,6 +4149,10 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         @"OnAddMsg:MsgWrap:", 'v', "@@", (IMP)hook_sessionAddMsg, (IMP *)&orig_sessionAddMsg);
     if (!orig_sessionModMsg) WCRInstallCheckedHook(sessionManager,
         @"OnModMsg:MsgWrap:", 'v', "@@", (IMP)hook_sessionModMsg, (IMP *)&orig_sessionModMsg);
+    if (!orig_sessionUnread) WCRInstallCheckedHook(sessionManager,
+        @"ChangeSessionUnReadCount:to:", 'v', "@I", (IMP)hook_sessionUnread, (IMP *)&orig_sessionUnread);
+    if (!orig_chatAppear) WCRInstallCheckedHook(NSClassFromString(@"BaseMsgContentViewController"),
+        @"viewDidAppear:", 'v', "B", (IMP)hook_chatAppear, (IMP *)&orig_chatAppear);
     Class groupList = NSClassFromString(@"WCRGroupingSessionListViewController");
     if (!orig_groupCell) WCRInstallCheckedHook(groupList,
         @"tableView:cellForRowAtIndexPath:", '@', "@@", (IMP)hook_groupCell, (IMP *)&orig_groupCell);
@@ -4040,8 +4171,11 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         @"viewDidAppear:", 'v', "B", (IMP)hook_groupAppear, (IMP *)&orig_groupAppear);
     if (!orig_groupDisappear) WCRInstallCheckedHook(groupList,
         @"viewWillDisappear:", 'v', "B", (IMP)hook_groupDisappear, (IMP *)&orig_groupDisappear);
+    if (!orig_groupSelection) WCRInstallCheckedHook(groupList,
+        @"tableView:didSelectRowAtIndexPath:", 'v', "@@",
+        (IMP)hook_groupSelection, (IMP *)&orig_groupSelection);
     if (!orig_homeSelection) WCRInstallCheckedHook(mainFrame,
-        @"wcrGrouping_tableView:didSelectRowAtIndexPath:", 'v', "@@",
+        @"tableView:didSelectRowAtIndexPath:", 'v', "@@",
         (IMP)hook_homeSelection, (IMP *)&orig_homeSelection);
 
     BOOL allInstalled =
@@ -4054,7 +4188,7 @@ static void WCRTryInstallBusinessHooks(NSUInteger attemptsRemaining) {
         gWCRHookCellDidMove && orig_addMsg && orig_sessionAddMsg && orig_sessionModMsg &&
         orig_groupCell && gWCRHookGroupLeadingSwipe && gWCRHookGroupCanEdit &&
         orig_groupCellPanShouldBegin && orig_groupAppear && orig_groupDisappear &&
-        orig_homeSelection;
+        orig_homeSelection && orig_sessionUnread && orig_chatAppear && orig_groupSelection;
 
     if (allInstalled) {
         WCRAF_LOG(@"business hooks installed config=1 provider=1 home=1 disappear=1 willDisplay=1 reuse=1 didMove=1 settings=%d",
@@ -4094,6 +4228,11 @@ static BOOL WCRScan(void) {
     if (!tableView) return NO;
 
     NewMainFrameViewController *host = WCRHomeControllerForTable(tableView);
+    if (host && tableView.window) {
+        gWCRKnownHomeController = host;
+        gWCRKnownHomeContext = [WCRAFStore() currentContext];
+        gWCRAppearedHomeController = host;
+    }
     for (UITableViewCell *cell in tableView.visibleCells) {
         if (!WCRIsMainFrameCell(cell)) continue;
         // Initial visible rows may predate installation of willDisplay hooks.
@@ -4117,6 +4256,7 @@ static void WCRTryInitialScan(NSUInteger remaining) {
         });
 }
 
+#if !defined(WCRAF_ACTIVITY_TESTS)
 __attribute__((constructor))
 static void WCRRightGroupUIInit(void) {
     @autoreleasepool {
@@ -4146,6 +4286,7 @@ static void WCRRightGroupUIInit(void) {
             WCRCancelReturnAnimation();
             WCRResetVisibleSwipeVisuals();
             [WCRAFGroupSwipe resetAll];
+            gWCRPendingHomeVisit = nil;
         }];
         static id activeObserver __attribute__((unused));
         activeObserver = [[NSNotificationCenter defaultCenter]
@@ -4179,3 +4320,4 @@ static void WCRRightGroupUIInit(void) {
 
     }
 }
+#endif

@@ -9,7 +9,9 @@ ARCH="$(uname -m)"
 xcrun --sdk iphonesimulator clang -target "$ARCH-apple-ios15.0-simulator" -isysroot "$SDK" \
     -fobjc-arc -fblocks -O1 -Wall -Wextra -Werror=objc-method-access -Werror=return-type \
     -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics \
-    "$ROOT/WCRAFGroupSwipe.m" "$ROOT/tests/GroupSwipeUITests.m" -o "$APP/SwipeTests"
+    -Wno-unused-function \
+    "$ROOT/WCRAFGroupSwipe.m" "$ROOT/WCRAFStateStore.m" \
+    "$ROOT/tests/GroupSwipeUITests.m" "$ROOT/tests/ActivityIntegrationTests.m" -o "$APP/SwipeTests"
 cp "$ROOT/tests/SwipeTests-Info.plist" "$APP/Info.plist"
 codesign --force --sign - "$APP"
 python3 "$ROOT/tests/run_ui_tests.py" "$OUT"
