@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.29 native reminder row refresh.
+// WCRefine ActiveFront - v1.9.30 home projection invalidation.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -49,6 +49,7 @@
 #import <stdarg.h>
 #import <string.h>
 #import <os/log.h>
+#import <dlfcn.h>
 #import "WCRAFGroupSwipe.h"
 
 static const CGFloat kWCRActionWidth = 60.0;
@@ -78,7 +79,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.29-source";
+static NSString * const kWCRAFVersion = @"1.9.30-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -172,6 +173,8 @@ static void WCRRefreshGroupingReminderAction(NSString *username, WCRAFAccountCon
 static void WCRRefreshReminderRow(UITableViewCell *cell, NSString *username, WCRAFAccountContext *context,
                                   UITableView *table, NSIndexPath *path);
 static UIViewController *WCRTopVC(void);
+@class NewMainFrameViewController;
+static NewMainFrameViewController *WCRActivityHomeController(void);
 
 
 @interface NewMainFrameViewController : UIViewController
@@ -1138,12 +1141,43 @@ static void WCRRefreshHomeDeferred(id host, NSString *reason, WCRAFAccountContex
     });
 }
 
+// ActiveFront state changes are invisible to the host's native session/group
+// comparison. Its groupsChanged path may deliberately retain the live snapshot.
+// Invalidate that snapshot on the actual home controller before scheduling once.
+static void WCRRefreshHomeProjection(id host, WCRAFAccountContext *context) {
+    if (![NSThread isMainThread] || ![WCRAFStore() isCurrentContext:context]) return;
+    id home = host ?: WCRActivityHomeController();
+    Class homeClass = NSClassFromString(@"NewMainFrameViewController");
+    SEL schedule = @selector(wcrGrouping_scheduleRefreshForTrigger:);
+    if (!homeClass || ![home isKindOfClass:homeClass] || ![home respondsToSelector:schedule]) {
+        WCRRefreshHome(nil, @"active_front_projection", context);
+        return;
+    }
+    // Export verified in the supplied WCRefine 2.1-9 binary. Resolve by name,
+    // never by image offsets, and reject an export from a different image.
+    void (*invalidate)(id) = (void (*)(id))dlsym(RTLD_DEFAULT,
+        "WCRGroupingInvalidateLiveSnapshotKeepingTabCache");
+    Method providerMethod = class_getClassMethod(NSClassFromString(@"WCRefineGroupDataProvider"),
+        @selector(shared));
+    Dl_info symbolImage = {0}, providerImage = {0};
+    BOOL supported = invalidate && providerMethod &&
+        dladdr((const void *)invalidate, &symbolImage) &&
+        dladdr((const void *)method_getImplementation(providerMethod), &providerImage) &&
+        symbolImage.dli_fbase == providerImage.dli_fbase;
+    @try {
+        if (supported) invalidate(home);
+        if (![WCRAFStore() isCurrentContext:context]) return;
+        // Older hosts without the export use the host's full rebuild trigger.
+        [home wcrGrouping_scheduleRefreshForTrigger:supported ? @"groupsChanged" : @"reloadAll"];
+    } @catch (__unused NSException *exception) {
+        // Preserve state if the host's refresh interface becomes incompatible.
+    }
+}
+
 static void WCRRefreshHomeGlobal(__unused NSString *reason, WCRAFAccountContext *context) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (context && ![WCRAFStore() isCurrentContext:context]) return;
-        [[NSNotificationCenter defaultCenter]
-            postNotificationName:kWCRHomeGroupsDidChangeNotification
-                          object:nil];
+        WCRRefreshHomeProjection(nil, context);
     });
 }
 
@@ -1280,8 +1314,10 @@ static void WCRSetHeld(NSString *username, BOOL held, id host,
               held ? @"keep" : @"return-to-group",
               username);
 
-    NSString *reason = held ? @"active_front_keep" : @"active_front_return";
-    WCRRefreshHomeDeferred(host, reason, context);
+    __weak id weakHost = host;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        WCRRefreshHomeProjection(weakHost, context);
+    });
 }
 
 static BOOL WCRPruneStaleActiveFrontState(void) {
@@ -1415,7 +1451,7 @@ static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountConte
         NewMainFrameViewController *home = WCRActivityHomeController();
         if (projectionChanged && home && [WCRAFStore() isCurrentContext:current] &&
             [home respondsToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)]) {
-            [home wcrGrouping_scheduleRefreshForTrigger:@"groupsChanged"];
+            WCRRefreshHomeProjection(home, current);
         }
     });
 }
@@ -2570,7 +2606,7 @@ static void WCRAnimateReturn(UITableViewCell *cell, WCRAFSwipeIntent *intent) {
         [container addSubview:overlay];
     }
     WCRCloseCell(cell, NO);
-    WCRRefreshHome(host, @"active_front_swipe_return", intent.context);
+    WCRRefreshHomeProjection(host, intent.context);
     UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc]
         initWithStyle:UIImpactFeedbackStyleLight];
     [feedback impactOccurred];

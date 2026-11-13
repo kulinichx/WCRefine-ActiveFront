@@ -44,6 +44,8 @@ jobs:
           path: |
             source/build/WCRefineGroup.dylib
             source/build/WCRefineGroup.dylib.sha256
+            source/build/WCRefineGroup_*.dylib
+            source/build/WCRefineGroup_*.dylib.sha256
             source/build/build_manifest.json
             source/build/native-tests.json
             source/build/native-tests.log
