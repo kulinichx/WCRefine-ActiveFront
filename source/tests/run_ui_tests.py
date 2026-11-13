@@ -7,6 +7,24 @@ import time
 from pathlib import Path
 
 
+def version_tuple(value):
+    if isinstance(value, int):
+        return value >> 16, (value >> 8) & 255, value & 255
+    parts = [int(part) for part in str(value).split(".")[:3]]
+    return tuple(parts + [0] * (3 - len(parts)))
+
+
+def select_runtime(runtimes, sdk_version):
+    # Images contain multiple Xcode generations. Do not pair the selected
+    # toolchain with an unrelated newer runtime just because it sorts last.
+    matches = [runtime for runtime in runtimes
+               if runtime.get("isAvailable") and ".iOS-" in runtime["identifier"] and
+               version_tuple(runtime["version"])[:2] == version_tuple(sdk_version)[:2]]
+    if not matches:
+        raise RuntimeError(f"No available iOS Simulator runtime matching SDK {sdk_version}")
+    return max(matches, key=lambda runtime: version_tuple(runtime["version"]))
+
+
 def run(*args, timeout=180):
     try:
         return subprocess.run(args, check=True, text=True, stdout=subprocess.PIPE,
@@ -49,13 +67,9 @@ def launch_and_collect(device, container, destination):
 def main():
     out = Path(sys.argv[1]).resolve()
     runtimes = json.loads(run("xcrun", "simctl", "list", "runtimes", "-j"))["runtimes"]
-    runtime = next(r for r in reversed(runtimes)
-                   if r.get("isAvailable") and ".iOS-" in r["identifier"])
-    def version_tuple(value):
-        if isinstance(value, int):
-            return value >> 16, (value >> 8) & 255, value & 255
-        parts = [int(part) for part in str(value).split(".")[:3]]
-        return tuple(parts + [0] * (3 - len(parts)))
+    sdk_version = run("xcrun", "--sdk", "iphonesimulator", "--show-sdk-version")
+    runtime = select_runtime(runtimes, sdk_version)
+    print(f"Simulator SDK {sdk_version}; runtime {runtime['identifier']}", flush=True)
     runtime_version = version_tuple(runtime["version"])
     types = json.loads(run("xcrun", "simctl", "list", "devicetypes", "-j"))["devicetypes"]
     reports = []
@@ -85,7 +99,8 @@ def main():
             run("xcrun", "simctl", "shutdown", device)
             run("xcrun", "simctl", "delete", device)
     (out / "ui-tests.json").write_text(json.dumps(
-        {"passed": True, "devices": reports, "wechat_host_tested": False},
+        {"passed": True, "devices": reports, "wechat_host_tested": False,
+         "simulator_sdk": sdk_version, "simulator_runtime": runtime["identifier"]},
         indent=2) + "\n")
 
 
