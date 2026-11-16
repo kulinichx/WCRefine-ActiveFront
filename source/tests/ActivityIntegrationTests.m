@@ -365,9 +365,13 @@ NSUInteger WCRRunActivityIntegrationTests(UIWindow *window) {
     TrackActivity(backgroundBurst, context);
     backgroundBurst.m_uUnReadCount = @0;
     lookups = testLookups;
-    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-        for (NSUInteger i = 0; i < 1000; i++) WCRQueueNativeActivityEvent(backgroundBurst.m_nsUsrName, context);
-    });
+    // Simulate a persistence/observer callback waiting for a worker event.
+    // The event queue must not acquire the store's persistence lock.
+    @synchronized (WCRAFStore()) {
+        dispatch_sync(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            for (NSUInteger i = 0; i < 1000; i++) WCRQueueNativeActivityEvent(backgroundBurst.m_nsUsrName, context);
+        });
+    }
     ActivityCheck(gWCRActivityObservations.count == 1, @"Off-main events merge before hopping to main queue");
     DrainActivity();
     ActivityCheck(testLookups == lookups + 1 &&

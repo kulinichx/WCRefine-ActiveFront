@@ -1402,9 +1402,18 @@ static NSMutableDictionary<NSString *, NSDictionary *> *gWCRActivityObservations
 static BOOL gWCRActivityObservationScheduled;
 static WCRAFAccountContext *gWCRActivityProjectionDirtyContext;
 
+// Never share this tiny queue lock with state persistence: defaults/host
+// callbacks may synchronously wait for another thread to enqueue an event.
+static NSObject *WCRActivityObservationLock(void) {
+    static NSObject *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
 static void WCRDrainActivityObservations(void) {
     NSDictionary *observations;
-    @synchronized (WCRAFStore()) {
+    @synchronized (WCRActivityObservationLock()) {
         observations = [gWCRActivityObservations copy];
         [gWCRActivityObservations removeAllObjects];
         gWCRActivityObservationScheduled = NO;
@@ -1468,7 +1477,7 @@ static void WCRDrainActivityObservations(void) {
 static void WCREnqueueActivityObservation(NSString *username, WCRAFAccountContext *context,
                                           BOOL projectedActive, BOOL nativeEvent) {
     if (![username isKindOfClass:NSString.class] || username.length == 0 || !context) return;
-    @synchronized (WCRAFStore()) {
+    @synchronized (WCRActivityObservationLock()) {
         if (!gWCRActivityObservations) gWCRActivityObservations = [NSMutableDictionary dictionary];
         NSDictionary *queued = gWCRActivityObservations[username];
         WCRAFAccountContext *previous = queued[@"context"];
