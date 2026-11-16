@@ -11,6 +11,8 @@ static BOOL testBypassAlias;
 static BOOL testDeferUnread;
 static BOOL testSwitchInsideUnread;
 static NSUInteger testLookups;
+static NSUInteger testAccountResolutions;
+static BOOL testSwitchDuringLookup;
 
 static void ActivityCheck(BOOL condition, NSString *message) {
     activityChecks++;
@@ -47,7 +49,7 @@ static void ActivityCheck(BOOL condition, NSString *message) {
 @end
 
 @implementation WCRefineHelper
-+ (NSString *)wcr_resolveCurrentUserWxidUncached { return testAccount; }
++ (NSString *)wcr_resolveCurrentUserWxidUncached { testAccountResolutions++; return testAccount; }
 + (id)currentChatContactFromTopViewController { return testSessions[testChatName]; }
 @end
 @implementation WCRefineConfig
@@ -89,6 +91,10 @@ static void ActivityCheck(BOOL condition, NSString *message) {
 - (BOOL)shouldExcludeNativeSessionFromGroupingForUnreadPolicy:(id)session { (void)session; return NO; }
 - (id)fulfilledSessionForUsername:(NSString *)name fallback:(id)fallback {
     testLookups++;
+    if (testSwitchDuringLookup) {
+        testSwitchDuringLookup = NO;
+        testAccount = [testAccount stringByAppendingString:@"-lookup-switch"];
+    }
     return testSessions[name] ?: fallback;
 }
 - (id)nativeCellDataForSession:(id)session { return session; }
@@ -327,6 +333,61 @@ NSUInteger WCRRunActivityIntegrationTests(UIWindow *window) {
     DrainActivity();
     ActivityCheck(home.refreshes == refreshes + 1 && testLookups == lookups + 1, @"Burst is one native read and one rebuild");
 
+    // Native Add/Mod/unread and predicate observations share the SAME entry
+    // queue. No account/group/session work is performed for each enqueue.
+    ActivitySession *nativeBurst = NewActivitySession(@"native-entry-burst", 1);
+    TrackActivity(nativeBurst, context);
+    nativeBurst.m_uUnReadCount = @0;
+    DrainActivity();
+    lookups = testLookups;
+    refreshes = home.refreshes;
+    NSUInteger resolutions = testAccountResolutions;
+    for (NSUInteger i = 0; i < 1000; i++) {
+        WCRQueueNativeActivityEvent(nativeBurst.m_nsUsrName, context);
+        WCRScheduleActivityObservation(nativeBurst.m_nsUsrName, context, i == 0);
+    }
+    ActivityCheck(testAccountResolutions == resolutions && testLookups == lookups,
+        @"Enqueue burst performs no account or session queries");
+    ActivityCheck(gWCRActivityObservationScheduled && gWCRActivityObservations.count == 1,
+        @"Native and predicate bursts occupy one queued username");
+    DrainActivity();
+    ActivityCheck(testLookups == lookups + 1 && home.refreshes == refreshes + 1,
+        @"Native-entry burst reads once and rebuilds once");
+    ActivityCheck(testAccountResolutions - resolutions < 30,
+        @"Drain account resolution is not proportional to event count");
+    lookups = testLookups;
+    resolutions = testAccountResolutions;
+    DrainActivity();
+    ActivityCheck(testLookups == lookups && testAccountResolutions == resolutions &&
+        !gWCRActivityObservationScheduled, @"Idle drain does not schedule another read");
+
+    ActivitySession *backgroundBurst = NewActivitySession(@"background-entry-burst", 1);
+    TrackActivity(backgroundBurst, context);
+    backgroundBurst.m_uUnReadCount = @0;
+    lookups = testLookups;
+    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        for (NSUInteger i = 0; i < 1000; i++) WCRQueueNativeActivityEvent(backgroundBurst.m_nsUsrName, context);
+    });
+    ActivityCheck(gWCRActivityObservations.count == 1, @"Off-main events merge before hopping to main queue");
+    DrainActivity();
+    ActivityCheck(testLookups == lookups + 1 &&
+        !WCRIsMessageActiveSession(backgroundBurst, backgroundBurst.m_nsUsrName, context),
+        @"Off-main burst reads latest unread state once");
+
+    ActivitySession *manyA = NewActivitySession(@"many-a", 1);
+    ActivitySession *manyB = NewActivitySession(@"many-b", 1);
+    TrackActivity(manyA, context);
+    TrackActivity(manyB, context);
+    manyA.m_uUnReadCount = @0;
+    manyB.m_uUnReadCount = @0;
+    refreshes = home.refreshes;
+    lookups = testLookups;
+    WCRQueueNativeActivityEvent(manyA.m_nsUsrName, context);
+    WCRQueueNativeActivityEvent(manyB.m_nsUsrName, context);
+    DrainActivity();
+    ActivityCheck(testLookups == lookups + 2 && home.refreshes == refreshes + 1,
+        @"Multiple changed usernames share a single structural rebuild");
+
     ActivitySession *switched = NewActivitySession(@"account-switch-event", 1);
     TrackActivity(switched, context);
     testSwitchInsideUnread = YES;
@@ -337,6 +398,25 @@ NSUInteger WCRRunActivityIntegrationTests(UIWindow *window) {
         ![WCRAFStore() isMessageReturnSuppressed:switched.m_nsUsrName context:newContext
             lastMessageTime:switched.m_uLastTime], @"Old native event cannot write into new account");
     testSwitchInsideUnread = NO;
+    [WCRAFStore() enableMessageActivityForContext:newContext];
+    ActivitySession *epoch = NewActivitySession(@"epoch-order", 1);
+    lookups = testLookups;
+    WCRQueueNativeActivityEvent(epoch.m_nsUsrName, newContext);
+    WCRQueueNativeActivityEvent(epoch.m_nsUsrName, context);
+    DrainActivity();
+    ActivityCheck(testLookups == lookups + 1 &&
+        [WCRAFStore() hasTrackedMessageActivity:epoch.m_nsUsrName context:newContext],
+        @"Late older epoch cannot overwrite queued current account event");
+    NSString *beforeLookupSwitch = testAccount;
+    testSwitchDuringLookup = YES;
+    WCRQueueNativeActivityEvent(epoch.m_nsUsrName, newContext);
+    DrainActivity();
+    WCRAFAccountContext *lookupContext = [WCRAFStore() currentContext];
+    ActivityCheck(lookupContext != newContext &&
+        ![WCRAFStore() hasTrackedMessageActivity:epoch.m_nsUsrName context:lookupContext],
+        @"Account switch inside host lookup aborts entire state batch");
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:
+        [@"com.local.wcrefine.activefront.account.v2." stringByAppendingString:beforeLookupSwitch]];
     [NSUserDefaults.standardUserDefaults removeObjectForKey:
         [@"com.local.wcrefine.activefront.account.v2." stringByAppendingString:firstAccount]];
     [NSUserDefaults.standardUserDefaults removeObjectForKey:

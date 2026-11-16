@@ -139,6 +139,7 @@ static int QualifiedNotifyWrite(id self, __unused SEL cmd, id contact, int notif
 @property(nonatomic, copy) NSString *suite;
 @property(nonatomic) NSTimeInterval now;
 @property(nonatomic) BOOL resolverThrows;
+@property(nonatomic) NSUInteger resolverCalls;
 @property(nonatomic) BOOL clockThrows;
 @property(nonatomic, strong) FaultDefaults *defaults;
 @property(nonatomic, strong) WCRAFStateStore *store;
@@ -164,6 +165,7 @@ static int QualifiedNotifyWrite(id self, __unused SEL cmd, id contact, int notif
     __weak Fixture *weakSelf = self;
     return [[WCRAFStateStore alloc] initWithDefaults:self.defaults
         accountResolver:^NSString *{
+            weakSelf.resolverCalls++;
             if (weakSelf.resolverThrows) [NSException raise:@"UnavailableAccount" format:@"test"];
             return weakSelf.account;
         } clock:^NSTimeInterval{
@@ -2269,6 +2271,243 @@ static void ContactObserverCapturesEventAccountBeforeDispatch(__unused Fixture *
     [observer.observer stopAll];
 }
 
+static WCRAFMessageActivityObservation *ActivityUpdate(NSString *name, NSTimeInterval time,
+    NSInteger unread, BOOL home, BOOL projected) {
+    WCRAFMessageActivityObservation *value = [WCRAFMessageActivityObservation new];
+    value.username = name;
+    value.lastMessageTime = time;
+    value.unreadCount = unread;
+    value.grouped = YES;
+    value.allowed = YES;
+    value.homeVisible = home;
+    value.projectedActive = projected;
+    return value;
+}
+
+static void ActivityBatchSavesManyNamesOnce(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    CHECK([f.store enableMessageActivityForContext:c]);
+    NSMutableArray *updates = [NSMutableArray array];
+    for (NSUInteger i = 0; i < 100; i++) {
+        [updates addObject:ActivityUpdate([NSString stringWithFormat:@"room-%lu", (unsigned long)i], f.now, 1, YES, YES)];
+    }
+    NSUInteger writes = f.defaults.writeCount;
+    CHECK(![f.store applyMessageActivityObservations:updates context:c]);
+    CHECK(f.defaults.writeCount == writes + 1);
+    CHECK([f.store trackedMessageActivityUsernamesForContext:c].count == 100);
+}
+
+static void ActivityBatchStableDoesNotSave(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    NSArray *updates = @[ActivityUpdate(@"alice", f.now, 1, YES, YES)];
+    [f.store applyMessageActivityObservations:updates context:c];
+    NSUInteger writes = f.defaults.writeCount;
+    for (NSUInteger i = 0; i < 100; i++) CHECK(![f.store applyMessageActivityObservations:updates context:c]);
+    CHECK(f.defaults.writeCount == writes);
+}
+
+static void ActivityBatchReadReturnsOnce(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    [f.store applyMessageActivityObservations:@[ActivityUpdate(@"alice", f.now, 1, YES, YES),
+        ActivityUpdate(@"bob", f.now, 1, YES, YES)] context:c];
+    NSUInteger writes = f.defaults.writeCount;
+    NSArray *read = @[ActivityUpdate(@"alice", f.now, 0, YES, YES), ActivityUpdate(@"bob", f.now, 0, YES, YES)];
+    CHECK([f.store applyMessageActivityObservations:read context:c]);
+    CHECK(f.defaults.writeCount == writes + 1);
+    CHECK([f.store trackedMessageActivityUsernamesForContext:c].count == 0);
+    CHECK([f.store isMessageReturnSuppressed:@"alice" context:c lastMessageTime:f.now]);
+    CHECK([f.store isMessageReturnSuppressed:@"bob" context:c lastMessageTime:f.now]);
+}
+
+static void ActivityBatchHiddenAndUnknownDoNotReturn(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    NSArray *updates = @[ActivityUpdate(@"hidden", f.now, 0, NO, YES),
+        ActivityUpdate(@"unknown", f.now, -1, YES, YES)];
+    CHECK(![f.store applyMessageActivityObservations:updates context:c]);
+    CHECK([f.store hasTrackedMessageActivity:@"hidden" context:c]);
+    CHECK([f.store hasTrackedMessageActivity:@"unknown" context:c]);
+}
+
+static void ActivityBatchKeepsExplicitHoldAndVisitLatch(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    [f.store setHeld:YES username:@"held" context:c];
+    [f.store noteOutgoingMessage:@"visit" context:c lastMessageTime:f.now];
+    CHECK(![f.store applyMessageActivityObservations:@[ActivityUpdate(@"held", f.now, 0, YES, YES),
+        ActivityUpdate(@"visit", f.now, 0, YES, YES)] context:c]);
+    CHECK([f.store isHeld:@"held" context:c]);
+    CHECK([f.store hasTrackedMessageActivity:@"visit" context:c]);
+    [f.store markHomeConversationOpened:@"visit" context:c];
+    CHECK([f.store applyMessageActivityObservations:@[ActivityUpdate(@"visit", f.now, 0, YES, YES)] context:c]);
+}
+
+static void ActivityBatchRejectsStaleAccount(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    NSUInteger writes = f.defaults.writeCount;
+    f.account = @"account-B";
+    CHECK(![f.store applyMessageActivityObservations:@[ActivityUpdate(@"alice", f.now, 1, YES, NO)] context:c]);
+    CHECK(f.defaults.writeCount == writes);
+    CHECK(![f.store hasTrackedMessageActivity:@"alice" context:[f.store currentContext]]);
+}
+
+static void ActivityBatchSwitchDuringSaveDoesNotPublish(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    __weak Fixture *weak = f;
+    f.defaults.afterWrite = ^{ weak.account = @"account-B"; [weak.store currentContext]; };
+    CHECK(![f.store applyMessageActivityObservations:@[ActivityUpdate(@"alice", f.now, 1, YES, NO)] context:c]);
+    WCRAFAccountContext *next = [f.store currentContext];
+    CHECK([next.account isEqualToString:@"account-B"]);
+    CHECK(![f.store hasTrackedMessageActivity:@"alice" context:next]);
+    CHECK(![f.defaults objectForKey:[Prefix stringByAppendingString:@"account-B"]]);
+}
+
+static void ActivityBatchWriteFailureCannotRefresh(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    NSString *key = [Prefix stringByAppendingString:f.account];
+    NSDictionary *before = [f.defaults objectForKey:key];
+    f.defaults.failWrite = YES;
+    CHECK(![f.store applyMessageActivityObservations:@[ActivityUpdate(@"alice", f.now, 1, YES, NO)] context:c]);
+    CHECK([[f.defaults objectForKey:key] isEqual:before]);
+    CHECK([f.store currentContext] == nil);
+}
+
+static void ActivityBatchNestedWriteIsRejected(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    __weak Fixture *weak = f;
+    __block BOOL nested = YES;
+    f.defaults.afterWrite = ^{ nested = [weak.store applyMessageActivityObservations:
+        @[ActivityUpdate(@"nested", weak.now, 1, YES, NO)] context:c]; };
+    [f.store applyMessageActivityObservations:@[ActivityUpdate(@"outer", f.now, 1, YES, YES)] context:c];
+    CHECK(!nested);
+    CHECK([f.store hasTrackedMessageActivity:@"outer" context:c]);
+    CHECK(![f.store hasTrackedMessageActivity:@"nested" context:c]);
+}
+
+static void ActivityBatchResolverCostIsConstant(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    NSMutableArray *updates = [NSMutableArray array];
+    for (NSUInteger i = 0; i < 100; i++) [updates addObject:ActivityUpdate(
+        [NSString stringWithFormat:@"room-%lu", (unsigned long)i], f.now, 1, YES, YES)];
+    NSUInteger calls = f.resolverCalls;
+    [f.store applyMessageActivityObservations:updates context:c];
+    CHECK(f.resolverCalls - calls <= 4);
+}
+
+static void ActivityBatchPreservesWatermarksAndInvalidTimes(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    [f.store setHeld:NO username:@"returned" context:c];
+    NSUInteger writes = f.defaults.writeCount;
+    CHECK(![f.store applyMessageActivityObservations:@[
+        ActivityUpdate(@"returned", f.now, 5, YES, NO),
+        ActivityUpdate(@"future", f.now + 60, 1, YES, NO),
+        ActivityUpdate(@"invalid", NAN, 1, YES, NO)] context:c]);
+    CHECK(f.defaults.writeCount == writes);
+    CHECK([f.store trackedMessageActivityUsernamesForContext:c].count == 0);
+    CHECK([f.store isMessageReturnSuppressed:@"returned" context:c lastMessageTime:f.now]);
+}
+
+static void ActivityBatchDiscardKeepsHoldAndWatermarks(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    [f.store noteOutgoingMessage:@"muted" context:c lastMessageTime:f.now];
+    [f.store noteOutgoingMessage:@"ungrouped" context:c lastMessageTime:f.now];
+    [f.store setHeld:YES username:@"held" context:c];
+    [f.store setHeld:NO username:@"returned" context:c];
+    WCRAFMessageActivityObservation *muted = ActivityUpdate(@"muted", f.now, 1, YES, YES);
+    WCRAFMessageActivityObservation *ungrouped = ActivityUpdate(@"ungrouped", f.now, 1, YES, YES);
+    muted.allowed = NO;
+    ungrouped.grouped = NO;
+    NSUInteger writes = f.defaults.writeCount;
+    CHECK([f.store applyMessageActivityObservations:@[muted, ungrouped] context:c]);
+    CHECK(f.defaults.writeCount == writes + 1);
+    CHECK(![f.store hasTrackedMessageActivity:@"muted" context:c]);
+    CHECK(![f.store hasTrackedMessageActivity:@"ungrouped" context:c]);
+    CHECK([f.store isHeld:@"held" context:c]);
+    CHECK([f.store isMessageReturnSuppressed:@"returned" context:c lastMessageTime:f.now]);
+}
+
+static void ActivityBatchMatchesSingleObservationSemantics(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    Fixture *reference = [Fixture new];
+    @try {
+        reference.now = f.now;
+        WCRAFAccountContext *rc = [reference.store currentContext];
+        [reference.store enableMessageActivityForContext:rc];
+        NSArray *updates = @[ActivityUpdate(@"read", f.now, 0, YES, YES),
+            ActivityUpdate(@"unread", f.now, 2, YES, YES), ActivityUpdate(@"unknown", f.now, -1, YES, YES),
+            ActivityUpdate(@"hidden", f.now, 0, NO, YES), ActivityUpdate(@"future", f.now + 10, 1, YES, NO)];
+        for (WCRAFMessageActivityObservation *o in updates) {
+            [reference.store observeMessageActivity:o.username context:rc lastMessageTime:o.lastMessageTime
+                unreadCount:o.unreadCount grouped:o.grouped homeVisible:o.homeVisible];
+        }
+        [f.store applyMessageActivityObservations:updates context:c];
+        CHECK([[f.defaults objectForKey:[Prefix stringByAppendingString:f.account]] isEqual:
+            [reference.defaults objectForKey:[Prefix stringByAppendingString:reference.account]]]);
+    } @finally { [reference clean]; }
+}
+
+static void ActivityBatchMatchesSequentialTransitions(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    Fixture *reference = [Fixture new];
+    @try {
+        reference.now = f.now;
+        WCRAFAccountContext *rc = [reference.store currentContext];
+        [reference.store enableMessageActivityForContext:rc];
+        for (NSUInteger turn = 0; turn < 100; turn++) {
+            f.now += 1;
+            reference.now = f.now;
+            if (turn % 9 == 0) {
+                [f.store setHeld:NO username:@"user-0" context:c];
+                [reference.store setHeld:NO username:@"user-0" context:rc];
+            }
+            if (turn % 7 == 0) {
+                [f.store noteOutgoingMessage:@"user-1" context:c lastMessageTime:f.now];
+                [reference.store noteOutgoingMessage:@"user-1" context:rc lastMessageTime:f.now];
+            }
+            if (turn % 8 == 0) {
+                [f.store markHomeConversationOpened:@"user-1" context:c];
+                [reference.store markHomeConversationOpened:@"user-1" context:rc];
+            }
+            NSMutableArray *updates = [NSMutableArray array];
+            for (NSUInteger index = 0; index < 10; index++) {
+                NSString *name = [NSString stringWithFormat:@"user-%lu", (unsigned long)index];
+                NSTimeInterval time = f.now - (turn % 3);
+                if ((turn + index) % 11 == 0) time = f.now + 1;
+                if ((turn + index) % 13 == 0) time = 0;
+                NSInteger unread = (NSInteger)((turn + index) % 4) - 1;
+                WCRAFMessageActivityObservation *o = ActivityUpdate(name, time, unread, turn % 2 == 0, YES);
+                [updates addObject:o];
+                [reference.store observeMessageActivity:name context:rc lastMessageTime:time
+                    unreadCount:unread grouped:YES homeVisible:o.homeVisible];
+            }
+            [f.store applyMessageActivityObservations:updates context:c];
+            CHECK([[f.defaults objectForKey:[Prefix stringByAppendingString:f.account]] isEqual:
+                [reference.defaults objectForKey:[Prefix stringByAppendingString:reference.account]]]);
+        }
+    } @finally { [reference clean]; }
+}
+
+static void ActivityBatchEmptyAndInvalidClockDoNotSave(Fixture *f) {
+    WCRAFAccountContext *c = [f.store currentContext];
+    [f.store enableMessageActivityForContext:c];
+    NSUInteger writes = f.defaults.writeCount;
+    CHECK(![f.store applyMessageActivityObservations:@[] context:c]);
+    f.clockThrows = YES;
+    CHECK(![f.store applyMessageActivityObservations:@[ActivityUpdate(@"alice", f.now, 1, YES, NO)] context:c]);
+    CHECK(f.defaults.writeCount == writes);
+}
+
 int main(int argc, const char *argv[]) {
     if (argc > 2) return 2;
     struct Test { const char *name; void (*run)(Fixture *); } tests[] = {
@@ -2343,7 +2582,22 @@ int main(int argc, const char *argv[]) {
         TEST(ContactObserverCancellationDropsQueuedEvents), TEST(ContactObserverRebindsHostAndDropsOldBatch),
         TEST(ContactObserverRejectsUnsupportedInterfaces), TEST(ContactObserverWatchSetIsBounded),
         TEST(ContactObserverConfirmsThroughNativeCallback), TEST(NotifyContactEventUnknownNeverConfirms),
-        TEST(ContactObserverCapturesEventAccountBeforeDispatch)
+        TEST(ContactObserverCapturesEventAccountBeforeDispatch),
+        TEST(ActivityBatchSavesManyNamesOnce),
+        TEST(ActivityBatchStableDoesNotSave),
+        TEST(ActivityBatchReadReturnsOnce),
+        TEST(ActivityBatchHiddenAndUnknownDoNotReturn),
+        TEST(ActivityBatchKeepsExplicitHoldAndVisitLatch),
+        TEST(ActivityBatchRejectsStaleAccount),
+        TEST(ActivityBatchSwitchDuringSaveDoesNotPublish),
+        TEST(ActivityBatchWriteFailureCannotRefresh),
+        TEST(ActivityBatchNestedWriteIsRejected),
+        TEST(ActivityBatchResolverCostIsConstant),
+        TEST(ActivityBatchPreservesWatermarksAndInvalidTimes),
+        TEST(ActivityBatchDiscardKeepsHoldAndWatermarks),
+        TEST(ActivityBatchMatchesSingleObservationSemantics),
+        TEST(ActivityBatchMatchesSequentialTransitions),
+        TEST(ActivityBatchEmptyAndInvalidClockDoNotSave)
 #undef TEST
     };
     int failed = 0;

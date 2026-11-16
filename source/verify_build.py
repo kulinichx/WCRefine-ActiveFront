@@ -113,7 +113,7 @@ def validate_inputs(tests, snapshot, current):
     if tests.get("passed") is not True or type(tests.get("failures")) is not int or tests["failures"] != 0:
         raise ValueError("Native tests did not pass")
     count = tests.get("tests_run")
-    if type(count) is not int or count < 143:
+    if type(count) is not int or count < 158:
         raise ValueError("Missing current native test coverage")
     if tests.get("ios_runtime_tested") is not False:
         raise ValueError("Native core report must not claim device testing")
@@ -149,10 +149,10 @@ def main():
     current = source_snapshot()
     validate_inputs(tests, inputs, current)
     binary = inspect_macho(args.binary.read_bytes())
-    if binary["current_version"] != "1.9.31":
-        raise ValueError("Expected Mach-O current_version 1.9.31")
+    if binary["current_version"] != "1.9.32":
+        raise ValueError("Expected Mach-O current_version 1.9.32")
     report = {
-        "product": "WCRefineGroup.dylib", "source_version": "1.9.31-source",
+        "product": "WCRefineGroup.dylib", "source_version": "1.9.32-source",
         "binary_sha256": sha256(args.binary), "binary_size": args.binary.stat().st_size,
         "native_tests": tests, "native_test_report_sha256": sha256(args.tests),
         "source_files_sha256": current, "macho": binary,

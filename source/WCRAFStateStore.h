@@ -97,6 +97,18 @@ FOUNDATION_EXPORT double WCRAFSwipeReturnThreshold(double rowWidth, double actio
 @property(nonatomic, copy, readonly) NSString *username;
 @end
 
+// One fresh native-session observation. Constructed and consumed synchronously
+// on the main queue; no host objects or callbacks are retained by the state batch.
+@interface WCRAFMessageActivityObservation : NSObject
+@property(nonatomic, copy) NSString *username;
+@property(nonatomic) NSTimeInterval lastMessageTime;
+@property(nonatomic) NSInteger unreadCount;
+@property(nonatomic) BOOL grouped;
+@property(nonatomic) BOOL allowed;
+@property(nonatomic) BOOL homeVisible;
+@property(nonatomic) BOOL projectedActive;
+@end
+
 // Foundation-only state logic so it can be tested without UIKit or WeChat.
 @interface WCRAFStateStore : NSObject
 - (instancetype)initWithDefaults:(NSUserDefaults *)defaults
@@ -125,6 +137,11 @@ FOUNDATION_EXPORT double WCRAFSwipeReturnThreshold(double rowWidth, double actio
                    unreadCount:(NSInteger)unreadCount
                        grouped:(BOOL)grouped
                    homeVisible:(BOOL)homeVisible;
+// Atomically applies a native-event batch with at most one account-record save.
+// Returns YES only for a projection transition in a valid, successfully saved batch.
+// A stable/no-op batch returns NO and does not save. Failed/stale batches return NO.
+- (BOOL)applyMessageActivityObservations:(NSArray<WCRAFMessageActivityObservation *> *)observations
+                               context:(WCRAFAccountContext *)context;
 - (BOOL)hasMessageActivityForContext:(WCRAFAccountContext *)context;
 - (BOOL)hasTrackedMessageActivity:(NSString *)username context:(WCRAFAccountContext *)context;
 - (NSArray<NSString *> *)trackedMessageActivityUsernamesForContext:(WCRAFAccountContext *)context;

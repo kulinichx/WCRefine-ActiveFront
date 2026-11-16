@@ -555,6 +555,9 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
 @implementation WCRAFExpiryCandidate
 @end
 
+@implementation WCRAFMessageActivityObservation
+@end
+
 @implementation WCRAFStateStore {
     NSUserDefaults *_defaults;
     NSString *(^_accountResolver)(void);
@@ -893,6 +896,69 @@ double WCRAFSwipeReturnThreshold(double rowWidth, double actionWidth) {
         }
         return [self saveHeld:_held since:_since days:_days activitySince:_activitySince
                     returned:returned activity:activity context:context];
+    }
+}
+
+- (BOOL)applyMessageActivityObservations:(NSArray<WCRAFMessageActivityObservation *> *)observations
+                               context:(WCRAFAccountContext *)context {
+    @synchronized (self) {
+        if (_saving || observations.count == 0 || ![self isCurrentContext:context]) return NO;
+        NSTimeInterval now = [self readClock];
+        if (now <= 0) return NO;
+        // Work on detached state. Do not publish unpersisted changes or reuse a
+        // cached account identity across callbacks, a queue turn or a save.
+        NSMutableDictionary *activity = [_activity mutableCopy];
+        NSMutableDictionary *returned = [_returned mutableCopy];
+        BOOL projectionChanged = NO;
+        for (WCRAFMessageActivityObservation *observation in observations) {
+            NSString *username = observation.username;
+            if (username.length == 0) continue;
+            BOOL held = [_held containsObject:username];
+            BOOL eligible = observation.allowed && observation.grouped && !held;
+            NSTimeInterval message = observation.lastMessageTime;
+            NSInteger unreadCount = observation.unreadCount;
+            NSDictionary *entry = activity[username];
+            NSTimeInterval recorded = [entry[@"message"] doubleValue];
+            BOOL validTime = isfinite(message) && message > 0 && message <= now;
+            if (!eligible) {
+                [activity removeObjectForKey:username];
+            } else if (_activitySince > 0 && validTime &&
+                       message > [returned[username] doubleValue] &&
+                       !(message < _activitySince && !entry && unreadCount <= 0) &&
+                       message >= recorded) {
+                BOOL awaitingVisit = [entry[@"awaitingVisit"] boolValue];
+                BOOL returnNow = unreadCount == 0 && observation.homeVisible && !awaitingVisit;
+                if (returnNow) {
+                    [activity removeObjectForKey:username];
+                    returned[username] = @(message);
+                } else {
+                    activity[username] = awaitingVisit ?
+                        @{@"message": @(message), @"readAt": @0, @"awaitingVisit": @YES} :
+                        @{@"message": @(message), @"readAt": @0};
+                }
+            }
+            // Match the existing read-only predicate, including unknown/future
+            // time handling and awaitingVisit. Never infer read from the event.
+            recorded = [activity[username][@"message"] doubleValue];
+            NSTimeInterval effective = validTime ? MAX(recorded, message) : recorded;
+            BOOL active = eligible && _activitySince > 0 && effective > 0 &&
+                effective > [returned[username] doubleValue] &&
+                !(effective < _activitySince && recorded <= 0 && unreadCount <= 0);
+            if (!held && observation.grouped && active != observation.projectedActive) {
+                projectionChanged = YES;
+            }
+        }
+        BOOL changed = ![activity isEqualToDictionary:_activity] ||
+                       ![returned isEqualToDictionary:_returned];
+        if (changed) {
+            // saveHeld re-resolves the account both before and after defaults
+            // callbacks. Reentrant writes and account switches cannot publish.
+            if (![self saveHeld:_held since:_since days:_days activitySince:_activitySince
+                       returned:returned activity:activity context:context]) return NO;
+        } else if (![self isCurrentContext:context]) {
+            return NO;
+        }
+        return projectionChanged;
     }
 }
 

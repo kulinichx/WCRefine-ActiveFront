@@ -1,5 +1,5 @@
 // WCRefineGroup source repair, based on ActiveFront.RIGHT_v1_9_8.m.
-// WCRefine ActiveFront - v1.9.31 event-driven read return.
+// WCRefine ActiveFront - v1.9.32 coalesced activity transactions.
 // Friend/chat-room messages surface temporarily without changing membership.
 // Unread sessions stay visible until read or explicitly returned by a long swipe.
 // Read + home-visible returns immediately unless Held. No activity timers.
@@ -85,7 +85,7 @@ static const void *kWCRPanConsumedKey = &kWCRPanConsumedKey;
 static NSHashTable<UITableViewCell *> *gWCRSwipeCells;
 
 
-static NSString * const kWCRAFVersion = @"1.9.31-source";
+static NSString * const kWCRAFVersion = @"1.9.32-source";
 static NSString * const kWCRHomeGroupsDidChangeNotification = @"WCRefineHomeGroupsDidChangeNotification";
 static const NSInteger kWCRAFDefaultHoldExpiryDays = 3;
 
@@ -1396,78 +1396,100 @@ static NewMainFrameViewController *WCRActivityHomeController(void) {
     return nil;
 }
 
-// Coalesce a complete grouping pass, then resolve the latest session again.
-// The predicate must not persist state or recurse into a home refresh.
+// Merge at the native-event entry point, before account/group/session queries.
+// A burst enqueues one drain, not one preliminary main-queue block per event.
 static NSMutableDictionary<NSString *, NSDictionary *> *gWCRActivityObservations;
 static BOOL gWCRActivityObservationScheduled;
 static WCRAFAccountContext *gWCRActivityProjectionDirtyContext;
 
-static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountContext *context,
-                                           BOOL projectedActive) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            WCRScheduleActivityObservation(username, context, projectedActive);
-        });
-        return;
-    }
-    if (username.length == 0 || ![WCRAFStore() isCurrentContext:context]) return;
-    if (!gWCRActivityObservations) gWCRActivityObservations = [NSMutableDictionary dictionary];
-    NSDictionary *queued = gWCRActivityObservations[username];
-    if (queued[@"context"] == context) projectedActive |= [queued[@"active"] boolValue];
-    gWCRActivityObservations[username] = @{@"context": context, @"active": @(projectedActive)};
-    if (gWCRActivityObservationScheduled) return;
-    gWCRActivityObservationScheduled = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSDictionary *observations = [gWCRActivityObservations copy];
+static void WCRDrainActivityObservations(void) {
+    NSDictionary *observations;
+    @synchronized (WCRAFStore()) {
+        observations = [gWCRActivityObservations copy];
         [gWCRActivityObservations removeAllObjects];
         gWCRActivityObservationScheduled = NO;
-        BOOL projectionChanged = NO;
-        WCRAFAccountContext *current = [WCRAFStore() currentContext];
-        for (NSString *name in observations) {
-            NSDictionary *observation = observations[name];
-            WCRAFAccountContext *captured = observation[@"context"];
-            if (![WCRAFStore() isCurrentContext:captured]) continue;
-            @try {
-                WCRefineGroupDataProvider *provider = WCRDataProvider();
-                if (![provider respondsToSelector:@selector(fulfilledSessionForUsername:fallback:)]) continue;
-                id latest = [provider fulfilledSessionForUsername:name fallback:nil];
-                id native = [provider nativeSessionFromObject:latest] ?: latest;
-                if (!native || ![[provider usernameForNativeObject:native] isEqualToString:name]) continue;
-                NSUInteger scope = [provider groupScopeForNativeSession:native];
-                BOOL grouped = WCRIsInCustomGroup(name);
-                BOOL held = [WCRAFStore() isHeld:name context:captured];
-                BOOL allowed = WCRSessionAllowsAutomaticActivity(native, scope, name, captured);
-                NSTimeInterval message = WCRSessionLastMessageTime(native);
-                NSInteger unread = WCRSessionUnreadCount(native);
-                if (!allowed || !grouped || held) {
-                    [WCRAFStore() discardMessageActivity:name context:captured];
-                } else {
-                    [WCRAFStore() observeMessageActivity:name context:captured
-                        lastMessageTime:message unreadCount:unread grouped:grouped
-                        homeVisible:WCRActivityHomeController() != nil];
-                }
-                BOOL active = allowed && grouped &&
-                    [WCRAFStore() isMessageActive:name context:captured
-                        lastMessageTime:message unreadCount:unread grouped:grouped];
-                if (!held && grouped && active != [observation[@"active"] boolValue]) {
-                    projectionChanged = YES;
-                }
-            } @catch (__unused NSException *exception) {
-                // Unknown session/read state never initiates a return.
-            }
+    }
+    WCRAFAccountContext *current = [WCRAFStore() currentContext];
+    if (!current) return;
+    BOOL hasCurrent = NO;
+    for (NSDictionary *observation in observations.allValues) {
+        if (observation[@"context"] == current) { hasCurrent = YES; break; }
+    }
+    if (!hasCurrent) return;
+    NSSet *tracked = [NSSet setWithArray:
+        [WCRAFStore() trackedMessageActivityUsernamesForContext:current]];
+    // Keep snapshots local to this synchronous drain, never across queue turns.
+    BOOL indexed = WCRBuildGroupIndex(current);
+    NSSet *members = indexed ? gWCRGroupIndexMembers : nil;
+    NSMutableArray<WCRAFMessageActivityObservation *> *updates = [NSMutableArray array];
+    WCRefineGroupDataProvider *provider = WCRDataProvider();
+    if (![provider respondsToSelector:@selector(fulfilledSessionForUsername:fallback:)]) return;
+    for (NSString *name in observations) {
+        NSDictionary *queued = observations[name];
+        WCRAFAccountContext *captured = queued[@"context"];
+        if (captured != current) continue;
+        @try {
+            BOOL grouped = indexed ? [members containsObject:name] : WCRIsInCustomGroup(name);
+            BOOL wasTracked = [tracked containsObject:name];
+            if ([queued[@"native"] boolValue] && !wasTracked && !grouped &&
+                ![queued[@"explicit"] boolValue]) continue;
+            id latest = [provider fulfilledSessionForUsername:name fallback:nil];
+            id native = [provider nativeSessionFromObject:latest] ?: latest;
+            if (!native || ![[provider usernameForNativeObject:native] isEqualToString:name]) continue;
+            NSUInteger scope = [provider groupScopeForNativeSession:native];
+            WCRAFMessageActivityObservation *update = [WCRAFMessageActivityObservation new];
+            update.username = name;
+            update.grouped = grouped;
+            update.allowed = WCRSessionAllowsAutomaticActivity(native, scope, name, captured);
+            update.lastMessageTime = WCRSessionLastMessageTime(native);
+            update.unreadCount = WCRSessionUnreadCount(native);
+            update.homeVisible = WCRActivityHomeController() != nil;
+            update.projectedActive = [queued[@"active"] boolValue] ||
+                ([queued[@"native"] boolValue] && wasTracked);
+            [updates addObject:update];
+        } @catch (__unused NSException *exception) {
+            // Missing/unknown native data cannot manufacture a read or return.
         }
-        // Persisting new-message state alone does not change the projection.
-        // Only a visibility transition requests the host's structural refresh.
-        NewMainFrameViewController *home = WCRActivityHomeController();
-        if (projectionChanged && [WCRAFStore() isCurrentContext:current]) {
-            gWCRActivityProjectionDirtyContext = current;
-        }
-        if (projectionChanged && home && [WCRAFStore() isCurrentContext:current] &&
-            [home respondsToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)]) {
-            gWCRActivityProjectionDirtyContext = nil;
-            WCRRefreshHomeProjection(home, current);
-        }
-    });
+    }
+    // The state transaction validates the real account before committing, and
+    // persists all changed usernames once. Do not cache isCurrentContext globally.
+    BOOL projectionChanged = [WCRAFStore() applyMessageActivityObservations:updates context:current];
+    NewMainFrameViewController *home = WCRActivityHomeController();
+    if (projectionChanged && [WCRAFStore() isCurrentContext:current]) {
+        gWCRActivityProjectionDirtyContext = current;
+    }
+    if (projectionChanged && home && [WCRAFStore() isCurrentContext:current] &&
+        [home respondsToSelector:@selector(wcrGrouping_scheduleRefreshForTrigger:)]) {
+        gWCRActivityProjectionDirtyContext = nil;
+        WCRRefreshHomeProjection(home, current);
+    }
+}
+
+static void WCREnqueueActivityObservation(NSString *username, WCRAFAccountContext *context,
+                                          BOOL projectedActive, BOOL nativeEvent) {
+    if (![username isKindOfClass:NSString.class] || username.length == 0 || !context) return;
+    @synchronized (WCRAFStore()) {
+        if (!gWCRActivityObservations) gWCRActivityObservations = [NSMutableDictionary dictionary];
+        NSDictionary *queued = gWCRActivityObservations[username];
+        WCRAFAccountContext *previous = queued[@"context"];
+        // A late event from the old account cannot overwrite a newer epoch.
+        if (previous && previous.epoch > context.epoch) return;
+        BOOL same = previous == context;
+        gWCRActivityObservations[username] = @{
+            @"context": context,
+            @"active": @(projectedActive || (same && [queued[@"active"] boolValue])),
+            @"native": @(nativeEvent || (same && [queued[@"native"] boolValue])),
+            @"explicit": @(!nativeEvent || (same && [queued[@"explicit"] boolValue]))
+        };
+        if (gWCRActivityObservationScheduled) return;
+        gWCRActivityObservationScheduled = YES;
+        dispatch_async(dispatch_get_main_queue(), ^{ WCRDrainActivityObservations(); });
+    }
+}
+
+static void WCRScheduleActivityObservation(NSString *username, WCRAFAccountContext *context,
+                                            BOOL projectedActive) {
+    WCREnqueueActivityObservation(username, context, projectedActive, NO);
 }
 
 static void WCRReconcileTrackedActivity(WCRAFAccountContext *context) {
@@ -1485,14 +1507,7 @@ static void WCRReconcileTrackedActivity(WCRAFAccountContext *context) {
 }
 
 static void WCRQueueNativeActivityEvent(id username, WCRAFAccountContext *context) {
-    if (![username isKindOfClass:NSString.class] || [username length] == 0 || !context) return;
-    NSString *name = [username copy];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (![WCRAFStore() isCurrentContext:context]) return;
-        BOOL tracked = [WCRAFStore() hasTrackedMessageActivity:name context:context];
-        if (!tracked && !WCRIsInCustomGroup(name)) return;
-        WCRScheduleActivityObservation(name, context, tracked);
-    });
+    WCREnqueueActivityObservation(username, context, NO, YES);
 }
 
 static BOOL WCRIsMessageActiveSession(id session, NSString *username,
