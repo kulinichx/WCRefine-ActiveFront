@@ -2336,8 +2336,8 @@ static void ActivityBatchKeepsExplicitHoldAndVisitLatch(Fixture *f) {
     [f.store enableMessageActivityForContext:c];
     [f.store setHeld:YES username:@"held" context:c];
     [f.store noteOutgoingMessage:@"visit" context:c lastMessageTime:f.now];
-    CHECK(![f.store applyMessageActivityObservations:@[ActivityUpdate(@"held", f.now, 0, YES, YES),
-        ActivityUpdate(@"visit", f.now, 0, YES, YES)] context:c]);
+    CHECK((![f.store applyMessageActivityObservations:@[ActivityUpdate(@"held", f.now, 0, YES, YES),
+        ActivityUpdate(@"visit", f.now, 0, YES, YES)] context:c]));
     CHECK([f.store isHeld:@"held" context:c]);
     CHECK([f.store hasTrackedMessageActivity:@"visit" context:c]);
     [f.store markHomeConversationOpened:@"visit" context:c];
@@ -2406,10 +2406,10 @@ static void ActivityBatchPreservesWatermarksAndInvalidTimes(Fixture *f) {
     [f.store enableMessageActivityForContext:c];
     [f.store setHeld:NO username:@"returned" context:c];
     NSUInteger writes = f.defaults.writeCount;
-    CHECK(![f.store applyMessageActivityObservations:@[
+    CHECK((![f.store applyMessageActivityObservations:@[
         ActivityUpdate(@"returned", f.now, 5, YES, NO),
         ActivityUpdate(@"future", f.now + 60, 1, YES, NO),
-        ActivityUpdate(@"invalid", NAN, 1, YES, NO)] context:c]);
+        ActivityUpdate(@"invalid", NAN, 1, YES, NO)] context:c]));
     CHECK(f.defaults.writeCount == writes);
     CHECK([f.store trackedMessageActivityUsernamesForContext:c].count == 0);
     CHECK([f.store isMessageReturnSuppressed:@"returned" context:c lastMessageTime:f.now]);
@@ -2427,7 +2427,7 @@ static void ActivityBatchDiscardKeepsHoldAndWatermarks(Fixture *f) {
     muted.allowed = NO;
     ungrouped.grouped = NO;
     NSUInteger writes = f.defaults.writeCount;
-    CHECK([f.store applyMessageActivityObservations:@[muted, ungrouped] context:c]);
+    CHECK(([f.store applyMessageActivityObservations:@[muted, ungrouped] context:c]));
     CHECK(f.defaults.writeCount == writes + 1);
     CHECK(![f.store hasTrackedMessageActivity:@"muted" context:c]);
     CHECK(![f.store hasTrackedMessageActivity:@"ungrouped" context:c]);
